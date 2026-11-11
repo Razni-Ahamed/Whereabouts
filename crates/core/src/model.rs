@@ -102,3 +102,24 @@ impl NetEvent {
         self.remote.ip().to_canonical().is_loopback()
     }
 }
+
+/// Anything the capture layer reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureEvent {
+    /// A network event.
+    Net(NetEvent),
+    /// A process started.
+    ProcessStarted {
+        /// ID of the new process.
+        pid: u32,
+        /// Path of its executable, as reported by the operating system
+        /// (on Windows, possibly a `\Device\HarddiskVolumeN\...` path).
+        image: String,
+    },
+    /// A process exited. Its ID may be reused by a later process, so flows
+    /// and names tied to this ID must be closed.
+    ProcessExited {
+        /// ID of the process that exited.
+        pid: u32,
+    },
+}

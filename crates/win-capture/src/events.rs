@@ -21,6 +21,18 @@ use whereabouts_core::model::{NetEvent, NetEventKind, Protocol};
 /// GUID of the `Microsoft-Windows-Kernel-Network` ETW provider.
 pub const KERNEL_NETWORK_PROVIDER: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 
+/// GUID of the `Microsoft-Windows-Kernel-Process` ETW provider.
+pub const KERNEL_PROCESS_PROVIDER: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
+
+/// `WINEVENT_KEYWORD_PROCESS`: process start and stop events only.
+pub const KERNEL_PROCESS_KEYWORD: u64 = 0x10;
+
+/// Kernel-Process event ID for a process start.
+pub const PROCESS_START_EVENT: u16 = 1;
+
+/// Kernel-Process event ID for a process stop.
+pub const PROCESS_STOP_EVENT: u16 = 2;
+
 /// Event IDs that Whereabouts captures (IPv4 and IPv6 variants).
 pub const CAPTURED_EVENT_IDS: [u16; 14] = [
     10, 26, // TCP send

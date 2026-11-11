@@ -2,7 +2,9 @@
 //!
 //! Reads connection metadata from the `Microsoft-Windows-Kernel-Network`
 //! ETW provider: which process, which remote address and port, how many
-//! bytes, and when. It never reads packet contents.
+//! bytes, and when. It never reads packet contents. Process start and exit
+//! events from `Microsoft-Windows-Kernel-Process` keep app attribution
+//! correct when Windows reuses a process ID.
 //!
 //! `unsafe` code is denied crate-wide and allowed only in [`process`], for
 //! Windows API calls. Every `unsafe` block has a `// SAFETY:` comment.
@@ -16,7 +18,7 @@
 //! let (sender, receiver) = mpsc::sync_channel(10_000);
 //! let capture = Capture::start(sender)?; // needs administrator rights
 //! for event in receiver.iter().take(10) {
-//!     println!("{} -> {}", event.pid, event.remote);
+//!     println!("{event:?}");
 //! }
 //! capture.stop()?;
 //! # Ok::<(), whereabouts_win_capture::CaptureError>(())

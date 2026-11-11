@@ -7,8 +7,8 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 ### Added
 
 - `win-capture`: live network capture from the `Microsoft-Windows-Kernel-Network` ETW provider (TCP and UDP, IPv4 and IPv6), with bounded queues and counters for dropped and unreadable events. Event decoding is verified against real Windows 11 events and covered by unit tests.
-- `win-capture`: executable path lookup for a process ID (first step of app attribution).
-- `core`: `NetEvent` model and `FlowTable`, which aggregates events into per-app, per-destination flows, ignores loopback traffic and caps memory use.
+- `win-capture`: executable path lookup for a process ID, plus process start/exit events from `Microsoft-Windows-Kernel-Process`, so flows and names are closed when a process exits and a reused process ID is never mixed up with the old process.
+- `core`: `NetEvent` model and `FlowTable`, which aggregates events into per-app, per-destination flows and ignores loopback traffic. Memory is capped per process and in total; traffic beyond a process's limit goes into a visible "many destinations" flow for that process, so one process cannot hide another's traffic by flooding the table.
 - `service`: `--console` mode showing live flows per app (run as administrator).
 - `win-capture`: `etw_probe` example for inspecting raw ETW events during development.
 - Design specification (`docs/design-spec.md`), privacy policy, security policy and contribution guide.
