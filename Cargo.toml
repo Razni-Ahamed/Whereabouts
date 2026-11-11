@@ -27,6 +27,10 @@ whereabouts-store = { path = "crates/store" }
 whereabouts-win-capture = { path = "crates/win-capture" }
 whereabouts-win-firewall = { path = "crates/win-firewall" }
 
+# Third-party
+ferrisetw = "1.2"
+windows = "0.62"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

@@ -10,7 +10,9 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+whereabouts-core.workspace = true
 whereabouts-ipc.workspace = true
+whereabouts-win-capture.workspace = true
 
 [lints]
 workspace = true

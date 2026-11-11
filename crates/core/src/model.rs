@@ -4,11 +4,11 @@
 //! field for URL paths, query strings, headers or bodies: Whereabouts never
 //! reads traffic contents (privacy principle P1).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::SystemTime;
 
 /// Transport protocol of a flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Protocol {
     /// Transmission Control Protocol.
     Tcp,
@@ -55,4 +55,71 @@ pub struct Flow {
     pub bytes_received: u64,
     /// Whether the app was in the foreground when the flow started.
     pub foreground: bool,
+}
+
+/// What happened on a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetEventKind {
+    /// An outgoing TCP connection was opened.
+    Connect,
+    /// An incoming TCP connection was accepted.
+    Accept,
+    /// Data was sent.
+    Send,
+    /// Data was received.
+    Receive,
+    /// A TCP connection was closed.
+    Disconnect,
+}
+
+/// One raw network event from the capture layer, before aggregation.
+///
+/// Like [`Flow`], this holds metadata only: who, where, when and how much.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetEvent {
+    /// ID of the process that owns the connection.
+    pub pid: u32,
+    /// Transport protocol.
+    pub protocol: Protocol,
+    /// What happened.
+    pub kind: NetEventKind,
+    /// Local address and port.
+    pub local: SocketAddr,
+    /// Remote address and port.
+    pub remote: SocketAddr,
+    /// Payload size in bytes for [`NetEventKind::Send`] and
+    /// [`NetEventKind::Receive`]; zero for other kinds.
+    pub bytes: u64,
+    /// When the event happened.
+    pub timestamp: SystemTime,
+}
+
+impl NetEvent {
+    /// Returns `true` if the remote end is this computer (loopback).
+    ///
+    /// Loopback traffic never leaves the device, so Whereabouts ignores it.
+    pub fn is_loopback(&self) -> bool {
+        self.remote.ip().to_canonical().is_loopback()
+    }
+}
+
+/// Anything the capture layer reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureEvent {
+    /// A network event.
+    Net(NetEvent),
+    /// A process started.
+    ProcessStarted {
+        /// ID of the new process.
+        pid: u32,
+        /// Path of its executable, as reported by the operating system
+        /// (on Windows, possibly a `\Device\HarddiskVolumeN\...` path).
+        image: String,
+    },
+    /// A process exited. Its ID may be reused by a later process, so flows
+    /// and names tied to this ID must be closed.
+    ProcessExited {
+        /// ID of the process that exited.
+        pid: u32,
+    },
 }

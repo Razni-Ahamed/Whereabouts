@@ -10,5 +10,6 @@
 #![forbid(unsafe_code)]
 
 pub mod entropy;
+pub mod flow;
 pub mod model;
 pub mod stats;

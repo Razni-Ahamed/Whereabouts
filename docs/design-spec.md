@@ -125,7 +125,17 @@ Sources (all metadata, no payload):
 2. **ETW – DNS client provider** (`Microsoft-Windows-DNS-Client`): DNS queries and answers with the process ID that asked.
 3. **WFP network events** (`FwpmNetEventSubscribe`): allowed/blocked connection events with the app identity. Used to confirm blocks and to catch connections the ETW stream missed.
 
-Rust libraries: `ferrisetw` for ETW consumption; the official `windows` crate for WFP and other Win32 APIs.
+Rust libraries: `ferrisetw` for ETW consumption; the official `windows` crate for WFP and other Win32 APIs. `ferrisetw` is wrapped inside the `win-capture` crate so it can be replaced without touching the rest of the code.
+
+Facts about the kernel network provider, verified against real events on Windows 11 (2026-11-11):
+
+| Fact | Consequence |
+|---|---|
+| The event header's process ID is usually 4 (System). | The owning process comes from the `PID` field in the event payload. |
+| Ports are stored in network byte order. | Ports are converted with `u16::from_be`. |
+| TCP events and UDP *send* events store the remote end in `daddr`/`dport`; UDP *receive* events store it in `saddr`/`sport`. | Direction is decoded per event type. |
+| Events 18/34 ("protocol copied data on behalf of user") repeat data already counted by receive events. | They are not captured, to avoid double counting. |
+| DNS lookups are sent by the DNS Client service (`svchost.exe`), not by the app that asked. | Domain attribution must use the DNS Client ETW provider (§5.4), not port-53 traffic. |
 
 Events are aggregated in memory into **flows** (app + remote IP + port + protocol) and flushed to storage in short batches (e.g. every 5 seconds) to keep disk writes low.
 

@@ -62,6 +62,16 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 | v1.0 | *Trust* | Signed installer, external security review |
 | Later | | Android app, PC + phone dashboard over your local network |
 
+## Trying the current build
+
+The background service and the desktop app are not ready yet, but you can already watch live connections per app in a terminal. Open **PowerShell as administrator** in the project folder and run:
+
+```powershell
+cargo run -p whereabouts-service -- --console
+```
+
+Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. It shows each app's connections with the remote address and port and the bytes sent and received. Nothing is saved yet.
+
 ## Building from source
 
 Requirements:
