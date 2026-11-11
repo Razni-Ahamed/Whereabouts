@@ -1,0 +1,13 @@
+[package]
+name = "whereabouts-core"
+description = "Platform-independent detection logic and data model for Whereabouts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

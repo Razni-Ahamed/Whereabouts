@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an idea for Whereabouts.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy rules
+      description: Whereabouts does not accept features that break its [privacy rules](https://github.com/Razni-Ahamed/Whereabouts/blob/main/CONTRIBUTING.md#the-privacy-rules).
+      options:
+        - label: This idea does not need traffic contents, does not send data off the device, and does not add telemetry.
+          required: true

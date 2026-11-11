@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/enrich",
+    "crates/ipc",
+    "crates/store",
+    "crates/win-capture",
+    "crates/win-firewall",
+    "service",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Razni-Ahamed/Whereabouts"
+authors = ["Whereabouts contributors"]
+publish = false
+
+[workspace.dependencies]
+whereabouts-core = { path = "crates/core" }
+whereabouts-enrich = { path = "crates/enrich" }
+whereabouts-ipc = { path = "crates/ipc" }
+whereabouts-store = { path = "crates/store" }
+whereabouts-win-capture = { path = "crates/win-capture" }
+whereabouts-win-firewall = { path = "crates/win-firewall" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1

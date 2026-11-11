@@ -1,0 +1,59 @@
+# Privacy
+
+Whereabouts exists to protect your privacy, so it has to protect it first. This page explains, in plain language, exactly what Whereabouts does and does not do with your data. The technical version is in the [design spec](docs/design-spec.md#3-privacy-principles-our-contract-with-users).
+
+If the code ever does something this page says it does not, that is a bug. Please [report it](SECURITY.md).
+
+## The short version
+
+- Whereabouts looks at the **outside of your network traffic** (which app, which server, when, how much), never the **inside**.
+- Everything stays **on your computer**. We have no servers and we never receive your data.
+- There is **no telemetry, no analytics, no ads and no account**.
+
+## What Whereabouts records
+
+| Recorded | Example |
+|---|---|
+| Which app made the connection (path, publisher) | `TikTok.exe`, signed by "TikTok Pte. Ltd." |
+| The server's IP address and port | `203.0.113.10:443` |
+| The domain name, if known from a DNS lookup | `analytics.example.com` |
+| The company and country of that server (looked up offline) | "Example Analytics Inc., Singapore" |
+| How much data was sent and received, and when | 12 MB sent, 3 MB received, 03:12–03:15 |
+| Whether the app was in use at the time | background |
+
+**Web browsers:** the list of sites a browser connects to is basically your browsing history. By default, Whereabouts stores only the main domain for browsers (for example `example.com`, not `mail.example.com`), and you can exclude browsers completely.
+
+## What Whereabouts never reads
+
+- Web addresses beyond the domain name (paths like `/user/48213/messages`, or search terms)
+- Headers, cookies, passwords or login tokens
+- Messages, files, photos, videos or any other content you send or receive
+
+Almost all of this is encrypted anyway. Whereabouts never decrypts traffic and never installs a root certificate to do so.
+
+## Where your data is kept
+
+- In an **encrypted database** on your computer, readable only by the Whereabouts service and administrators.
+- **Old data is deleted automatically**: individual connections after 30 days, hourly summaries after 180 days. You can change these limits.
+- You can **export** your data or **delete everything** at any time from the app.
+
+We recommend turning on **BitLocker** so that someone who steals your computer's disk cannot read it.
+
+## Requests Whereabouts makes itself
+
+This is the complete list. You can turn off both.
+
+| Request | Why | What it sends |
+|---|---|---|
+| Download list updates | Keep tracker, company and country data current | A plain download of a fixed public file. No ID, no cookies, nothing about you. |
+| Check for app updates | Tell you when a new version exists | The same: a plain download of a fixed public file. |
+
+Both downloads are digitally signed, and Whereabouts rejects any file that fails the signature check. Whereabouts monitors itself like every other app, so you can check this list against what it actually does.
+
+## Learning and machine learning
+
+Whereabouts learns what is normal for each of your apps so it can warn you about unusual behaviour. This learning happens **only on your computer**. The learned profiles are stored encrypted, you can view and reset them, and nothing is ever shared, not even anonymised model updates.
+
+## Crash reports
+
+If Whereabouts crashes, the report is saved on your computer. It is never uploaded. If you want to help fix the problem, you can attach it to a GitHub issue yourself, after reviewing it.

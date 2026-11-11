@@ -1,0 +1,16 @@
+[package]
+name = "whereabouts-service"
+description = "Whereabouts background service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+whereabouts-ipc.workspace = true
+
+[lints]
+workspace = true

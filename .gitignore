@@ -1,0 +1,49 @@
+# Rust build output (Cargo.lock IS committed: this is an application)
+/target/
+
+# Secrets and signing material: never commit
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
+
+# User traffic data and local databases: never commit
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+*.pcap
+*.pcapng
+*.etl
+
+# Lab, ML and experiment artefacts
+lab/output/
+lab/data/raw/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+mlruns/
+wandb/
+
+# Frontend (Tauri UI)
+node_modules/
+ui/dist/
+
+# Editors and OS files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+.DS_Store
+Thumbs.db

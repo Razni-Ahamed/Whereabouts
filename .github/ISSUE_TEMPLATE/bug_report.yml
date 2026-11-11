@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in Whereabouts does not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Privacy check:** issues are public. Before pasting logs or screenshots, remove domain names, IP addresses, file paths and anything else you do not want the world to see.
+        Security problems go through [private reporting](https://github.com/Razni-Ahamed/Whereabouts/security/advisories/new), not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Whereabouts version or commit
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: e.g. Windows 11 24H2
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional, review for private data first)
+      render: text

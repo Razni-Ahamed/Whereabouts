@@ -1,0 +1,36 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Checks dependencies for security advisories, licence compatibility with
+# GPL-3.0-or-later, duplicate versions and untrusted sources.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Licences compatible with distributing Whereabouts under GPL-3.0-or-later.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Our own crates are not published; their licence is set in Cargo.toml.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
