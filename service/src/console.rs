@@ -50,11 +50,15 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     let mut names = ProcessNames::default();
     let mut closed = VecDeque::new();
     let mut exited = RecentlyExited::default();
+    // Start time of each running process, so that a process is identified by
+    // its ID *and* start time, not by its ID alone.
+    let mut starts: HashMap<u32, SystemTime> = HashMap::new();
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(CaptureEvent::Net(event)) => {
-                if let Some(app) = exited.name(event.pid) {
+                let current_start = starts.get(&event.pid).copied();
+                if let Some(app) = exited.owner(&event, current_start) {
                     add_late_traffic(&mut closed, app, &event);
                 } else {
                     // Look the process up while it is still running.
@@ -62,16 +66,20 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                     table.record(&event);
                 }
             }
-            Ok(CaptureEvent::ProcessStarted { pid, image }) => {
-                // A new process with a reused ID: its traffic is its own.
-                exited.forget(pid);
+            Ok(CaptureEvent::ProcessStarted {
+                pid,
+                image,
+                timestamp,
+            }) => {
+                starts.insert(pid, timestamp);
                 names.set(pid, file_name(&image));
             }
-            Ok(CaptureEvent::ProcessExited { pid }) => {
+            Ok(CaptureEvent::ProcessExited { pid, timestamp }) => {
                 // Windows may reuse this ID, so close everything tied to it.
                 close(&mut closed, &names, table.take_process(pid));
-                exited.insert(pid, names.get(pid).to_owned());
+                exited.insert(pid, names.get(pid).to_owned(), timestamp);
                 names.forget(pid);
+                starts.remove(&pid);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -92,6 +100,8 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     }
 
     draw(&table, &closed, &names, capture.counts(), started.elapsed());
+    // Release any process event waiting for queue space before stopping.
+    drop(receiver);
     if let Err(error) = capture.stop() {
         eprintln!("warning: {error}");
     }
@@ -126,29 +136,55 @@ impl ProcessNames {
     }
 }
 
-/// Names of processes that exited recently, for attributing late traffic.
+/// A process that exited recently.
+#[derive(Debug)]
+struct Exited {
+    app: String,
+    /// Exit time reported by Windows.
+    exited_at: SystemTime,
+    /// When we learned about the exit, for expiring the entry.
+    noted: Instant,
+}
+
+/// Processes that exited recently, for attributing late traffic.
 #[derive(Debug, Default)]
-struct RecentlyExited(HashMap<u32, (String, Instant)>);
+struct RecentlyExited(HashMap<u32, Exited>);
 
 impl RecentlyExited {
-    fn insert(&mut self, pid: u32, app: String) {
-        self.0.insert(pid, (app, Instant::now()));
+    fn insert(&mut self, pid: u32, app: String, exited_at: SystemTime) {
+        let noted = Instant::now();
+        self.0.insert(
+            pid,
+            Exited {
+                app,
+                exited_at,
+                noted,
+            },
+        );
     }
 
-    fn forget(&mut self, pid: u32) {
-        self.0.remove(&pid);
-    }
-
-    fn name(&self, pid: u32) -> Option<&str> {
-        self.0
-            .get(&pid)
-            .filter(|(_, at)| at.elapsed() < LATE_TRAFFIC_WINDOW)
-            .map(|(app, _)| app.as_str())
+    /// Returns the name of the exited process that `event` belongs to, if
+    /// it is late traffic from a process that exited recently.
+    ///
+    /// `current_start` is the start time of the process that now has the
+    /// event's ID, if any. Traffic at or after that start belongs to the new
+    /// process, even if the events arrive out of order.
+    fn owner(&self, event: &NetEvent, current_start: Option<SystemTime>) -> Option<&str> {
+        let exited = self.0.get(&event.pid)?;
+        if exited.noted.elapsed() >= LATE_TRAFFIC_WINDOW {
+            return None;
+        }
+        let newer_process = current_start
+            .is_some_and(|start| start >= exited.exited_at && event.timestamp >= start);
+        if newer_process {
+            return None;
+        }
+        Some(&exited.app)
     }
 
     fn expire(&mut self) {
         self.0
-            .retain(|_, (_, at)| at.elapsed() < LATE_TRAFFIC_WINDOW);
+            .retain(|_, exited| exited.noted.elapsed() < LATE_TRAFFIC_WINDOW);
     }
 }
 
@@ -186,10 +222,18 @@ fn close(closed: &mut VecDeque<Row>, names: &ProcessNames, flows: Vec<(FlowKey, 
             closed.pop_front();
         }
         closed.push_back(Row {
-            app: names.get(key.pid).to_owned(),
+            app: app_name(&key, names),
             key,
             stats,
         });
+    }
+}
+
+fn app_name(key: &FlowKey, names: &ProcessNames) -> String {
+    if key.is_global_overflow() {
+        String::from("(many processes)")
+    } else {
+        names.get(key.pid).to_owned()
     }
 }
 
@@ -204,7 +248,7 @@ fn draw(
         .snapshot()
         .into_iter()
         .map(|(key, stats)| Row {
-            app: names.get(key.pid).to_owned(),
+            app: app_name(&key, names),
             key,
             stats,
         })
@@ -296,6 +340,10 @@ mod tests {
     use super::*;
     use whereabouts_core::model::NetEventKind;
 
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
     fn late_send(pid: u32, bytes: u64) -> NetEvent {
         NetEvent {
             pid,
@@ -319,12 +367,29 @@ mod tests {
     }
 
     #[test]
-    fn recently_exited_names_are_cleared_when_the_id_is_reused() {
+    fn late_traffic_goes_to_the_exited_process() {
         let mut exited = RecentlyExited::default();
-        exited.insert(7, String::from("old.exe"));
-        assert_eq!(exited.name(7), Some("old.exe"));
-        exited.forget(7); // ProcessStarted for a new process with ID 7
-        assert_eq!(exited.name(7), None);
+        exited.insert(7, String::from("old.exe"), at(100));
+        let mut event = late_send(7, 24);
+        event.timestamp = at(101);
+        assert_eq!(exited.owner(&event, None), Some("old.exe"));
+    }
+
+    #[test]
+    fn traffic_from_a_new_process_with_a_reused_id_is_not_late_traffic() {
+        let mut exited = RecentlyExited::default();
+        exited.insert(7, String::from("old.exe"), at(100));
+        let new_start = Some(at(105));
+
+        let mut new_traffic = late_send(7, 500);
+        new_traffic.timestamp = at(106);
+        assert_eq!(exited.owner(&new_traffic, new_start), None);
+
+        // Late traffic from the old process that arrives out of order, after
+        // the new process's start event, still goes to the old process.
+        let mut old_traffic = late_send(7, 24);
+        old_traffic.timestamp = at(101);
+        assert_eq!(exited.owner(&old_traffic, new_start), Some("old.exe"));
     }
 
     #[test]

@@ -104,6 +104,11 @@ impl NetEvent {
 }
 
 /// Anything the capture layer reports.
+///
+/// Process events let consumers tell apart two processes that had the same
+/// ID at different times: a process is identified by its ID *and* its start
+/// time. The capture layer never drops process events, unlike network
+/// events, which are dropped (and counted) if the consumer falls behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureEvent {
     /// A network event.
@@ -115,11 +120,15 @@ pub enum CaptureEvent {
         /// Path of its executable, as reported by the operating system
         /// (on Windows, possibly a `\Device\HarddiskVolumeN\...` path).
         image: String,
+        /// When the process started.
+        timestamp: SystemTime,
     },
     /// A process exited. Its ID may be reused by a later process, so flows
     /// and names tied to this ID must be closed.
     ProcessExited {
         /// ID of the process that exited.
         pid: u32,
+        /// When the process exited.
+        timestamp: SystemTime,
     },
 }

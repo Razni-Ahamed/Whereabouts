@@ -20,6 +20,7 @@
 //! for event in receiver.iter().take(10) {
 //!     println!("{event:?}");
 //! }
+//! drop(receiver); // release any process event waiting for queue space
 //! capture.stop()?;
 //! # Ok::<(), whereabouts_win_capture::CaptureError>(())
 //! ```
