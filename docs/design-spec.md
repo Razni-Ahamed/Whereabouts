@@ -341,6 +341,7 @@ This is the complete list. Anything not on it is a bug.
 | Someone with the disk (stolen laptop) | SQLCipher + DPAPI | DPAPI machine-scope keys can be recovered from an unencrypted Windows disk. **We recommend BitLocker** and say so in the UI. |
 | Malware with admin/SYSTEM rights | None. It can stop our service or read memory. | **Out of scope**, stated clearly. We may still observe its network activity before it acts. |
 | Malware hiding inside a trusted process | Attributed to the host process | Stated limitation (§5.3) |
+| Malware flooding the flow table to hide traffic | Per-process flow limits; excess traffic goes to a per-process overflow flow, so bytes stay visible and attributed | With thousands of processes flooding at once, the overflow limit is exhausted and further traffic lands in one shared flow without per-process attribution. This is counted and reported as a possible evasion attempt. |
 | Tampered list update | Signature check with built-in key | Key compromise → rotate key in an app update |
 | Supply-chain attack on dependencies | `Cargo.lock` committed, `cargo-audit` + `cargo-deny` in CI, minimal dependencies, review of new crates | – |
 | **Us, the developers** | No backend, no telemetry, open source, signed and documented builds, reproducible builds goal | – |

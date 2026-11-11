@@ -272,6 +272,12 @@ fn draw(
         counts.malformed,
         table.overflowed_events()
     );
+    if table.shared_overflow_events() > 0 {
+        println!(
+            "!! {} events could not be attributed to a process: many processes are flooding the              flow table at once, which may be an attempt to evade monitoring.",
+            table.shared_overflow_events()
+        );
+    }
     println!(
         "{:>6}  {:<24} {:<5} {:<46} {:>10} {:>10}",
         "PID", "APP", "PROTO", "REMOTE", "SENT", "RECEIVED"
