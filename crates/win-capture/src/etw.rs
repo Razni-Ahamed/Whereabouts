@@ -64,13 +64,31 @@ struct Counters {
 }
 
 impl Counters {
-    fn deliver(&self, sender: &SyncSender<CaptureEvent>, event: Option<CaptureEvent>) {
+    /// Delivers a high-volume network event. If the queue is full the event
+    /// is dropped and counted, so a slow consumer cannot stall ETW.
+    fn deliver_lossy(&self, sender: &SyncSender<CaptureEvent>, event: Option<CaptureEvent>) {
         self.events.fetch_add(1, Ordering::Relaxed);
         match event {
             Some(event) => {
                 if sender.try_send(event).is_err() {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+            None => {
+                self.malformed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Delivers a process start/exit event, waiting for queue space if
+    /// needed. These events are rare, and losing one would let a reused
+    /// process ID be attributed to the wrong app, so they are never dropped.
+    /// The send fails only once the consumer has dropped its receiver.
+    fn deliver_reliable(&self, sender: &SyncSender<CaptureEvent>, event: Option<CaptureEvent>) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+        match event {
+            Some(event) => {
+                let _ = sender.send(event);
             }
             None => {
                 self.malformed.fetch_add(1, Ordering::Relaxed);
@@ -90,8 +108,13 @@ impl Capture {
     /// Starts capturing and sends every decoded event to `sender`.
     ///
     /// Events are delivered from a background thread. If `sender`'s queue is
-    /// full, events are dropped (and counted) rather than buffered without
-    /// limit, so memory use stays bounded.
+    /// full, network events are dropped (and counted) rather than buffered
+    /// without limit, so memory use stays bounded. Process events wait for
+    /// space instead and are never dropped.
+    ///
+    /// Drop the receiver before calling [`Capture::stop`]: a process event
+    /// waiting for space in a full queue is released only when the receiver
+    /// is read from or dropped.
     pub fn start(sender: SyncSender<CaptureEvent>) -> Result<Self, CaptureError> {
         // A session left behind by a crashed run would block a new one.
         let _ = stop_trace_by_name(SESSION_NAME);
@@ -107,7 +130,7 @@ impl Capture {
                     return;
                 };
                 let event = decode_net(record, locator, spec).map(CaptureEvent::Net);
-                net_counters.deliver(&net_sender, event);
+                net_counters.deliver_lossy(&net_sender, event);
             })
             .build();
 
@@ -124,7 +147,7 @@ impl Capture {
                     return;
                 }
                 let event = decode_process(record, locator, id);
-                process_counters.deliver(&sender, event);
+                process_counters.deliver_reliable(&sender, event);
             })
             .build();
 
@@ -183,10 +206,15 @@ fn decode_process(record: &EventRecord, locator: &SchemaLocator, id: u16) -> Opt
     let schema = locator.event_schema(record).ok()?;
     let parser = Parser::create(record, &schema);
     let pid: u32 = parser.try_parse("ProcessID").ok()?;
+    let timestamp = filetime_to_system_time(record.raw_timestamp());
     if id == PROCESS_START_EVENT {
         let image: String = parser.try_parse("ImageName").ok()?;
-        Some(CaptureEvent::ProcessStarted { pid, image })
+        Some(CaptureEvent::ProcessStarted {
+            pid,
+            image,
+            timestamp,
+        })
     } else {
-        Some(CaptureEvent::ProcessExited { pid })
+        Some(CaptureEvent::ProcessExited { pid, timestamp })
     }
 }
