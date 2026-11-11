@@ -17,6 +17,14 @@
 //! overflow traffic from processes without an overflow flow goes into one
 //! shared flow (see [`FlowKey::is_global_overflow`]), so memory stays
 //! bounded even if a program starts thousands of processes.
+//!
+//! Traffic in the shared flow has lost its per-process attribution. That
+//! can only happen when thousands of processes are flooding the table at
+//! the same time, which is itself suspicious, so it is counted separately
+//! in [`FlowTable::shared_overflow_events`] for the alert layer to report.
+//! (Evicting older overflow flows instead was rejected: finding the one to
+//! evict would cost a scan per event, letting an attacker slow Whereabouts
+//! itself down.)
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -34,9 +42,9 @@ pub const DEFAULT_MAX_FLOWS_PER_PROCESS: usize = 5_000;
 /// Default maximum number of overflow flows.
 pub const DEFAULT_MAX_OVERFLOW_FLOWS: usize = 10_000;
 
-/// Process ID used for the shared overflow flow. PID 0 is the System Idle
-/// Process, which never sends network traffic.
-const GLOBAL_OVERFLOW_PID: u32 = 0;
+/// Process ID used for the shared overflow flow. Windows process IDs are
+/// multiples of 4, so this value can never belong to a real process.
+const GLOBAL_OVERFLOW_PID: u32 = u32::MAX;
 
 /// The remote address used by overflow flows. Real connections never use
 /// address `0.0.0.0` with port 0.
@@ -138,6 +146,7 @@ pub struct FlowTable {
     max_flows_per_process: usize,
     max_overflow_flows: usize,
     overflowed_events: u64,
+    shared_overflow_events: u64,
 }
 
 impl Default for FlowTable {
@@ -173,6 +182,7 @@ impl FlowTable {
             max_flows_per_process,
             max_overflow_flows,
             overflowed_events: 0,
+            shared_overflow_events: 0,
         }
     }
 
@@ -209,6 +219,7 @@ impl FlowTable {
                 {
                     own
                 } else {
+                    self.shared_overflow_events += 1;
                     FlowKey::overflow(GLOBAL_OVERFLOW_PID, event.protocol)
                 };
                 match self.flows.entry(overflow_key) {
@@ -298,6 +309,17 @@ impl FlowTable {
     /// Number of events added to overflow flows because a limit was reached.
     pub fn overflowed_events(&self) -> u64 {
         self.overflowed_events
+    }
+
+    /// Number of events added to the shared overflow flow, which has lost
+    /// per-process attribution.
+    ///
+    /// This only happens when the overflow limit is exhausted, which takes
+    /// thousands of processes flooding the table at once. A non-zero value
+    /// is a sign of a possible attempt to evade monitoring and should be
+    /// reported to the user.
+    pub fn shared_overflow_events(&self) -> u64 {
+        self.shared_overflow_events
     }
 }
 
@@ -443,6 +465,9 @@ mod tests {
             .find(|(k, _)| k.is_global_overflow())
             .expect("shared overflow flow exists");
         assert_eq!(shared.1.bytes_sent, 998 * 100);
+        assert_eq!(shared.0.pid, u32::MAX, "sentinel cannot be a real PID");
+        assert_eq!(table.shared_overflow_events(), 998);
+        assert_eq!(table.overflowed_events(), 999);
         // Process 2 keeps its own overflow flow and stays attributed.
         assert!(
             flows
