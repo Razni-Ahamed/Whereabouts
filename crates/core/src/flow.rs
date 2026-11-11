@@ -12,6 +12,11 @@
 //! flow for that process (see [`FlowKey::overflow`]), so the bytes stay
 //! visible and attributed. A process that floods the table with fake
 //! connections therefore cannot hide another process's traffic.
+//!
+//! Overflow flows are limited too. Once that limit is reached, further
+//! overflow traffic from processes without an overflow flow goes into one
+//! shared flow (see [`FlowKey::is_global_overflow`]), so memory stays
+//! bounded even if a program starts thousands of processes.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -25,6 +30,13 @@ pub const DEFAULT_MAX_FLOWS: usize = 50_000;
 
 /// Default maximum number of regular flows per process.
 pub const DEFAULT_MAX_FLOWS_PER_PROCESS: usize = 5_000;
+
+/// Default maximum number of overflow flows.
+pub const DEFAULT_MAX_OVERFLOW_FLOWS: usize = 10_000;
+
+/// Process ID used for the shared overflow flow. PID 0 is the System Idle
+/// Process, which never sends network traffic.
+const GLOBAL_OVERFLOW_PID: u32 = 0;
 
 /// The remote address used by overflow flows. Real connections never use
 /// address `0.0.0.0` with port 0.
@@ -55,6 +67,12 @@ impl FlowKey {
     /// Returns `true` if this is an overflow flow.
     pub fn is_overflow(&self) -> bool {
         self.remote == OVERFLOW_REMOTE
+    }
+
+    /// Returns `true` if this is the overflow flow shared by all processes,
+    /// used once the overflow limit is reached.
+    pub fn is_global_overflow(&self) -> bool {
+        self.is_overflow() && self.pid == GLOBAL_OVERFLOW_PID
     }
 }
 
@@ -115,14 +133,20 @@ pub struct FlowTable {
     /// Number of regular (non-overflow) flows per process.
     per_process: HashMap<u32, usize>,
     regular_flows: usize,
+    overflow_flows: usize,
     max_flows: usize,
     max_flows_per_process: usize,
+    max_overflow_flows: usize,
     overflowed_events: u64,
 }
 
 impl Default for FlowTable {
     fn default() -> Self {
-        Self::with_limits(DEFAULT_MAX_FLOWS, DEFAULT_MAX_FLOWS_PER_PROCESS)
+        Self::with_limits(
+            DEFAULT_MAX_FLOWS,
+            DEFAULT_MAX_FLOWS_PER_PROCESS,
+            DEFAULT_MAX_OVERFLOW_FLOWS,
+        )
     }
 }
 
@@ -133,16 +157,21 @@ impl FlowTable {
     }
 
     /// Creates an empty table that holds at most `max_flows` regular flows
-    /// in total and `max_flows_per_process` per process.
-    ///
-    /// Overflow flows are not counted; there are at most two per process.
-    pub fn with_limits(max_flows: usize, max_flows_per_process: usize) -> Self {
+    /// in total, `max_flows_per_process` per process, and
+    /// `max_overflow_flows` overflow flows (plus at most two shared ones).
+    pub fn with_limits(
+        max_flows: usize,
+        max_flows_per_process: usize,
+        max_overflow_flows: usize,
+    ) -> Self {
         Self {
             flows: HashMap::new(),
             per_process: HashMap::new(),
             regular_flows: 0,
+            overflow_flows: 0,
             max_flows,
             max_flows_per_process,
+            max_overflow_flows,
             overflowed_events: 0,
         }
     }
@@ -174,9 +203,21 @@ impl FlowTable {
             }
             Entry::Vacant(_) => {
                 self.overflowed_events += 1;
-                self.flows
-                    .entry(FlowKey::overflow(event.pid, event.protocol))
-                    .or_insert_with(|| FlowStats::new(event.timestamp))
+                let own = FlowKey::overflow(event.pid, event.protocol);
+                let overflow_key = if self.flows.contains_key(&own)
+                    || self.overflow_flows < self.max_overflow_flows
+                {
+                    own
+                } else {
+                    FlowKey::overflow(GLOBAL_OVERFLOW_PID, event.protocol)
+                };
+                match self.flows.entry(overflow_key) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        self.overflow_flows += 1;
+                        entry.insert(FlowStats::new(event.timestamp))
+                    }
+                }
             }
         };
         stats.record(event);
@@ -228,7 +269,9 @@ impl FlowTable {
             .collect();
         for (key, _) in &taken {
             self.flows.remove(key);
-            if !key.is_overflow() {
+            if key.is_overflow() {
+                self.overflow_flows -= 1;
+            } else {
                 self.regular_flows -= 1;
                 if let Entry::Occupied(mut count) = self.per_process.entry(key.pid) {
                     *count.get_mut() -= 1;
@@ -338,7 +381,7 @@ mod tests {
 
     #[test]
     fn flooding_process_cannot_hide_another_process() {
-        let mut table = FlowTable::with_limits(100, 3);
+        let mut table = FlowTable::with_limits(100, 3, 100);
         // Process 1 opens 50 connections; only 3 get their own flow.
         for port in 1..=50 {
             table.record(&event(1, &server(port), NetEventKind::Send, 10, 1));
@@ -366,7 +409,7 @@ mod tests {
 
     #[test]
     fn full_table_sends_new_flows_to_overflow_and_keeps_updating_existing_ones() {
-        let mut table = FlowTable::with_limits(1, 10);
+        let mut table = FlowTable::with_limits(1, 10, 100);
         table.record(&event(1, SERVER, NetEventKind::Send, 10, 1));
         table.record(&event(2, SERVER, NetEventKind::Send, 10, 1));
         table.record(&event(1, SERVER, NetEventKind::Send, 5, 2));
@@ -380,6 +423,32 @@ mod tests {
                 .any(|(k, s)| k.pid == 2 && k.is_overflow() && s.bytes_sent == 10)
         );
         assert_eq!(table.overflowed_events(), 1);
+    }
+
+    #[test]
+    fn overflow_flows_are_capped_by_a_shared_bucket() {
+        // One regular flow in total and one overflow flow before sharing.
+        let mut table = FlowTable::with_limits(1, 1, 1);
+        table.record(&event(1, &server(1), NetEventKind::Send, 1, 1)); // regular
+        table.record(&event(2, &server(2), NetEventKind::Send, 10, 1)); // own overflow
+        for pid in 3..=1000 {
+            table.record(&event(pid, &server(3), NetEventKind::Send, 100, 1));
+        }
+
+        // 1 regular + 1 per-process overflow + 1 shared overflow, however many processes.
+        assert_eq!(table.len(), 3);
+        let flows = table.snapshot();
+        let shared = flows
+            .iter()
+            .find(|(k, _)| k.is_global_overflow())
+            .expect("shared overflow flow exists");
+        assert_eq!(shared.1.bytes_sent, 998 * 100);
+        // Process 2 keeps its own overflow flow and stays attributed.
+        assert!(
+            flows
+                .iter()
+                .any(|(k, s)| k.pid == 2 && k.is_overflow() && s.bytes_sent == 10)
+        );
     }
 
     #[test]
@@ -407,7 +476,7 @@ mod tests {
 
     #[test]
     fn take_process_removes_all_flows_of_that_process() {
-        let mut table = FlowTable::with_limits(100, 1);
+        let mut table = FlowTable::with_limits(100, 1, 100);
         table.record(&event(1, &server(1), NetEventKind::Send, 1, 1));
         table.record(&event(1, &server(2), NetEventKind::Send, 1, 1)); // overflow
         table.record(&event(2, SERVER, NetEventKind::Send, 1, 1));
@@ -420,7 +489,7 @@ mod tests {
 
     #[test]
     fn removed_flows_free_their_slots_for_reused_process_ids() {
-        let mut table = FlowTable::with_limits(100, 1);
+        let mut table = FlowTable::with_limits(100, 1, 100);
         table.record(&event(7, &server(1), NetEventKind::Send, 1, 1));
         table.take_process(7);
 
