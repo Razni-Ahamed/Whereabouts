@@ -15,24 +15,34 @@
 //!
 //! A label is therefore:
 //!
-//! - [`LabelSource::Verified`] when the app's answer is backed by a
-//!   confirmed answer for the same name and address;
+//! - [`LabelSource::Verified`] when the Windows DNS service resolved the
+//!   *same name* the app reported to the *same address*. This proves the app
+//!   did not invent the pair. It does not prove who runs the server: DNS
+//!   itself can be lied to (for example by a malicious DNS server).
 //! - [`LabelSource::Unverified`] when only the app says so (it may be a
 //!   lie, or the lookup was answered from the cache before Whereabouts
-//!   started);
+//!   started).
 //! - [`LabelSource::Inferred`] when the process made no lookup for the
-//!   address but the DNS service resolved it for some name. Only confirmed
+//!   address but the DNS service resolved some name to it. Only confirmed
 //!   answers are used for this, so one app cannot plant labels on another
-//!   app's connections.
+//!   app's connections. It is a guess: one address can serve many names.
+//!
+//! Confirmations are kept **by name**, and an app answer is checked against
+//! them when it arrives; the result is stored with the answer. So a later
+//! flood of lookups cannot undo a verification, and an attacker who points
+//! their own domain at a popular address cannot verify a different name.
+//! The per-address list used for inferred labels keeps the *first* names it
+//! sees; newer names never push older ones out.
 //!
 //! # Limits
 //!
 //! App answers are bounded per process and in total; answers beyond the
-//! limits are counted, not stored. Confirmed answers are bounded in total;
-//! when full, the oldest are evicted so new lookups are always recorded.
-//! Everything here lives in memory only.
+//! limits are counted, not stored. Confirmations are bounded in total; when
+//! full, the least recently confirmed are evicted, so new lookups are always
+//! recorded. Everything here lives in memory only.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -49,22 +59,25 @@ pub const DEFAULT_MAX_PER_PROCESS: usize = 10_000;
 /// Default maximum number of remembered app answers in total.
 pub const DEFAULT_MAX_TOTAL: usize = 200_000;
 
-/// Default maximum number of addresses with confirmed answers.
+/// Default maximum number of names and of addresses with confirmations.
 pub const DEFAULT_MAX_CONFIRMED: usize = 200_000;
 
-/// Most names remembered per confirmed address. Content delivery networks
-/// serve many names from one address.
+/// Most names remembered per address for inferred labels. Content delivery
+/// networks serve many names from one address.
 const MAX_NAMES_PER_ADDRESS: usize = 8;
+
+/// Most addresses remembered per confirmed name.
+const MAX_ADDRESSES_PER_NAME: usize = 64;
 
 /// How much a label can be trusted. Ordered from least to most trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LabelSource {
-    /// The process made no lookup for this address; the name is the most
-    /// recent one the DNS service resolved to it.
+    /// The process made no lookup for this address; the name is one the DNS
+    /// service resolved to it.
     Inferred,
     /// Only the app itself reported this lookup.
     Unverified,
-    /// The app's lookup is confirmed by the Windows DNS service.
+    /// The Windows DNS service resolved the app's name to this address.
     Verified,
 }
 
@@ -81,28 +94,110 @@ pub struct DomainLabel {
 struct Answer {
     name: Arc<str>,
     at: SystemTime,
+    /// Whether a confirmation existed when the answer arrived.
+    verified: bool,
 }
 
+/// A bounded map that evicts the least recently updated entry when full.
 #[derive(Debug)]
-struct Confirmed {
-    /// Names resolved to this address, oldest first.
-    names: Vec<Arc<str>>,
-    at: SystemTime,
+struct Recent<K, V> {
+    map: HashMap<K, (V, SystemTime)>,
+    /// Update order, oldest first. May hold stale entries, which are skipped
+    /// on eviction and removed by compaction.
+    order: VecDeque<(K, SystemTime)>,
+    max: usize,
 }
 
-/// Map of DNS answers per process and per address.
+impl<K: Hash + Eq + Clone, V> Recent<K, V> {
+    fn new(max: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            max,
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<(&V, SystemTime)> {
+        self.map.get(key).map(|(value, at)| (value, *at))
+    }
+
+    /// Updates `key` with `update`, or inserts `make()` if it is absent,
+    /// evicting the least recently updated entries if the map is full.
+    fn upsert(
+        &mut self,
+        key: K,
+        at: SystemTime,
+        make: impl FnOnce() -> V,
+        update: impl FnOnce(&mut V),
+    ) {
+        let latest = if let Some((value, seen)) = self.map.get_mut(&key) {
+            update(value);
+            *seen = (*seen).max(at);
+            *seen
+        } else {
+            while self.map.len() >= self.max && self.evict_oldest() {}
+            if self.map.len() >= self.max {
+                return;
+            }
+            self.map.insert(key.clone(), (make(), at));
+            at
+        };
+        self.order.push_back((key, latest));
+        if self.order.len() > 2 * self.map.len() + 1024 {
+            self.compact();
+        }
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        while let Some((key, at)) = self.order.pop_front() {
+            if self.map.get(&key).is_some_and(|(_, seen)| *seen == at) {
+                self.map.remove(&key);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Keeps only the latest order entry per key.
+    fn compact(&mut self) {
+        let map = &self.map;
+        let mut seen = HashSet::new();
+        let mut kept: Vec<(K, SystemTime)> = self
+            .order
+            .iter()
+            .rev()
+            .filter(|(key, at)| {
+                map.get(key).is_some_and(|(_, latest)| latest == at) && seen.insert(key.clone())
+            })
+            .cloned()
+            .collect();
+        kept.reverse();
+        self.order = kept.into();
+    }
+
+    fn retain_fresh(&mut self, now: SystemTime, lifetime: Duration) {
+        self.map.retain(|_, (_, at)| age(*at, now) < lifetime);
+        self.compact();
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Map of DNS answers per process, with confirmations per name and address.
 #[derive(Debug)]
 pub struct DnsMap {
     asked: HashMap<u32, HashMap<IpAddr, Answer>>,
     asked_entries: usize,
-    confirmed: HashMap<IpAddr, Confirmed>,
-    /// Insertion order of confirmed updates, for evicting the oldest. May
-    /// hold stale entries, which are skipped and periodically compacted.
-    confirmed_order: VecDeque<(IpAddr, SystemTime)>,
+    /// Name -> addresses the DNS service resolved it to.
+    by_name: Recent<Arc<str>, HashSet<IpAddr>>,
+    /// Address -> names the DNS service resolved to it (first ones kept),
+    /// each with when it was last confirmed.
+    by_address: Recent<IpAddr, Vec<(Arc<str>, SystemTime)>>,
     lifetime: Duration,
     max_per_process: usize,
     max_total: usize,
-    max_confirmed: usize,
     dropped_answers: u64,
 }
 
@@ -125,7 +220,7 @@ impl DnsMap {
 
     /// Creates an empty map that keeps answers for `lifetime`, at most
     /// `max_per_process` app answers per process and `max_total` in total,
-    /// and confirmed answers for at most `max_confirmed` addresses.
+    /// and confirmations for at most `max_confirmed` names and addresses.
     pub fn with_limits(
         lifetime: Duration,
         max_per_process: usize,
@@ -135,18 +230,18 @@ impl DnsMap {
         Self {
             asked: HashMap::new(),
             asked_entries: 0,
-            confirmed: HashMap::new(),
-            confirmed_order: VecDeque::new(),
+            by_name: Recent::new(max_confirmed),
+            by_address: Recent::new(max_confirmed),
             lifetime,
             max_per_process,
             max_total,
-            max_confirmed,
             dropped_answers: 0,
         }
     }
 
     /// Records an app answer: process `pid` says it looked up `name` and
-    /// got `addresses`.
+    /// got `addresses`. Each address is checked against the confirmations
+    /// now, and the result is kept with the answer.
     ///
     /// A newer answer for the same process and address replaces the older
     /// one. Addresses beyond the limits are counted in
@@ -163,6 +258,7 @@ impl DnsMap {
             let answer = Answer {
                 name: Arc::clone(&name),
                 at,
+                verified: self.is_confirmed(&name, address, at),
             };
             let total_full = self.asked_entries >= self.max_total;
             let entries = self.asked.entry(pid).or_default();
@@ -185,32 +281,42 @@ impl DnsMap {
     /// process.
     pub fn record_confirmed(&mut self, name: &str, addresses: &[IpAddr], at: SystemTime) {
         let name: Arc<str> = Arc::from(name);
-        for address in addresses.iter().map(IpAddr::to_canonical) {
-            if let Some(entry) = self.confirmed.get_mut(&address) {
-                entry.names.retain(|existing| *existing != name);
-                entry.names.push(Arc::clone(&name));
-                if entry.names.len() > MAX_NAMES_PER_ADDRESS {
-                    entry.names.remove(0);
+        let addresses: Vec<IpAddr> = addresses.iter().map(IpAddr::to_canonical).collect();
+
+        let initial: HashSet<IpAddr> = addresses
+            .iter()
+            .copied()
+            .take(MAX_ADDRESSES_PER_NAME)
+            .collect();
+        self.by_name.upsert(
+            Arc::clone(&name),
+            at,
+            || initial,
+            |known| {
+                for address in &addresses {
+                    if known.len() >= MAX_ADDRESSES_PER_NAME {
+                        break;
+                    }
+                    known.insert(*address);
                 }
-                entry.at = entry.at.max(at);
-            } else {
-                while self.confirmed.len() >= self.max_confirmed && self.evict_oldest_confirmed() {}
-                if self.confirmed.len() >= self.max_confirmed {
-                    continue;
-                }
-                self.confirmed.insert(
-                    address,
-                    Confirmed {
-                        names: vec![Arc::clone(&name)],
-                        at,
-                    },
-                );
-            }
-            let latest = self.confirmed[&address].at;
-            self.confirmed_order.push_back((address, latest));
-        }
-        if self.confirmed_order.len() > 2 * self.confirmed.len() + 1024 {
-            self.compact_confirmed_order();
+            },
+        );
+
+        for address in addresses {
+            self.by_address.upsert(
+                address,
+                at,
+                || vec![(Arc::clone(&name), at)],
+                |names| {
+                    if let Some(entry) = names.iter_mut().find(|(known, _)| *known == name) {
+                        entry.1 = entry.1.max(at);
+                    } else if names.len() < MAX_NAMES_PER_ADDRESS {
+                        names.push((Arc::clone(&name), at));
+                    }
+                    // Otherwise the new name is ignored: earlier names are
+                    // never pushed out by later ones.
+                },
+            );
         }
     }
 
@@ -218,21 +324,17 @@ impl DnsMap {
     /// or `None` if no fresh answer is known.
     pub fn lookup(&self, pid: u32, address: IpAddr, at: SystemTime) -> Option<DomainLabel> {
         let address = address.to_canonical();
-        let confirmed = self
-            .confirmed
-            .get(&address)
-            .filter(|entry| self.is_fresh(entry.at, at));
-
         let asked = self
             .asked
             .get(&pid)
             .and_then(|entries| entries.get(&address))
             .filter(|answer| self.is_fresh(answer.at, at));
         if let Some(answer) = asked {
-            let backed = confirmed.is_some_and(|entry| entry.names.contains(&answer.name));
+            // The confirmation may also arrive just after the app's answer.
+            let verified = answer.verified || self.is_confirmed(&answer.name, address, at);
             return Some(DomainLabel {
                 name: Arc::clone(&answer.name),
-                source: if backed {
+                source: if verified {
                     LabelSource::Verified
                 } else {
                     LabelSource::Unverified
@@ -240,9 +342,14 @@ impl DnsMap {
             });
         }
 
-        confirmed
-            .and_then(|entry| entry.names.last())
-            .map(|name| DomainLabel {
+        let (names, seen) = self.by_address.get(&address)?;
+        if !self.is_fresh(seen, at) {
+            return None;
+        }
+        names
+            .iter()
+            .max_by_key(|(_, confirmed_at)| *confirmed_at)
+            .map(|(name, _)| DomainLabel {
                 name: Arc::clone(name),
                 source: LabelSource::Inferred,
             })
@@ -259,14 +366,13 @@ impl DnsMap {
     /// Removes answers older than the lifetime, measured at `now`.
     pub fn expire(&mut self, now: SystemTime) {
         let lifetime = self.lifetime;
-        let fresh = |seen: SystemTime| age(seen, now) < lifetime;
         for entries in self.asked.values_mut() {
-            entries.retain(|_, answer| fresh(answer.at));
+            entries.retain(|_, answer| age(answer.at, now) < lifetime);
         }
         self.asked.retain(|_, entries| !entries.is_empty());
         self.asked_entries = self.asked.values().map(HashMap::len).sum();
-        self.confirmed.retain(|_, entry| fresh(entry.at));
-        self.compact_confirmed_order();
+        self.by_name.retain_fresh(now, lifetime);
+        self.by_address.retain_fresh(now, lifetime);
     }
 
     /// Number of remembered app answers (process, address pairs).
@@ -274,14 +380,14 @@ impl DnsMap {
         self.asked_entries
     }
 
-    /// Number of addresses with confirmed answers.
+    /// Number of names with confirmations.
     pub fn confirmed_len(&self) -> usize {
-        self.confirmed.len()
+        self.by_name.len()
     }
 
     /// Returns `true` if nothing is remembered.
     pub fn is_empty(&self) -> bool {
-        self.asked_entries == 0 && self.confirmed.is_empty()
+        self.asked_entries == 0 && self.by_name.len() == 0 && self.by_address.len() == 0
     }
 
     /// Number of app answers not stored because a limit was reached.
@@ -289,43 +395,15 @@ impl DnsMap {
         self.dropped_answers
     }
 
+    /// Whether the DNS service recently resolved `name` to `address`.
+    fn is_confirmed(&self, name: &Arc<str>, address: IpAddr, at: SystemTime) -> bool {
+        self.by_name.get(name).is_some_and(|(addresses, seen)| {
+            self.is_fresh(seen, at) && addresses.contains(&address)
+        })
+    }
+
     fn is_fresh(&self, seen: SystemTime, at: SystemTime) -> bool {
         age(seen, at) < self.lifetime
-    }
-
-    /// Removes the confirmed address updated longest ago. Returns `false`
-    /// if there was nothing to remove.
-    fn evict_oldest_confirmed(&mut self) -> bool {
-        while let Some((address, at)) = self.confirmed_order.pop_front() {
-            // Skip stale order entries: the address was updated later or
-            // already removed.
-            if self
-                .confirmed
-                .get(&address)
-                .is_some_and(|entry| entry.at == at)
-            {
-                self.confirmed.remove(&address);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn compact_confirmed_order(&mut self) {
-        let confirmed = &self.confirmed;
-        let mut seen = std::collections::HashSet::new();
-        // Keep only the latest order entry per address, in order.
-        let mut kept: Vec<(IpAddr, SystemTime)> = self
-            .confirmed_order
-            .iter()
-            .rev()
-            .filter(|(address, at)| {
-                confirmed.get(address).is_some_and(|entry| entry.at == *at) && seen.insert(*address)
-            })
-            .copied()
-            .collect();
-        kept.reverse();
-        self.confirmed_order = kept.into();
     }
 }
 
@@ -367,6 +445,17 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_arriving_just_after_the_app_answer_still_verifies() {
+        let mut map = DnsMap::new();
+        map.record_app_answer(7, "example.com", &[ip("104.20.23.154")], at(0));
+        map.record_confirmed("example.com", &[ip("104.20.23.154")], at(0));
+        assert_eq!(
+            label(&map, 7, "104.20.23.154", 1),
+            some("example.com", LabelSource::Verified)
+        );
+    }
+
+    #[test]
     fn app_answer_alone_is_unverified() {
         // E.g. answered from the cache before Whereabouts started.
         let mut map = DnsMap::new();
@@ -396,6 +485,53 @@ mod tests {
     }
 
     #[test]
+    fn pointing_another_name_at_an_address_does_not_verify_a_claim() {
+        // An attacker's own domain resolves to example.com's address. That
+        // must not verify an app's claim that the address is some third name.
+        let mut map = DnsMap::new();
+        map.record_confirmed("attacker.example", &[ip("104.20.23.154")], at(0));
+        map.record_app_answer(7, "bank.example", &[ip("104.20.23.154")], at(0));
+        assert_eq!(
+            label(&map, 7, "104.20.23.154", 1),
+            some("bank.example", LabelSource::Unverified)
+        );
+    }
+
+    #[test]
+    fn a_flood_of_names_cannot_undo_an_earlier_verification() {
+        let mut map = DnsMap::with_limits(DEFAULT_LIFETIME, 100, 100, 5);
+        map.record_confirmed("example.com", &[ip("104.20.23.154")], at(0));
+        map.record_app_answer(7, "example.com", &[ip("104.20.23.154")], at(0));
+        // The attacker's lookups evict example.com's confirmation...
+        for i in 0..50 {
+            map.record_confirmed(
+                &format!("a{i}.attacker.example"),
+                &[ip("104.20.23.154")],
+                at(1),
+            );
+        }
+        assert_eq!(map.confirmed_len(), 5);
+        // ...but the verification was recorded with the app's answer.
+        assert_eq!(
+            label(&map, 7, "104.20.23.154", 2),
+            some("example.com", LabelSource::Verified)
+        );
+    }
+
+    #[test]
+    fn later_names_never_push_earlier_ones_out_of_an_address() {
+        let mut map = DnsMap::new();
+        map.record_confirmed("example.com", &[ip("1.2.3.4")], at(0));
+        for i in 0..20 {
+            map.record_confirmed(&format!("n{i}.attacker.example"), &[ip("1.2.3.4")], at(1));
+        }
+        // The first names, including example.com, are kept.
+        let (names, _) = map.by_address.get(&ip("1.2.3.4")).unwrap();
+        assert_eq!(names.len(), MAX_NAMES_PER_ADDRESS);
+        assert!(names.iter().any(|(name, _)| &**name == "example.com"));
+    }
+
+    #[test]
     fn app_answers_never_label_other_processes() {
         let mut map = DnsMap::new();
         map.record_app_answer(7, "planted.example", &[ip("1.2.3.4")], at(0));
@@ -413,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_addresses_verify_any_of_their_names() {
+    fn shared_addresses_verify_each_of_their_names() {
         let mut map = DnsMap::new();
         map.record_confirmed("a.example", &[ip("1.2.3.4")], at(0));
         map.record_confirmed("b.example", &[ip("1.2.3.4")], at(1));
@@ -422,7 +558,7 @@ mod tests {
             label(&map, 7, "1.2.3.4", 2),
             some("a.example", LabelSource::Verified)
         );
-        // The inferred label is the most recent name.
+        // The inferred label is the most recently confirmed name.
         assert_eq!(
             label(&map, 8, "1.2.3.4", 2),
             some("b.example", LabelSource::Inferred)
@@ -493,13 +629,16 @@ mod tests {
     }
 
     #[test]
-    fn full_confirmed_map_evicts_the_oldest_and_keeps_new_lookups() {
+    fn full_confirmation_maps_evict_the_least_recently_confirmed() {
         let mut map = DnsMap::with_limits(DEFAULT_LIFETIME, 100, 100, 3);
         for i in 0..10u64 {
-            map.record_confirmed("x.example", &[ip(&format!("10.0.0.{i}"))], at(i));
+            map.record_confirmed(
+                &format!("n{i}.example"),
+                &[ip(&format!("10.0.0.{i}"))],
+                at(i),
+            );
         }
         assert_eq!(map.confirmed_len(), 3);
-        // The three newest remain.
         for i in 7..10 {
             assert!(
                 label(&map, 1, &format!("10.0.0.{i}"), 10).is_some(),
@@ -510,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_addresses_are_not_evicted_first() {
+    fn refreshed_confirmations_are_not_evicted_first() {
         let mut map = DnsMap::with_limits(DEFAULT_LIFETIME, 100, 100, 2);
         map.record_confirmed("a.example", &[ip("10.0.0.1")], at(0));
         map.record_confirmed("b.example", &[ip("10.0.0.2")], at(1));
@@ -522,21 +661,13 @@ mod tests {
     }
 
     #[test]
-    fn names_per_address_are_capped() {
+    fn addresses_per_name_are_capped() {
         let mut map = DnsMap::new();
-        for i in 0..20 {
-            map.record_confirmed(&format!("n{i}.example"), &[ip("1.2.3.4")], at(0));
-        }
-        map.record_app_answer(7, "n0.example", &[ip("1.2.3.4")], at(0));
-        // n0 was pushed out by newer names, so the app's claim is not backed.
-        assert_eq!(
-            label(&map, 7, "1.2.3.4", 1),
-            some("n0.example", LabelSource::Unverified)
-        );
-        map.record_app_answer(8, "n19.example", &[ip("1.2.3.4")], at(0));
-        assert_eq!(
-            label(&map, 8, "1.2.3.4", 1),
-            some("n19.example", LabelSource::Verified)
-        );
+        let many: Vec<IpAddr> = (0..200u32)
+            .map(|i| ip(&format!("10.0.{}.{}", i / 250, i % 250)))
+            .collect();
+        map.record_confirmed("big.example", &many, at(0));
+        let (addresses, _) = map.by_name.get(&Arc::from("big.example")).unwrap();
+        assert_eq!(addresses.len(), MAX_ADDRESSES_PER_NAME);
     }
 }
