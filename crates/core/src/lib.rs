@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dns;
 pub mod entropy;
 pub mod flow;
 pub mod model;

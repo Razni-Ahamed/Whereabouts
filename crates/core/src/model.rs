@@ -131,4 +131,19 @@ pub enum CaptureEvent {
         /// When the process exited.
         timestamp: SystemTime,
     },
+    /// A process received a successful DNS answer (from the network or the
+    /// cache). Used to label its connections with domain names.
+    DnsAnswer {
+        /// ID of the process that asked.
+        pid: u32,
+        /// The name the process asked for, normalised (lowercase, no
+        /// trailing dot).
+        name: String,
+        /// CNAME aliases in the answer.
+        aliases: Vec<String>,
+        /// Addresses in the answer.
+        addresses: Vec<IpAddr>,
+        /// When the answer arrived.
+        timestamp: SystemTime,
+    },
 }

@@ -27,6 +27,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod dns;
 mod etw;
 pub mod events;
 pub mod process;

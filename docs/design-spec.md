@@ -163,6 +163,15 @@ Gaps and how we handle them:
 
 Domains are grouped by **registrable domain** (“eTLD+1”) using the Public Suffix List, so `a.tiktokcdn.com` and `b.tiktokcdn.com` count as one place.
 
+Facts about the DNS Client provider (`Microsoft-Windows-DNS-Client`), verified on Windows 11 (2026-11-12):
+
+| Fact | Consequence |
+|---|---|
+| Event 3008 ("query completed") is logged in the requesting process, also for answers from the cache. Events 3009-3020 come from the DNS service (`svchost.exe`). | Only event 3008 is used; its header process ID is the app. |
+| `QueryResults` is `;`-separated: CNAME aliases as `type: 5 <name>`, then addresses. Some IPv4 answers appear as IPv4-mapped IPv6 (`::ffff:a.b.c.d`). | Addresses are converted to plain IPv4 before matching. |
+| The record TTL is not in the event. | Answers are kept for a fixed 30 minutes. |
+| Lookups made before Whereabouts started are not seen. | Running from boot (service) covers most cases; pre-filling from the Windows DNS cache at start is planned. |
+
 ### 5.5 Enrichment (offline only)
 
 | Lookup | Source (candidate) | Licence check needed |

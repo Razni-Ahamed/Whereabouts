@@ -11,6 +11,7 @@
 //! They must run one at a time (`--test-threads=1`) because only one
 //! Whereabouts ETW session can exist at once.
 
+use std::net::IpAddr;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -85,7 +86,32 @@ fn captures_a_short_lived_process_and_its_https_traffic() {
         .map(|n| n.bytes)
         .sum();
 
+    let answers: Vec<&Vec<IpAddr>> = events
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::DnsAnswer {
+                pid: p,
+                name,
+                addresses,
+                ..
+            } if *p == pid && name == "example.com" => Some(addresses),
+            _ => None,
+        })
+        .collect();
+    let connected_to_answer = traffic.iter().any(|n| {
+        let remote = n.remote.ip().to_canonical();
+        answers.iter().any(|addresses| addresses.contains(&remote))
+    });
+
     assert!(started, "no ProcessStarted event for curl.exe (pid {pid})");
+    assert!(
+        !answers.is_empty(),
+        "no DNS answer for example.com attributed to curl.exe (pid {pid})"
+    );
+    assert!(
+        connected_to_answer,
+        "curl.exe's traffic did not go to an address from its DNS answer"
+    );
     assert!(exited, "no ProcessExited event for curl.exe (pid {pid})");
     assert!(
         !traffic.is_empty(),

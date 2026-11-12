@@ -1,5 +1,5 @@
-//! Real-time ETW session that turns kernel network and process events into
-//! [`CaptureEvent`]s.
+//! Real-time ETW session that turns kernel network, process and DNS events
+//! into [`CaptureEvent`]s.
 
 use std::fmt;
 use std::sync::Arc;
@@ -13,6 +13,9 @@ use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::{UserTrace, stop_trace_by_name};
 use whereabouts_core::model::{CaptureEvent, NetEvent};
 
+use crate::dns::{
+    DNS_CLIENT_PROVIDER, DNS_QUERY_COMPLETED_EVENT, normalize_name, parse_query_results,
+};
 use crate::events::{
     CAPTURED_EVENT_IDS, EventSpec, KERNEL_NETWORK_PROVIDER, KERNEL_PROCESS_KEYWORD,
     KERNEL_PROCESS_PROVIDER, PROCESS_START_EVENT, PROCESS_STOP_EVENT, RawFields, classify,
@@ -134,6 +137,24 @@ impl Capture {
             })
             .build();
 
+        let dns_counters = Arc::clone(&counters);
+        let dns_sender = sender.clone();
+        let dns = Provider::by_guid(DNS_CLIENT_PROVIDER)
+            .add_filter(EventFilter::ByEventIds(vec![DNS_QUERY_COMPLETED_EVENT]))
+            .add_callback(move |record, locator| {
+                if record.event_id() != DNS_QUERY_COMPLETED_EVENT {
+                    return;
+                }
+                match decode_dns(record, locator) {
+                    DnsDecode::Answer(event) => {
+                        dns_counters.deliver_lossy(&dns_sender, Some(event))
+                    }
+                    DnsDecode::Malformed => dns_counters.deliver_lossy(&dns_sender, None),
+                    DnsDecode::Skip => {}
+                }
+            })
+            .build();
+
         let process_counters = Arc::clone(&counters);
         let process = Provider::by_guid(KERNEL_PROCESS_PROVIDER)
             .any(KERNEL_PROCESS_KEYWORD)
@@ -155,6 +176,7 @@ impl Capture {
             .named(String::from(SESSION_NAME))
             .enable(network)
             .enable(process)
+            .enable(dns)
             .start_and_process()
             .map_err(|e| CaptureError::Start(format!("{e:?}")))?;
 
@@ -200,6 +222,47 @@ fn decode_net(record: &EventRecord, locator: &SchemaLocator, spec: EventSpec) ->
     };
     let timestamp = filetime_to_system_time(record.raw_timestamp());
     Some(to_net_event(spec, &raw, timestamp))
+}
+
+/// Result of decoding a "DNS query completed" event.
+enum DnsDecode {
+    /// A successful answer with at least one address.
+    Answer(CaptureEvent),
+    /// A failed query, an answer without addresses, or an invalid name.
+    /// Ordinary lookup failures are not decoding problems, so these are not
+    /// counted as malformed.
+    Skip,
+    /// The event's fields could not be read.
+    Malformed,
+}
+
+fn decode_dns(record: &EventRecord, locator: &SchemaLocator) -> DnsDecode {
+    let Ok(schema) = locator.event_schema(record) else {
+        return DnsDecode::Malformed;
+    };
+    let parser = Parser::create(record, &schema);
+    let (Ok(status), Ok(name), Ok(results)) = (
+        parser.try_parse::<u32>("QueryStatus"),
+        parser.try_parse::<String>("QueryName"),
+        parser.try_parse::<String>("QueryResults"),
+    ) else {
+        return DnsDecode::Malformed;
+    };
+    let Some(name) = normalize_name(&name).filter(|_| status == 0) else {
+        return DnsDecode::Skip;
+    };
+    let parsed = parse_query_results(&results);
+    if parsed.addresses.is_empty() {
+        return DnsDecode::Skip;
+    }
+    DnsDecode::Answer(CaptureEvent::DnsAnswer {
+        // Event 3008 is logged in the requesting process.
+        pid: record.process_id(),
+        name,
+        aliases: parsed.aliases,
+        addresses: parsed.addresses,
+        timestamp: filetime_to_system_time(record.raw_timestamp()),
+    })
 }
 
 fn decode_process(record: &EventRecord, locator: &SchemaLocator, id: u16) -> Option<CaptureEvent> {
