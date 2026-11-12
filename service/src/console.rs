@@ -30,13 +30,14 @@ const LATE_TRAFFIC_WINDOW: Duration = Duration::from_secs(10);
 /// Most program identities kept for display.
 const MAX_IDENTITIES: usize = 20_000;
 
-/// A flow together with the app name and program path it had when
-/// recorded. The publisher is looked up from the path when drawing, so a
-/// signature check that finishes after the app exited still shows up.
+/// A flow together with the app name and process instance it had when
+/// recorded. The publisher is looked up from the instance's token when
+/// drawing, so a signature check that finishes after the app exited still
+/// shows up.
 #[derive(Debug, Clone)]
 struct Row {
     app: String,
-    path: Option<String>,
+    token: Option<u64>,
     key: FlowKey,
     stats: FlowStats,
 }
@@ -79,7 +80,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
             Ok(CaptureEvent::Net(event)) => {
                 let current_start = starts.get(&event.pid).copied();
                 if let Some(owner) = exited.owner(&event, current_start) {
-                    add_late_traffic(&mut closed, &owner.app, owner.path.as_deref(), &event);
+                    add_late_traffic(&mut closed, &owner.app, owner.token, &event);
                 } else {
                     // Look the process up while it is still running.
                     names.note_traffic(event.pid);
@@ -98,7 +99,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
             Ok(CaptureEvent::ProcessExited { pid, timestamp }) => {
                 // Windows may reuse this ID, so close everything tied to it.
                 close(&mut closed, &names, table.take_process(pid));
-                exited.insert(pid, names.get(pid).to_owned(), names.path(pid), timestamp);
+                exited.insert(pid, names.get(pid).to_owned(), names.token(pid), timestamp);
                 names.forget(pid);
                 starts.remove(&pid);
                 dns.forget_process(pid);
@@ -155,18 +156,25 @@ struct ProcessInfo {
     name: String,
     /// Drive-letter path, if known.
     path: Option<String>,
+    /// Identifies this process instance (process IDs are reused), and its
+    /// identity result.
+    token: u64,
     /// Whether its identity has been asked for. Only processes that use
     /// the network are checked.
     requested: bool,
 }
 
-/// What the console knows about each process, plus each program's
+/// What the console knows about each process, plus each process's program
 /// identity (signature, hash), worked out by a background worker.
+///
+/// Identities are stored per process instance, never looked up by path: a
+/// file swapped at the same path must not inherit another process's result.
 #[derive(Debug)]
 struct ProcessNames {
     processes: HashMap<u32, Option<ProcessInfo>>,
-    /// Identities by lowercase path.
-    identities: HashMap<String, AppIdentity>,
+    /// Identities by process-instance token.
+    identities: HashMap<u64, AppIdentity>,
+    next_token: u64,
     resolver: IdentityResolver,
     devices: DevicePaths,
 }
@@ -176,18 +184,26 @@ impl ProcessNames {
         Self {
             processes: HashMap::new(),
             identities: HashMap::new(),
+            next_token: 0,
             resolver: IdentityResolver::start(),
             devices: DevicePaths::load(),
         }
+    }
+
+    fn new_token(&mut self) -> u64 {
+        self.next_token += 1;
+        self.next_token
     }
 
     /// Called for each network event of `pid`: looks the process up if it
     /// is not known yet, and asks for its program's identity once.
     fn note_traffic(&mut self, pid: u32) {
         if !self.processes.contains_key(&pid) {
+            let token = self.new_token();
             let info = process::image_path(pid).map(|path| ProcessInfo {
                 name: file_name(&path).to_owned(),
                 path: self.devices.to_dos(&path),
+                token,
                 requested: false,
             });
             self.processes.insert(pid, info);
@@ -199,10 +215,8 @@ impl ProcessNames {
             return;
         }
         info.requested = match info.path.as_deref() {
-            Some(path) if !self.identities.contains_key(&path.to_ascii_lowercase()) => {
-                self.resolver.request(path, Some(pid))
-            }
-            _ => true,
+            Some(path) => self.resolver.request(info.token, path, Some(pid)),
+            None => true,
         };
     }
 
@@ -213,6 +227,7 @@ impl ProcessNames {
         let info = ProcessInfo {
             name: file_name(image).to_owned(),
             path: self.devices.to_dos(image),
+            token: self.new_token(),
             requested: false,
         };
         self.processes.insert(pid, Some(info));
@@ -231,12 +246,11 @@ impl ProcessNames {
 
     /// Collects identities the background worker has finished.
     fn poll(&mut self) {
-        for identity in self.resolver.finished() {
+        for (token, identity) in self.resolver.finished() {
             if self.identities.len() >= MAX_IDENTITIES {
                 self.identities.clear();
             }
-            self.identities
-                .insert(identity.path.to_ascii_lowercase(), identity);
+            self.identities.insert(token, identity);
         }
     }
 
@@ -251,21 +265,24 @@ impl ProcessNames {
             .map_or("(unknown)", |info| info.name.as_str())
     }
 
-    /// Drive-letter path of `pid`'s program, if known.
-    fn path(&self, pid: u32) -> Option<String> {
+    /// Token of `pid`'s current process instance, if it has a program file
+    /// whose identity can be checked.
+    fn token(&self, pid: u32) -> Option<u64> {
         self.processes
             .get(&pid)
             .and_then(Option::as_ref)
-            .and_then(|info| info.path.clone())
+            .filter(|info| info.path.is_some())
+            .map(|info| info.token)
     }
 
-    /// Publisher text for a program path: the signer, `UNSIGNED`, `INVALID
-    /// SIGNATURE`, `…` while being checked, or `-` if there is no file.
-    fn publisher(&self, path: Option<&str>) -> String {
-        match path {
-            Some(path) => self
+    /// Publisher text for a process instance: the signer, `UNSIGNED`,
+    /// `INVALID SIGNATURE`, `…` while being checked, or `-` if there is no
+    /// program file.
+    fn publisher(&self, token: Option<u64>) -> String {
+        match token {
+            Some(token) => self
                 .identities
-                .get(&path.to_ascii_lowercase())
+                .get(&token)
                 .map_or_else(|| String::from("…"), AppIdentity::publisher_text),
             None => String::from("-"),
         }
@@ -276,7 +293,7 @@ impl ProcessNames {
 #[derive(Debug)]
 struct Exited {
     app: String,
-    path: Option<String>,
+    token: Option<u64>,
     /// Exit time reported by Windows.
     exited_at: SystemTime,
     /// When we learned about the exit, for expiring the entry.
@@ -288,13 +305,13 @@ struct Exited {
 struct RecentlyExited(HashMap<u32, Exited>);
 
 impl RecentlyExited {
-    fn insert(&mut self, pid: u32, app: String, path: Option<String>, exited_at: SystemTime) {
+    fn insert(&mut self, pid: u32, app: String, token: Option<u64>, exited_at: SystemTime) {
         let noted = Instant::now();
         self.0.insert(
             pid,
             Exited {
                 app,
-                path,
+                token,
                 exited_at,
                 noted,
             },
@@ -328,7 +345,7 @@ impl RecentlyExited {
 
 /// Adds traffic that arrived after its process exited to the matching
 /// closed flow, or starts a new closed flow for it.
-fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, path: Option<&str>, event: &NetEvent) {
+fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, token: Option<u64>, event: &NetEvent) {
     if event.is_loopback() {
         return;
     }
@@ -348,7 +365,7 @@ fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, path: Option<&str>, e
     }
     closed.push_back(Row {
         app: app.to_owned(),
-        path: path.map(str::to_owned),
+        token,
         key,
         stats,
     });
@@ -362,18 +379,18 @@ fn close(closed: &mut VecDeque<Row>, names: &ProcessNames, flows: Vec<(FlowKey, 
         }
         closed.push_back(Row {
             app: app_name(&key, names),
-            path: path_for(&key, names),
+            token: token_for(&key, names),
             key,
             stats,
         });
     }
 }
 
-fn path_for(key: &FlowKey, names: &ProcessNames) -> Option<String> {
+fn token_for(key: &FlowKey, names: &ProcessNames) -> Option<u64> {
     if key.is_global_overflow() {
         None
     } else {
-        names.path(key.pid)
+        names.token(key.pid)
     }
 }
 
@@ -397,7 +414,7 @@ fn draw(
         .into_iter()
         .map(|(key, stats)| Row {
             app: app_name(&key, names),
-            path: path_for(&key, names),
+            token: token_for(&key, names),
             key,
             stats,
         })
@@ -440,7 +457,7 @@ fn draw(
         "PID", "APP", "PUBLISHER", "PROTO", "DOMAIN", "REMOTE", "SENT", "RECEIVED"
     );
     for row in rows.iter().take(TOP_ROWS) {
-        println!("{}", format_row(row, &names.publisher(row.path.as_deref())));
+        println!("{}", format_row(row, &names.publisher(row.token)));
     }
     if rows.len() > TOP_ROWS {
         println!("  … and {} more", rows.len() - TOP_ROWS);

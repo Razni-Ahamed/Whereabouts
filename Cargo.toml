@@ -42,3 +42,8 @@ todo = "warn"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Hashing large program files (hundreds of MB) is dozens of times slower
+# without optimisation, so optimise the hashing crate even in dev builds.
+[profile.dev.package.sha2]
+opt-level = 3

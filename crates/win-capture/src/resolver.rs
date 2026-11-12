@@ -1,44 +1,53 @@
-//! Works out app identities on a background thread, with a cache.
+//! Works out app identities on a background thread.
 //!
 //! Hashing a file and checking its signature can take a while, so it must
-//! not happen on the thread that reads network events. Each program file is
-//! checked once; the result is reused until the file's size or modification
-//! time changes (for example after an update).
+//! not happen on the thread that reads network events.
+//!
+//! Every process is checked on its own: each request names one process
+//! instance (a caller-chosen token), and the file is opened, locked and
+//! hashed again for it. Signature results are cached **by content hash**,
+//! so a swapped file always gets a new hash and a fresh signature check,
+//! while the same program started many times (e.g. a browser's helper
+//! processes) is only verified once. Files too large to hash are verified
+//! every time.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
-use std::time::SystemTime;
 
-use whereabouts_core::model::AppIdentity;
+use whereabouts_core::model::{AppIdentity, Signature};
 
-use crate::identity::identify;
+use crate::identity::{open_locked, package_family_name, size_and_hash, verify_signature_of};
 
-/// Most identity requests waiting at once. Further requests are dropped and
-/// retried the next time the program is seen.
+/// Most identity requests waiting at once. Further requests are refused
+/// and should be retried later.
 const MAX_PENDING: usize = 1_024;
 
-/// Most identities kept in the worker's cache.
+/// Most signature results kept in the worker's cache.
 const MAX_CACHED: usize = 10_000;
 
 struct Request {
+    token: u64,
     path: String,
     pid: Option<u32>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("token", &self.token)
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 /// Resolves app identities in the background.
 #[derive(Debug)]
 pub struct IdentityResolver {
     requests: SyncSender<Request>,
-    results: Receiver<AppIdentity>,
-    pending: HashSet<String>,
-}
-
-impl std::fmt::Debug for Request {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Request").field("path", &self.path).finish()
-    }
+    results: Receiver<(u64, AppIdentity)>,
+    pending: HashSet<u64>,
 }
 
 impl IdentityResolver {
@@ -49,11 +58,10 @@ impl IdentityResolver {
         thread::Builder::new()
             .name(String::from("whereabouts-identity"))
             .spawn(move || {
-                let mut cache: HashMap<(String, Option<u64>, Option<SystemTime>), AppIdentity> =
-                    HashMap::new();
+                let mut cache: HashMap<String, Signature> = HashMap::new();
                 for request in worker_requests {
-                    let identity = cached_identify(&mut cache, &request);
-                    if worker_results.send(identity).is_err() {
+                    let identity = identify_cached(&mut cache, &request);
+                    if worker_results.send((request.token, identity)).is_err() {
                         break;
                     }
                 }
@@ -67,72 +75,90 @@ impl IdentityResolver {
     }
 
     /// Asks for the identity of the program at `path` (a drive-letter
-    /// path). Returns `true` if the request is queued or already waiting,
-    /// `false` if the queue is full (ask again later).
-    pub fn request(&mut self, path: &str, pid: Option<u32>) -> bool {
-        let key = path.to_ascii_lowercase();
-        if self.pending.contains(&key) {
+    /// path) for one process instance, identified by `token`. Returns
+    /// `true` if the request is queued or already waiting, `false` if the
+    /// queue is full (ask again later).
+    pub fn request(&mut self, token: u64, path: &str, pid: Option<u32>) -> bool {
+        if self.pending.contains(&token) {
             return true;
         }
         let request = Request {
+            token,
             path: path.to_owned(),
             pid,
         };
         match self.requests.try_send(request) {
             Ok(()) => {
-                self.pending.insert(key);
+                self.pending.insert(token);
                 true
             }
-            // Disconnected means the worker has stopped; there is no point
-            // in asking again either.
             Err(TrySendError::Full(_)) => false,
+            // The worker has stopped; there is no point in asking again.
             Err(TrySendError::Disconnected(_)) => true,
         }
+    }
+
+    /// Returns the identities finished since the last call, with the token
+    /// each was requested for.
+    pub fn finished(&mut self) -> Vec<(u64, AppIdentity)> {
+        let done: Vec<(u64, AppIdentity)> = self.results.try_iter().collect();
+        for (token, _) in &done {
+            self.pending.remove(token);
+        }
+        done
     }
 
     /// Returns `true` if no requests are waiting.
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }
-
-    /// Returns the identities finished since the last call.
-    pub fn finished(&mut self) -> Vec<AppIdentity> {
-        let done: Vec<AppIdentity> = self.results.try_iter().collect();
-        for identity in &done {
-            self.pending.remove(&identity.path.to_ascii_lowercase());
-        }
-        done
-    }
 }
 
-fn cached_identify(
-    cache: &mut HashMap<(String, Option<u64>, Option<SystemTime>), AppIdentity>,
-    request: &Request,
-) -> AppIdentity {
-    let metadata = std::fs::metadata(Path::new(&request.path)).ok();
-    let key = (
-        request.path.to_ascii_lowercase(),
-        metadata.as_ref().map(std::fs::Metadata::len),
-        metadata.and_then(|m| m.modified().ok()),
-    );
-    if let Some(known) = cache.get(&key) {
-        return known.clone();
+/// Opens, locks and hashes the file for this request; reuses a cached
+/// signature result only for identical content.
+fn identify_cached(cache: &mut HashMap<String, Signature>, request: &Request) -> AppIdentity {
+    let path = Path::new(&request.path);
+    let package_family_name = request.pid.and_then(package_family_name);
+    let Ok(file) = open_locked(path) else {
+        return AppIdentity {
+            path: request.path.clone(),
+            signature: Signature::Unknown,
+            sha256: None,
+            size: None,
+            package_family_name,
+        };
+    };
+    let (size, sha256) = size_and_hash(&file);
+    let signature = match &sha256 {
+        Some(hash) => {
+            if let Some(known) = cache.get(hash) {
+                known.clone()
+            } else {
+                let signature = verify_signature_of(&file, path);
+                if cache.len() >= MAX_CACHED {
+                    cache.clear();
+                }
+                cache.insert(hash.clone(), signature.clone());
+                signature
+            }
+        }
+        None => verify_signature_of(&file, path),
+    };
+    AppIdentity {
+        path: request.path.clone(),
+        signature,
+        sha256,
+        size,
+        package_family_name,
     }
-    let identity = identify(&request.path, request.pid);
-    if cache.len() >= MAX_CACHED {
-        cache.clear();
-    }
-    cache.insert(key, identity.clone());
-    identity
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
-    use whereabouts_core::model::Signature;
 
-    fn wait_for(resolver: &mut IdentityResolver, count: usize) -> Vec<AppIdentity> {
+    fn wait_for(resolver: &mut IdentityResolver, count: usize) -> Vec<(u64, AppIdentity)> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut done = Vec::new();
         while done.len() < count && Instant::now() < deadline {
@@ -142,24 +168,61 @@ mod tests {
         done
     }
 
-    #[test]
-    fn resolves_in_the_background_and_deduplicates() {
+    fn curl() -> String {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
-        let curl = format!(r"{root}\System32\curl.exe");
+        format!(r"{root}\System32\curl.exe")
+    }
+
+    #[test]
+    fn resolves_each_process_in_the_background() {
         let mut resolver = IdentityResolver::start();
-        resolver.request(&curl, None);
-        resolver.request(&curl, None); // ignored: already pending
-        resolver.request(&curl.to_uppercase(), None); // same file, other case
+        assert!(resolver.request(1, &curl(), None));
+        assert!(resolver.request(1, &curl(), None)); // already pending
+        assert!(resolver.request(2, &curl(), None)); // another process
 
-        let done = wait_for(&mut resolver, 1);
-        assert_eq!(done.len(), 1);
-        assert!(matches!(done[0].signature, Signature::Signed { .. }));
-        // Nothing else arrives.
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(resolver.finished().is_empty());
+        let mut done = wait_for(&mut resolver, 2);
+        done.sort_by_key(|(token, _)| *token);
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0].0, 1);
+        assert_eq!(done[1].0, 2);
+        assert!(matches!(done[0].1.signature, Signature::Signed { .. }));
+        assert_eq!(done[0].1.signature, done[1].1.signature);
+        assert!(resolver.is_idle());
+    }
 
-        // Asking again later is answered (from the cache).
-        resolver.request(&curl, None);
-        assert_eq!(wait_for(&mut resolver, 1).len(), 1);
+    #[test]
+    fn a_swapped_file_at_the_same_path_is_checked_again() {
+        let dir = std::env::temp_dir().join(format!("whereabouts-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = dir.join("app.exe");
+        let path = app.to_string_lossy().into_owned();
+
+        // First the genuine, signed program...
+        std::fs::copy(curl(), &app).unwrap();
+        let mut resolver = IdentityResolver::start();
+        resolver.request(1, &path, None);
+        let first = wait_for(&mut resolver, 1);
+        assert!(matches!(first[0].1.signature, Signature::Signed { .. }));
+
+        // ...then an unsigned file put in its place, with the same size and
+        // modification time, as an attacker who can write there might do.
+        let original = std::fs::metadata(&app).unwrap();
+        let mut fake = std::fs::read(&app).unwrap();
+        let middle = fake.len() / 2;
+        fake[middle] ^= 0xff;
+        std::fs::write(&app, &fake).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&app).unwrap();
+        file.set_modified(original.modified().unwrap()).unwrap();
+        drop(file);
+
+        resolver.request(2, &path, None);
+        let second = wait_for(&mut resolver, 1);
+        assert!(
+            !matches!(second[0].1.signature, Signature::Signed { .. }),
+            "the swapped file must not inherit the original's signature: {:?}",
+            second[0].1.signature
+        );
+        assert_ne!(first[0].1.sha256, second[0].1.sha256);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
