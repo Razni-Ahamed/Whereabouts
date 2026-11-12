@@ -40,6 +40,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Live tests
+
+Some tests read real network and process events from Windows (ETW). They need administrator rights, so `cargo test` skips them. Run them with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1
+```
+
+The script builds everything as you, asks for administrator rights once (UAC), runs the live tests and a short check of `whereabouts-service --console`, and prints **PASS** or **FAIL**. It makes a few HTTPS requests to example.com. Its logs contain your computer's connection metadata, so they go to a temporary folder and must never be committed.
+
+CI runs the same live tests on GitHub's Windows runners (job "Live ETW tests").
+
 ## Code guidelines
 
 - **`unsafe` code** is forbidden in `core`, `enrich`, `ipc` and `store`. It is allowed only in the Windows API crates (`win-capture`, `win-firewall`), and every `unsafe` block needs a `// SAFETY:` comment explaining why it is sound.
