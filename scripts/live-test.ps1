@@ -123,9 +123,16 @@ function Invoke-ConsoleSmokeTest {
             $passed = $false
         }
     }
-    if ($output -notmatch "(?m)^\s*$($curl.Id)\s+curl\.exe\s") {
+    $curlRows = @($output -split "`r?`n" | Where-Object { $_ -match "^\s*$($curl.Id)\s+curl\.exe\s" })
+    if ($curlRows.Count -eq 0) {
         Write-Log "FAIL: curl.exe (pid $($curl.Id)) is not in the console table"
         $passed = $false
+    } else {
+        Write-Log "    $($curlRows[-1].Trim())"
+        if ($curlRows[-1] -notmatch '\sexample\.com\s') {
+            Write-Log 'FAIL: curl.exe row is not labelled with example.com'
+            $passed = $false
+        }
     }
     if ($passed) { Write-Log 'ok: console smoke test' }
     return $passed

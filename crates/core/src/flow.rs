@@ -31,6 +31,7 @@ use std::collections::hash_map::Entry;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime};
 
+use crate::dns::DomainLabel;
 use crate::model::{NetEvent, NetEventKind, Protocol};
 
 /// Default maximum number of regular flows kept in memory.
@@ -85,7 +86,7 @@ impl FlowKey {
 }
 
 /// Running totals for one flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowStats {
     /// Time of the earliest event seen for this flow.
     pub first_seen: SystemTime,
@@ -97,6 +98,8 @@ pub struct FlowStats {
     pub bytes_received: u64,
     /// Number of TCP connections opened or accepted.
     pub connections: u32,
+    /// Domain name of the remote end, if known from DNS.
+    pub domain: Option<DomainLabel>,
 }
 
 impl FlowStats {
@@ -108,6 +111,23 @@ impl FlowStats {
             bytes_sent: 0,
             bytes_received: 0,
             connections: 0,
+            domain: None,
+        }
+    }
+
+    /// Attaches a domain label if the flow has none yet, or replaces an
+    /// inferred label with a direct one. A direct label is never replaced,
+    /// so the flow keeps the name it had when the connection was made.
+    pub fn apply_label(&mut self, label: Option<DomainLabel>) {
+        let Some(label) = label else {
+            return;
+        };
+        let replace = match &self.domain {
+            None => true,
+            Some(current) => current.inferred && !label.inferred,
+        };
+        if replace {
+            self.domain = Some(label);
         }
     }
 
@@ -186,12 +206,19 @@ impl FlowTable {
         }
     }
 
-    /// Adds one event to its flow.
+    /// Adds one event to its flow, without a domain label.
+    pub fn record(&mut self, event: &NetEvent) {
+        self.record_labeled(event, None);
+    }
+
+    /// Adds one event to its flow and offers a domain label for it (see
+    /// [`FlowStats::apply_label`]).
     ///
     /// Loopback events are ignored. If the event would start a new flow but
     /// a limit is reached, it is added to the process's overflow flow and
-    /// counted in [`FlowTable::overflowed_events`].
-    pub fn record(&mut self, event: &NetEvent) {
+    /// counted in [`FlowTable::overflowed_events`]. Overflow flows cover many
+    /// destinations, so they never get a label.
+    pub fn record_labeled(&mut self, event: &NetEvent, label: Option<DomainLabel>) {
         if event.is_loopback() {
             return;
         }
@@ -204,12 +231,12 @@ impl FlowTable {
         let at_limit =
             process_flows >= self.max_flows_per_process || self.regular_flows >= self.max_flows;
 
-        let stats = match self.flows.entry(key) {
-            Entry::Occupied(entry) => entry.into_mut(),
+        let (stats, labelable) = match self.flows.entry(key) {
+            Entry::Occupied(entry) => (entry.into_mut(), !key.is_overflow()),
             Entry::Vacant(entry) if !at_limit && !key.is_overflow() => {
                 *self.per_process.entry(event.pid).or_insert(0) += 1;
                 self.regular_flows += 1;
-                entry.insert(FlowStats::new(event.timestamp))
+                (entry.insert(FlowStats::new(event.timestamp)), true)
             }
             Entry::Vacant(_) => {
                 self.overflowed_events += 1;
@@ -222,16 +249,20 @@ impl FlowTable {
                     self.shared_overflow_events += 1;
                     FlowKey::overflow(GLOBAL_OVERFLOW_PID, event.protocol)
                 };
-                match self.flows.entry(overflow_key) {
+                let stats = match self.flows.entry(overflow_key) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
                         self.overflow_flows += 1;
                         entry.insert(FlowStats::new(event.timestamp))
                     }
-                }
+                };
+                (stats, false)
             }
         };
         stats.record(event);
+        if labelable {
+            stats.apply_label(label);
+        }
     }
 
     /// Returns a copy of all flows, largest total traffic first.
@@ -239,7 +270,7 @@ impl FlowTable {
         let mut flows: Vec<(FlowKey, FlowStats)> = self
             .flows
             .iter()
-            .map(|(key, stats)| (*key, *stats))
+            .map(|(key, stats)| (*key, stats.clone()))
             .collect();
         flows.sort_by(|a, b| {
             b.1.total_bytes()
@@ -276,7 +307,7 @@ impl FlowTable {
             .flows
             .iter()
             .filter(|(key, stats)| matches(key, stats))
-            .map(|(key, stats)| (*key, *stats))
+            .map(|(key, stats)| (*key, stats.clone()))
             .collect();
         for (key, _) in &taken {
             self.flows.remove(key);
@@ -396,7 +427,7 @@ mod tests {
         table.record(&event(1, SERVER, NetEventKind::Send, 1, 5));
         table.record(&event(1, SERVER, NetEventKind::Send, 1, 2));
         table.record(&event(1, SERVER, NetEventKind::Send, 1, 9));
-        let stats = table.snapshot()[0].1;
+        let stats = table.snapshot()[0].1.clone();
         assert_eq!(stats.first_seen, at(2));
         assert_eq!(stats.last_seen, at(9));
     }
@@ -484,6 +515,52 @@ mod tests {
         table.record(&event(3, "198.51.100.3:443", NetEventKind::Send, 50, 1));
         let pids: Vec<u32> = table.snapshot().iter().map(|(key, _)| key.pid).collect();
         assert_eq!(pids, [2, 3, 1]);
+    }
+
+    fn label(name: &str, inferred: bool) -> Option<DomainLabel> {
+        Some(DomainLabel {
+            name: std::sync::Arc::from(name),
+            inferred,
+        })
+    }
+
+    #[test]
+    fn flows_keep_their_first_direct_label() {
+        let mut table = FlowTable::new();
+        table.record_labeled(&event(1, SERVER, NetEventKind::Send, 1, 1), None);
+        table.record_labeled(
+            &event(1, SERVER, NetEventKind::Send, 1, 2),
+            label("guess.example", true),
+        );
+        assert_eq!(table.snapshot()[0].1.domain, label("guess.example", true));
+
+        // A direct label replaces an inferred one...
+        table.record_labeled(
+            &event(1, SERVER, NetEventKind::Send, 1, 3),
+            label("example.com", false),
+        );
+        // ...but is never replaced itself.
+        table.record_labeled(
+            &event(1, SERVER, NetEventKind::Send, 1, 4),
+            label("other.example", false),
+        );
+        assert_eq!(table.snapshot()[0].1.domain, label("example.com", false));
+    }
+
+    #[test]
+    fn overflow_flows_are_never_labeled() {
+        let mut table = FlowTable::with_limits(100, 1, 100);
+        table.record_labeled(
+            &event(1, &server(1), NetEventKind::Send, 1, 1),
+            label("a.example", false),
+        );
+        table.record_labeled(
+            &event(1, &server(2), NetEventKind::Send, 1, 1),
+            label("b.example", false),
+        );
+        let flows = table.snapshot();
+        let overflow = flows.iter().find(|(k, _)| k.is_overflow()).unwrap();
+        assert_eq!(overflow.1.domain, None);
     }
 
     #[test]

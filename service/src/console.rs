@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
+use whereabouts_core::dns::DnsMap;
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{CaptureEvent, NetEvent, Protocol};
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
@@ -43,6 +44,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         }
     };
     println!("Whereabouts is watching network connections. Press Ctrl+C to stop.");
+    println!("A * after a domain means it was looked up by another app, so it is a guess.");
 
     let started = Instant::now();
     let mut last_draw = Instant::now();
@@ -53,6 +55,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     // Start time of each running process, so that a process is identified by
     // its ID *and* start time, not by its ID alone.
     let mut starts: HashMap<u32, SystemTime> = HashMap::new();
+    let mut dns = DnsMap::new();
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(200)) {
@@ -63,7 +66,8 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 } else {
                     // Look the process up while it is still running.
                     names.resolve(event.pid);
-                    table.record(&event);
+                    let label = dns.lookup(event.pid, event.remote.ip(), event.timestamp);
+                    table.record_labeled(&event, label);
                 }
             }
             Ok(CaptureEvent::ProcessStarted {
@@ -80,12 +84,23 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 exited.insert(pid, names.get(pid).to_owned(), timestamp);
                 names.forget(pid);
                 starts.remove(&pid);
+                dns.forget_process(pid);
+            }
+            Ok(CaptureEvent::DnsAnswer {
+                pid,
+                name,
+                addresses,
+                timestamp,
+                ..
+            }) => {
+                dns.record(pid, &name, &addresses, timestamp);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if last_draw.elapsed() >= REFRESH {
             exited.expire();
+            dns.expire(SystemTime::now());
             close(
                 &mut closed,
                 &names,
@@ -274,13 +289,14 @@ fn draw(
     );
     if table.shared_overflow_events() > 0 {
         println!(
-            "!! {} events could not be attributed to a process: many processes are flooding the              flow table at once, which may be an attempt to evade monitoring.",
+            "!! {} events could not be attributed to a process: many processes are flooding the \
+             flow table at once, which may be an attempt to evade monitoring.",
             table.shared_overflow_events()
         );
     }
     println!(
-        "{:>6}  {:<24} {:<5} {:<46} {:>10} {:>10}",
-        "PID", "APP", "PROTO", "REMOTE", "SENT", "RECEIVED"
+        "{:>6}  {:<22} {:<5} {:<34} {:<40} {:>10} {:>10}",
+        "PID", "APP", "PROTO", "DOMAIN", "REMOTE", "SENT", "RECEIVED"
     );
     for row in rows.iter().take(TOP_ROWS) {
         println!("{}", format_row(row));
@@ -295,20 +311,33 @@ fn format_row(row: &Row) -> String {
         Protocol::Tcp => "TCP",
         Protocol::Udp => "UDP",
     };
-    let remote = if row.key.is_overflow() {
-        String::from("(many destinations: flow limit reached)")
+    let (domain, remote) = if row.key.is_overflow() {
+        (
+            String::from("(many)"),
+            String::from("(many destinations: flow limit reached)"),
+        )
     } else {
-        row.key.remote.to_string()
+        (domain_text(row), row.key.remote.to_string())
     };
     format!(
-        "{:>6}  {:<24} {:<5} {:<46} {:>10} {:>10}",
+        "{:>6}  {:<22} {:<5} {:<34} {:<40} {:>10} {:>10}",
         row.key.pid,
-        truncate(&row.app, 24),
+        truncate(&row.app, 22),
         proto,
+        domain,
         remote,
         format_bytes(row.stats.bytes_sent),
         format_bytes(row.stats.bytes_received)
     )
+}
+
+/// Domain column text: the name, with `*` if it is inferred, or `-`.
+fn domain_text(row: &Row) -> String {
+    match &row.stats.domain {
+        Some(label) if label.inferred => format!("{}*", truncate(&label.name, 33)),
+        Some(label) => truncate(&label.name, 34),
+        None => String::from("-"),
+    }
 }
 
 /// Returns the last component of a Windows or Unix path.
