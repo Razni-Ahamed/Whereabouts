@@ -23,16 +23,19 @@
 //!   lie, or the lookup was answered from the cache before Whereabouts
 //!   started).
 //! - [`LabelSource::Inferred`] when the process made no lookup for the
-//!   address but the DNS service resolved some name to it. Only confirmed
-//!   answers are used for this, so one app cannot plant labels on another
-//!   app's connections. It is a guess: one address can serve many names.
+//!   address but the DNS service recently resolved exactly **one** name to
+//!   it. Only confirmed answers are used, so one app cannot plant labels on
+//!   another app's connections. If several names currently point at the
+//!   address, the guess would be ambiguous (and an attacker could add their
+//!   own names), so no inferred label is given.
 //!
-//! Confirmations are kept **by name**, and an app answer is checked against
-//! them when it arrives; the result is stored with the answer. So a later
-//! flood of lookups cannot undo a verification, and an attacker who points
-//! their own domain at a popular address cannot verify a different name.
-//! The per-address list used for inferred labels keeps the *first* names it
-//! sees; newer names never push older ones out.
+//! Confirmations are kept **by name**, with a timestamp for every
+//! name/address pair, and an app answer is checked against them when it
+//! arrives; the result is stored with the answer. So a later flood of
+//! lookups cannot undo a verification, an attacker who points their own
+//! domain at a popular address cannot verify a different name, and an
+//! address a name no longer resolves to stops counting once its own
+//! timestamp expires.
 //!
 //! # Limits
 //!
@@ -62,8 +65,8 @@ pub const DEFAULT_MAX_TOTAL: usize = 200_000;
 /// Default maximum number of names and of addresses with confirmations.
 pub const DEFAULT_MAX_CONFIRMED: usize = 200_000;
 
-/// Most names remembered per address for inferred labels. Content delivery
-/// networks serve many names from one address.
+/// Most names remembered per address for inferred labels. When full, the
+/// least recently confirmed name is dropped.
 const MAX_NAMES_PER_ADDRESS: usize = 8;
 
 /// Most addresses remembered per confirmed name.
@@ -72,8 +75,8 @@ const MAX_ADDRESSES_PER_NAME: usize = 64;
 /// How much a label can be trusted. Ordered from least to most trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LabelSource {
-    /// The process made no lookup for this address; the name is one the DNS
-    /// service resolved to it.
+    /// The process made no lookup for this address; the name is the only
+    /// one the DNS service recently resolved to it.
     Inferred,
     /// Only the app itself reported this lookup.
     Unverified,
@@ -190,10 +193,11 @@ impl<K: Hash + Eq + Clone, V> Recent<K, V> {
 pub struct DnsMap {
     asked: HashMap<u32, HashMap<IpAddr, Answer>>,
     asked_entries: usize,
-    /// Name -> addresses the DNS service resolved it to.
-    by_name: Recent<Arc<str>, HashSet<IpAddr>>,
-    /// Address -> names the DNS service resolved to it (first ones kept),
-    /// each with when it was last confirmed.
+    /// Name -> addresses the DNS service resolved it to, each with when that
+    /// pair was last confirmed.
+    by_name: Recent<Arc<str>, Vec<(IpAddr, SystemTime)>>,
+    /// Address -> names the DNS service resolved to it, each with when that
+    /// pair was last confirmed.
     by_address: Recent<IpAddr, Vec<(Arc<str>, SystemTime)>>,
     lifetime: Duration,
     max_per_process: usize,
@@ -283,21 +287,19 @@ impl DnsMap {
         let name: Arc<str> = Arc::from(name);
         let addresses: Vec<IpAddr> = addresses.iter().map(IpAddr::to_canonical).collect();
 
-        let initial: HashSet<IpAddr> = addresses
-            .iter()
-            .copied()
-            .take(MAX_ADDRESSES_PER_NAME)
-            .collect();
+        let lifetime = self.lifetime;
+
+        let mut initial = Vec::new();
+        for address in &addresses {
+            note_pair(&mut initial, *address, at, MAX_ADDRESSES_PER_NAME, lifetime);
+        }
         self.by_name.upsert(
             Arc::clone(&name),
             at,
             || initial,
             |known| {
                 for address in &addresses {
-                    if known.len() >= MAX_ADDRESSES_PER_NAME {
-                        break;
-                    }
-                    known.insert(*address);
+                    note_pair(known, *address, at, MAX_ADDRESSES_PER_NAME, lifetime);
                 }
             },
         );
@@ -308,13 +310,13 @@ impl DnsMap {
                 at,
                 || vec![(Arc::clone(&name), at)],
                 |names| {
-                    if let Some(entry) = names.iter_mut().find(|(known, _)| *known == name) {
-                        entry.1 = entry.1.max(at);
-                    } else if names.len() < MAX_NAMES_PER_ADDRESS {
-                        names.push((Arc::clone(&name), at));
-                    }
-                    // Otherwise the new name is ignored: earlier names are
-                    // never pushed out by later ones.
+                    note_pair(
+                        names,
+                        Arc::clone(&name),
+                        at,
+                        MAX_NAMES_PER_ADDRESS,
+                        lifetime,
+                    )
                 },
             );
         }
@@ -342,17 +344,18 @@ impl DnsMap {
             });
         }
 
-        let (names, seen) = self.by_address.get(&address)?;
-        if !self.is_fresh(seen, at) {
-            return None;
-        }
-        names
+        // Guess only when exactly one name currently points at the address.
+        let (names, _) = self.by_address.get(&address)?;
+        let mut fresh = names
             .iter()
-            .max_by_key(|(_, confirmed_at)| *confirmed_at)
-            .map(|(name, _)| DomainLabel {
+            .filter(|(_, confirmed_at)| self.is_fresh(*confirmed_at, at));
+        match (fresh.next(), fresh.next()) {
+            (Some((name, _)), None) => Some(DomainLabel {
                 name: Arc::clone(name),
                 source: LabelSource::Inferred,
-            })
+            }),
+            _ => None,
+        }
     }
 
     /// Forgets the app answers of process `pid`. Call this when it exits:
@@ -395,15 +398,49 @@ impl DnsMap {
         self.dropped_answers
     }
 
-    /// Whether the DNS service recently resolved `name` to `address`.
+    /// Whether the DNS service recently resolved `name` to `address`. The
+    /// pair's own timestamp counts, not the name's.
     fn is_confirmed(&self, name: &Arc<str>, address: IpAddr, at: SystemTime) -> bool {
-        self.by_name.get(name).is_some_and(|(addresses, seen)| {
-            self.is_fresh(seen, at) && addresses.contains(&address)
+        self.by_name.get(name).is_some_and(|(addresses, _)| {
+            addresses
+                .iter()
+                .any(|(known, seen)| *known == address && self.is_fresh(*seen, at))
         })
     }
 
     fn is_fresh(&self, seen: SystemTime, at: SystemTime) -> bool {
         age(seen, at) < self.lifetime
+    }
+}
+
+/// Records that `key` was confirmed at `at` in a small list of pairs: drops
+/// pairs that have expired by `at`, refreshes or adds `key`, and if the list
+/// is over `cap`, drops the least recently confirmed pairs.
+fn note_pair<K: PartialEq>(
+    pairs: &mut Vec<(K, SystemTime)>,
+    key: K,
+    at: SystemTime,
+    cap: usize,
+    lifetime: Duration,
+) {
+    pairs.retain(|(_, seen)| age(*seen, at) < lifetime);
+    if let Some(entry) = pairs.iter_mut().find(|(known, _)| *known == key) {
+        entry.1 = entry.1.max(at);
+    } else {
+        pairs.push((key, at));
+    }
+    while pairs.len() > cap {
+        let stalest = pairs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, seen))| *seen)
+            .map(|(index, _)| index);
+        match stalest {
+            Some(index) => {
+                pairs.remove(index);
+            }
+            None => break,
+        }
     }
 }
 
@@ -519,16 +556,55 @@ mod tests {
     }
 
     #[test]
-    fn later_names_never_push_earlier_ones_out_of_an_address() {
+    fn extra_names_on_an_address_remove_the_guess_instead_of_steering_it() {
         let mut map = DnsMap::new();
         map.record_confirmed("example.com", &[ip("1.2.3.4")], at(0));
+        assert_eq!(
+            label(&map, 8, "1.2.3.4", 1),
+            some("example.com", LabelSource::Inferred)
+        );
+        // An attacker points their own names at the address and keeps
+        // refreshing them: the guess becomes ambiguous, so none is shown.
         for i in 0..20 {
             map.record_confirmed(&format!("n{i}.attacker.example"), &[ip("1.2.3.4")], at(1));
         }
-        // The first names, including example.com, are kept.
+        assert_eq!(label(&map, 8, "1.2.3.4", 2), None);
         let (names, _) = map.by_address.get(&ip("1.2.3.4")).unwrap();
         assert_eq!(names.len(), MAX_NAMES_PER_ADDRESS);
-        assert!(names.iter().any(|(name, _)| &**name == "example.com"));
+    }
+
+    #[test]
+    fn names_on_an_address_expire_individually() {
+        let lifetime = Duration::from_secs(60);
+        let mut map = DnsMap::with_limits(lifetime, 100, 100, 100);
+        map.record_confirmed("old.example", &[ip("1.2.3.4")], at(0));
+        map.record_confirmed("new.example", &[ip("1.2.3.4")], at(50));
+        // At 70 s, old.example has expired; only new.example remains.
+        assert_eq!(
+            label(&map, 8, "1.2.3.4", 70),
+            some("new.example", LabelSource::Inferred)
+        );
+    }
+
+    #[test]
+    fn an_address_a_name_no_longer_uses_stops_counting() {
+        let lifetime = Duration::from_secs(60);
+        let mut map = DnsMap::with_limits(lifetime, 100, 100, 100);
+        map.record_confirmed("example.com", &[ip("1.1.1.1")], at(0));
+        // Later the name moves to another address and keeps being refreshed.
+        map.record_confirmed("example.com", &[ip("2.2.2.2")], at(50));
+        map.record_confirmed("example.com", &[ip("2.2.2.2")], at(100));
+        // An app claiming the old address at 100 s is not verified.
+        map.record_app_answer(7, "example.com", &[ip("1.1.1.1")], at(100));
+        assert_eq!(
+            label(&map, 7, "1.1.1.1", 101),
+            some("example.com", LabelSource::Unverified)
+        );
+        map.record_app_answer(7, "example.com", &[ip("2.2.2.2")], at(100));
+        assert_eq!(
+            label(&map, 7, "2.2.2.2", 101),
+            some("example.com", LabelSource::Verified)
+        );
     }
 
     #[test]
@@ -558,11 +634,8 @@ mod tests {
             label(&map, 7, "1.2.3.4", 2),
             some("a.example", LabelSource::Verified)
         );
-        // The inferred label is the most recently confirmed name.
-        assert_eq!(
-            label(&map, 8, "1.2.3.4", 2),
-            some("b.example", LabelSource::Inferred)
-        );
+        // Two names point at the address, so no guess is made for others.
+        assert_eq!(label(&map, 8, "1.2.3.4", 2), None);
     }
 
     #[test]
@@ -669,5 +742,12 @@ mod tests {
         map.record_confirmed("big.example", &many, at(0));
         let (addresses, _) = map.by_name.get(&Arc::from("big.example")).unwrap();
         assert_eq!(addresses.len(), MAX_ADDRESSES_PER_NAME);
+        // A full list never refuses a new address: the stalest one is dropped.
+        map.record_confirmed("big.example", &[ip("192.0.2.1")], at(1));
+        map.record_app_answer(7, "big.example", &[ip("192.0.2.1")], at(1));
+        assert_eq!(
+            label(&map, 7, "192.0.2.1", 2),
+            some("big.example", LabelSource::Verified)
+        );
     }
 }
