@@ -11,6 +11,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - `core`: `NetEvent` model and `FlowTable`, which aggregates events into per-app, per-destination flows and ignores loopback traffic. Memory is capped per process and in total; traffic beyond a process's limit goes into a visible "many destinations" flow for that process, so one process cannot hide another's traffic by flooding the table. Overflow flows are capped too, with one shared bucket beyond the cap.
 - `service`: `--console` mode showing live flows per app (run as administrator).
 - `win-capture`: `etw_probe` example for inspecting raw ETW events during development.
+- Live ETW integration tests (`crates/win-capture/tests/live_capture.rs`), skipped by default, plus `scripts/live-test.ps1`, which runs them and a console smoke test with one UAC prompt, and a CI job that runs them on GitHub's Windows runners.
 - Design specification (`docs/design-spec.md`), privacy policy, security policy and contribution guide.
 - Cargo workspace with `core`, `enrich`, `ipc`, `store`, `win-capture`, `win-firewall` and `service` crates.
 - `core`: connection metadata model, robust statistics (median, MAD, robust z-score) and domain entropy.
