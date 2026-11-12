@@ -171,6 +171,8 @@ Facts about the DNS Client provider (`Microsoft-Windows-DNS-Client`), verified o
 | `QueryResults` is `;`-separated: CNAME aliases as `type: 5 <name>`, then addresses. Some IPv4 answers appear as IPv4-mapped IPv6 (`::ffff:a.b.c.d`). | Addresses are converted to plain IPv4 before matching. |
 | The record TTL is not in the event. | Answers are kept for a fixed 30 minutes. |
 | Lookups made before Whereabouts started are not seen. | Running from boot (service) covers most cases; pre-filling from the Windows DNS cache at start is planned. |
+| Event 3008 is written by the app itself, and **any program can write events under the DNS provider's ID**. Windows stamps every event with the writer's real process ID. | An app's own report can be a lie. Labels are *verified* only when the DNS service's event 3020, accepted only from the DNS Client service's process (found via the Service Control Manager), confirms the same name and address. Otherwise they are shown as *unverified* (`?`). Forged service events are rejected and counted. |
+| Event 3020 ("query response") is logged by the DNS service with the same `QueryName`/`QueryResults` format, status in `Status`. | Used as the trusted source; inferred labels come only from it. |
 
 ### 5.5 Enrichment (offline only)
 
@@ -350,6 +352,8 @@ This is the complete list. Anything not on it is a bug.
 | Someone with the disk (stolen laptop) | SQLCipher + DPAPI | DPAPI machine-scope keys can be recovered from an unencrypted Windows disk. **We recommend BitLocker** and say so in the UI. |
 | Malware with admin/SYSTEM rights | None. It can stop our service or read memory. | **Out of scope**, stated clearly. We may still observe its network activity before it acts. |
 | Malware hiding inside a trusted process | Attributed to the host process | Stated limitation (§5.3) |
+| Malware faking DNS events to disguise its destinations | Labels verified against the DNS service's own events; forged service events rejected by process ID | A label the app reports for itself stays *unverified* (`?`) and is shown as such |
+| Malware writing fake *kernel* network/process events under the kernel providers' IDs | Not yet addressed | Under research: restricting who may write to those providers, or detecting events not written by the kernel |
 | Malware flooding the flow table to hide traffic | Per-process flow limits; excess traffic goes to a per-process overflow flow, so bytes stay visible and attributed | With thousands of processes flooding at once, the overflow limit is exhausted and further traffic lands in one shared flow without per-process attribution. This is counted and reported as a possible evasion attempt. |
 | Tampered list update | Signature check with built-in key | Key compromise → rotate key in an app update |
 | Supply-chain attack on dependencies | `Cargo.lock` committed, `cargo-audit` + `cargo-deny` in CI, minimal dependencies, review of new crates | – |

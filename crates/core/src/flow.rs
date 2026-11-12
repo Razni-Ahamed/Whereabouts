@@ -115,16 +115,17 @@ impl FlowStats {
         }
     }
 
-    /// Attaches a domain label if the flow has none yet, or replaces an
-    /// inferred label with a direct one. A direct label is never replaced,
-    /// so the flow keeps the name it had when the connection was made.
+    /// Attaches a domain label if the flow has none yet, or replaces the
+    /// current label with a more trusted one (see [`crate::dns::LabelSource`]). A label
+    /// is never replaced by an equally or less trusted one, so the flow keeps
+    /// the name it had when the connection was made.
     pub fn apply_label(&mut self, label: Option<DomainLabel>) {
         let Some(label) = label else {
             return;
         };
         let replace = match &self.domain {
             None => true,
-            Some(current) => current.inferred && !label.inferred,
+            Some(current) => label.source > current.source,
         };
         if replace {
             self.domain = Some(label);
@@ -357,6 +358,7 @@ impl FlowTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::LabelSource;
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -517,34 +519,40 @@ mod tests {
         assert_eq!(pids, [2, 3, 1]);
     }
 
-    fn label(name: &str, inferred: bool) -> Option<DomainLabel> {
+    fn label(name: &str, source: LabelSource) -> Option<DomainLabel> {
         Some(DomainLabel {
             name: std::sync::Arc::from(name),
-            inferred,
+            source,
         })
     }
 
     #[test]
-    fn flows_keep_their_first_direct_label() {
+    fn flows_keep_their_most_trusted_first_label() {
         let mut table = FlowTable::new();
         table.record_labeled(&event(1, SERVER, NetEventKind::Send, 1, 1), None);
         table.record_labeled(
             &event(1, SERVER, NetEventKind::Send, 1, 2),
-            label("guess.example", true),
+            label("guess.example", LabelSource::Inferred),
         );
-        assert_eq!(table.snapshot()[0].1.domain, label("guess.example", true));
+        assert_eq!(
+            table.snapshot()[0].1.domain,
+            label("guess.example", LabelSource::Inferred)
+        );
 
-        // A direct label replaces an inferred one...
+        // A more trusted label replaces a less trusted one...
         table.record_labeled(
             &event(1, SERVER, NetEventKind::Send, 1, 3),
-            label("example.com", false),
+            label("example.com", LabelSource::Verified),
         );
-        // ...but is never replaced itself.
+        // ...but never by an equally trusted one.
         table.record_labeled(
             &event(1, SERVER, NetEventKind::Send, 1, 4),
-            label("other.example", false),
+            label("other.example", LabelSource::Verified),
         );
-        assert_eq!(table.snapshot()[0].1.domain, label("example.com", false));
+        assert_eq!(
+            table.snapshot()[0].1.domain,
+            label("example.com", LabelSource::Verified)
+        );
     }
 
     #[test]
@@ -552,11 +560,11 @@ mod tests {
         let mut table = FlowTable::with_limits(100, 1, 100);
         table.record_labeled(
             &event(1, &server(1), NetEventKind::Send, 1, 1),
-            label("a.example", false),
+            label("a.example", LabelSource::Verified),
         );
         table.record_labeled(
             &event(1, &server(2), NetEventKind::Send, 1, 1),
-            label("b.example", false),
+            label("b.example", LabelSource::Verified),
         );
         let flows = table.snapshot();
         let overflow = flows.iter().find(|(k, _)| k.is_overflow()).unwrap();

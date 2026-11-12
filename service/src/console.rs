@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
-use whereabouts_core::dns::DnsMap;
+use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{CaptureEvent, NetEvent, Protocol};
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
@@ -44,7 +44,10 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         }
     };
     println!("Whereabouts is watching network connections. Press Ctrl+C to stop.");
-    println!("A * after a domain means it was looked up by another app, so it is a guess.");
+    println!(
+        "Domains: plain = confirmed by the Windows DNS service · ? = reported only by the app"
+    );
+    println!("         itself (could be false) · * = guessed from another app's lookup");
 
     let started = Instant::now();
     let mut last_draw = Instant::now();
@@ -93,7 +96,14 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 timestamp,
                 ..
             }) => {
-                dns.record(pid, &name, &addresses, timestamp);
+                dns.record_app_answer(pid, &name, &addresses, timestamp);
+            }
+            Ok(CaptureEvent::DnsConfirmed {
+                name,
+                addresses,
+                timestamp,
+            }) => {
+                dns.record_confirmed(&name, &addresses, timestamp);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -287,6 +297,13 @@ fn draw(
         counts.malformed,
         table.overflowed_events()
     );
+    if counts.rejected > 0 {
+        println!(
+            "!! {} DNS events claimed to come from the Windows DNS service but did not: a \
+             program may be trying to fake domain names.",
+            counts.rejected
+        );
+    }
     if table.shared_overflow_events() > 0 {
         println!(
             "!! {} events could not be attributed to a process: many processes are flooding the \
@@ -331,11 +348,14 @@ fn format_row(row: &Row) -> String {
     )
 }
 
-/// Domain column text: the name, with `*` if it is inferred, or `-`.
+/// Domain column text: the name with a trust marker, or `-`.
 fn domain_text(row: &Row) -> String {
     match &row.stats.domain {
-        Some(label) if label.inferred => format!("{}*", truncate(&label.name, 33)),
-        Some(label) => truncate(&label.name, 34),
+        Some(label) => match label.source {
+            LabelSource::Verified => truncate(&label.name, 34),
+            LabelSource::Unverified => format!("{}?", truncate(&label.name, 33)),
+            LabelSource::Inferred => format!("{}*", truncate(&label.name, 33)),
+        },
         None => String::from("-"),
     }
 }

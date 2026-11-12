@@ -131,8 +131,22 @@ pub enum CaptureEvent {
         /// When the process exited.
         timestamp: SystemTime,
     },
-    /// A process received a successful DNS answer (from the network or the
-    /// cache). Used to label its connections with domain names.
+    /// The Windows DNS service resolved a name. Unlike
+    /// [`CaptureEvent::DnsAnswer`], this comes from the DNS service's own
+    /// process, which ordinary programs cannot impersonate, so it is used to
+    /// verify what apps report.
+    DnsConfirmed {
+        /// The name that was resolved, normalised.
+        name: String,
+        /// Addresses in the answer.
+        addresses: Vec<IpAddr>,
+        /// When the answer arrived.
+        timestamp: SystemTime,
+    },
+    /// A process reported a successful DNS answer (from the network or the
+    /// cache). Used to label its connections with domain names. The process
+    /// itself logs this, so it can be faked; see `core::dns` for how it is
+    /// verified.
     DnsAnswer {
         /// ID of the process that asked.
         pid: u32,

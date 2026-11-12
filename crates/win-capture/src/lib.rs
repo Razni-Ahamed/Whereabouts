@@ -31,5 +31,6 @@ pub mod dns;
 mod etw;
 pub mod events;
 pub mod process;
+pub mod service;
 
 pub use etw::{Capture, CaptureCounts, CaptureError, SESSION_NAME};
