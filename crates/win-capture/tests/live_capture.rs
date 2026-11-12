@@ -57,6 +57,10 @@ fn start_capture(queue: usize) -> (Capture, Receiver<CaptureEvent>) {
 #[ignore = "needs administrator rights and network access"]
 fn captures_a_short_lived_process_and_its_https_traffic() {
     let (capture, receiver) = start_capture(200_000);
+    assert!(
+        capture.kernel_events_protected(),
+        "kernel events could be faked here"
+    );
     flush_dns_cache();
 
     let mut child = Command::new("curl.exe")

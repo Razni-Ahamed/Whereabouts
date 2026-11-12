@@ -154,6 +154,7 @@ impl Counters {
 pub struct Capture {
     trace: UserTrace,
     counters: Arc<Counters>,
+    kernel_events_protected: bool,
 }
 
 impl Capture {
@@ -244,7 +245,11 @@ impl Capture {
             .start_and_process()
             .map_err(|e| CaptureError::Start(format!("{e:?}")))?;
 
-        Ok(Self { trace, counters })
+        Ok(Self {
+            trace,
+            counters,
+            kernel_events_protected: crate::protection::kernel_providers_protected(),
+        })
     }
 
     /// Returns the current counters.
@@ -255,6 +260,14 @@ impl Capture {
             malformed: self.counters.malformed.load(Ordering::Relaxed),
             rejected: self.counters.rejected.load(Ordering::Relaxed),
         }
+    }
+
+    /// Whether Windows refuses to let programs register the kernel network
+    /// and process provider IDs, checked when the capture started. If
+    /// `false`, those events could be faked, so app attribution cannot be
+    /// fully trusted and the user should be warned.
+    pub fn kernel_events_protected(&self) -> bool {
+        self.kernel_events_protected
     }
 
     /// Stops the capture.

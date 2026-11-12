@@ -21,6 +21,12 @@ use whereabouts_core::model::{NetEvent, NetEventKind, Protocol};
 /// GUID of the `Microsoft-Windows-Kernel-Network` ETW provider.
 pub const KERNEL_NETWORK_PROVIDER: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 
+/// [`KERNEL_NETWORK_PROVIDER`] as a number, for Windows APIs.
+pub const KERNEL_NETWORK_PROVIDER_ID: u128 = 0x7dd42a49_5329_4832_8dfd_43d979153a88;
+
+/// [`KERNEL_PROCESS_PROVIDER`] as a number, for Windows APIs.
+pub const KERNEL_PROCESS_PROVIDER_ID: u128 = 0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716;
+
 /// GUID of the `Microsoft-Windows-Kernel-Process` ETW provider.
 pub const KERNEL_PROCESS_PROVIDER: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
 

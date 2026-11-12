@@ -44,6 +44,12 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         }
     };
     println!("Whereabouts is watching network connections. Press Ctrl+C to stop.");
+    if !capture.kernel_events_protected() {
+        println!(
+            "!! Warning: this version of Windows lets programs write fake kernel network and \
+             process events, so which app made a connection could be faked."
+        );
+    }
     println!(
         "Domains: plain = confirmed by the Windows DNS service · ? = reported only by the app"
     );

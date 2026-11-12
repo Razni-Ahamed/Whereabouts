@@ -136,6 +136,8 @@ Facts about the kernel network provider, verified against real events on Windows
 | TCP events and UDP *send* events store the remote end in `daddr`/`dport`; UDP *receive* events store it in `saddr`/`sport`. | Direction is decoded per event type. |
 | Events 18/34 ("protocol copied data on behalf of user") repeat data already counted by receive events. | They are not captured, to avoid double counting. |
 | DNS lookups are sent by the DNS Client service (`svchost.exe`), not by the app that asked. | Domain attribution must use the DNS Client ETW provider (§5.4), not port-53 traffic. |
+| Programs cannot register the Kernel-Network or Kernel-Process provider IDs (access denied, even as administrator). | These events cannot be faked from user mode (§8). |
+| Process-start events are logged under the **parent** process's ID; exits under the exiting process's. | The parent is available for free if needed later (e.g. "started by"). |
 
 Events are aggregated in memory into **flows** (app + remote IP + port + protocol) and flushed to storage in short batches (e.g. every 5 seconds) to keep disk writes low.
 
@@ -355,7 +357,7 @@ This is the complete list. Anything not on it is a bug.
 | Malware with admin/SYSTEM rights | None. It can stop our service or read memory. | **Out of scope**, stated clearly. We may still observe its network activity before it acts. |
 | Malware hiding inside a trusted process | Attributed to the host process | Stated limitation (§5.3) |
 | Malware faking DNS events to disguise its destinations | Labels verified against the DNS service's own events; forged service events rejected by process ID | A label the app reports for itself stays *unverified* (`?`) and is shown as such |
-| Malware writing fake *kernel* network/process events under the kernel providers' IDs | Not yet addressed | Under research: restricting who may write to those providers, or detecting events not written by the kernel |
+| Malware writing fake *kernel* network/process events under the kernel providers' IDs | Windows refuses user-mode registration of these provider IDs (`EventRegister` → access denied, even as administrator; verified on Windows 11 2026-11-12 and checked on every CI run). Whereabouts re-checks at start-up and warns if a Windows version allows it. | Kernel-mode malware (a driver) can do anything; out of scope like other administrator-level malware |
 | Malware flooding the flow table to hide traffic | Per-process flow limits; excess traffic goes to a per-process overflow flow, so bytes stay visible and attributed | With thousands of processes flooding at once, the overflow limit is exhausted and further traffic lands in one shared flow without per-process attribution. This is counted and reported as a possible evasion attempt. |
 | Tampered list update | Signature check with built-in key | Key compromise → rotate key in an app update |
 | Supply-chain attack on dependencies | `Cargo.lock` committed, `cargo-audit` + `cargo-deny` in CI, minimal dependencies, review of new crates | – |

@@ -14,13 +14,10 @@ whereabouts-core.workspace = true
 ferrisetw.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Etw",
     "Win32_System_Services",
     "Win32_System_Threading",
 ] }
-
-[dev-dependencies]
-# Lets a live test write fake ETW events, to check they are rejected.
-windows = { workspace = true, features = ["Win32_System_Diagnostics_Etw"] }
 
 [lints]
 workspace = true
