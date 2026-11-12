@@ -16,12 +16,20 @@
 //! no embedded signature, its hash is looked up in the catalogs. Because the
 //! lookup is by hash, a renamed copy of a Windows program is still
 //! recognised, and a modified copy is not.
+//!
+//! # One locked handle
+//!
+//! Each check opens the file once, with sharing set so that nobody else can
+//! write to, rename or delete it until the check is done, and does the
+//! hash, the signature check and the catalog lookup through that same
+//! handle. So the file cannot be swapped between the steps.
 
 #![allow(unsafe_code)]
 
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::mem::size_of;
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
@@ -44,17 +52,28 @@ use windows::Win32::Security::WinTrust::{
     WTD_STATEACTION_VERIFY, WTD_UI_NONE, WTHelperGetProvSignerFromChain,
     WTHelperProvDataFromStateData, WinVerifyTrust,
 };
-use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, QueryDosDeviceW};
 use windows::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
-/// Files larger than this are not hashed, to keep checks quick.
+/// Files larger than this are not hashed, to keep checks quick. Their
+/// signature is still checked, but the result is not cached.
 pub const MAX_HASH_SIZE: u64 = 512 * 1024 * 1024;
 
-/// Returns the SHA-256 hash of the file at `path`, hex-encoded.
-pub fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+/// Opens `path` for reading and stops anyone else from writing to, renaming
+/// or deleting it until the returned handle is closed.
+pub fn open_locked(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+}
+
+/// Returns the SHA-256 hash of `file`'s whole content, hex-encoded. Reads
+/// from the start, whatever the current position.
+pub fn sha256_of(mut file: &File) -> io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -131,11 +150,20 @@ impl DevicePaths {
 
 /// Checks the code signature of the file at `path`, without network access.
 pub fn verify_signature(path: &Path) -> Signature {
-    let Ok(file) = File::open(path) else {
-        return Signature::Unknown;
-    };
+    match open_locked(path) {
+        Ok(file) => verify_signature_of(&file, path),
+        Err(_) => Signature::Unknown,
+    }
+}
+
+/// Checks the code signature of an open `file` (opened from `path`), using
+/// only that handle for reading.
+pub fn verify_signature_of(file: &File, path: &Path) -> Signature {
     let path_w = HSTRING::from(path.as_os_str());
-    let (status, publisher) = verify_embedded(&path_w, &file);
+    let (status, publisher) = match rewind(file) {
+        Ok(()) => verify_embedded(&path_w, file),
+        Err(_) => return Signature::Unknown,
+    };
     if status == 0 {
         return Signature::Signed {
             publisher: publisher.unwrap_or_else(|| String::from("(unknown publisher)")),
@@ -153,7 +181,7 @@ pub fn verify_signature(path: &Path) -> Signature {
             code: u32::from_ne_bytes(status.to_ne_bytes()),
         };
     }
-    match verify_catalog(path, &path_w) {
+    match verify_catalog(file, &path_w) {
         Some((0, publisher)) => Signature::Signed {
             publisher: publisher.unwrap_or_else(|| String::from("(unknown publisher)")),
             via_catalog: true,
@@ -163,6 +191,10 @@ pub fn verify_signature(path: &Path) -> Signature {
         },
         None => Signature::Unsigned,
     }
+}
+
+fn rewind(mut file: &File) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0)).map(|_| ())
 }
 
 /// Settings shared by every check: no UI, no revocation, no network.
@@ -269,7 +301,7 @@ fn verify_embedded(path_w: &HSTRING, file: &File) -> (i32, Option<String>) {
 
 /// Looks the file's hash up in the Windows security catalogs and checks
 /// the catalog's signature. Returns `None` if no catalog lists the file.
-fn verify_catalog(path: &Path, path_w: &HSTRING) -> Option<(i32, Option<String>)> {
+fn verify_catalog(file: &File, path_w: &HSTRING) -> Option<(i32, Option<String>)> {
     // Newer catalogs use SHA-256; older ones SHA-1 (the default).
     for algorithm in [w!("SHA256"), PCWSTR::null()] {
         let mut admin: isize = 0;
@@ -278,7 +310,7 @@ fn verify_catalog(path: &Path, path_w: &HSTRING) -> Option<(i32, Option<String>)
         {
             continue;
         }
-        let result = catalog_lookup(admin, path, path_w);
+        let result = catalog_lookup(admin, file, path_w);
         // SAFETY: `admin` was acquired above and is released exactly once.
         let _ = unsafe { CryptCATAdminReleaseContext(admin, 0) };
         if result.is_some() {
@@ -288,9 +320,9 @@ fn verify_catalog(path: &Path, path_w: &HSTRING) -> Option<(i32, Option<String>)
     None
 }
 
-fn catalog_lookup(admin: isize, path: &Path, path_w: &HSTRING) -> Option<(i32, Option<String>)> {
-    let file = File::open(path).ok()?;
+fn catalog_lookup(admin: isize, file: &File, path_w: &HSTRING) -> Option<(i32, Option<String>)> {
     let handle = HANDLE(file.as_raw_handle());
+    rewind(file).ok()?;
     let mut size = 0u32;
     // SAFETY: first call only asks for the hash size; `handle` is open.
     let _ = unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut size, None, None) };
@@ -298,6 +330,7 @@ fn catalog_lookup(admin: isize, path: &Path, path_w: &HSTRING) -> Option<(i32, O
         return None;
     }
     let mut hash = vec![0u8; usize::try_from(size).ok()?];
+    rewind(file).ok()?;
     // SAFETY: `hash` has room for `size` bytes.
     unsafe {
         CryptCATAdminCalcHashFromFileHandle2(
@@ -323,16 +356,13 @@ fn catalog_lookup(admin: isize, path: &Path, path_w: &HSTRING) -> Option<(i32, O
     let result = if unsafe { CryptCATCatalogInfoFromContext(catalog, &mut info, 0) }.is_ok() {
         let tag: String = hash.iter().map(|byte| format!("{byte:02X}")).collect();
         let tag = HSTRING::from(tag);
-        let member = File::open(path).ok();
         let mut catalog_info = WINTRUST_CATALOG_INFO {
             cbStruct: struct_size::<WINTRUST_CATALOG_INFO>(),
             dwCatalogVersion: 0,
             pcwszCatalogFilePath: PCWSTR(info.wszCatalogFile.as_ptr()),
             pcwszMemberTag: PCWSTR(tag.as_ptr()),
             pcwszMemberFilePath: PCWSTR(path_w.as_ptr()),
-            hMemberFile: member
-                .as_ref()
-                .map_or(HANDLE::default(), |f| HANDLE(f.as_raw_handle())),
+            hMemberFile: handle,
             pbCalculatedFileHash: hash.as_mut_ptr(),
             cbCalculatedFileHash: size,
             pcCatalogContext: std::ptr::null_mut(),
@@ -345,8 +375,9 @@ fn catalog_lookup(admin: isize, path: &Path, path_w: &HSTRING) -> Option<(i32, O
             },
             ..base_trust_data()
         };
+        let _ = rewind(file);
         // SAFETY: `data` points at `catalog_info`, whose pointers refer to
-        // `info`, `tag`, `path_w`, `member` and `hash`, all of which outlive
+        // `info`, `tag`, `path_w`, `file` and `hash`, all of which outlive
         // the call.
         Some(unsafe { run_trust_check(&mut data) })
     } else {
@@ -383,22 +414,38 @@ pub fn package_family_name(pid: u32) -> Option<String> {
     name
 }
 
-/// Works out the full identity of the program at `path` (a drive-letter
-/// path). `pid` is used for the Store package name, if the process is still
-/// running.
-pub fn identify(path: &str, pid: Option<u32>) -> AppIdentity {
-    let file = Path::new(path);
-    let size = std::fs::metadata(file).ok().map(|m| m.len());
-    let sha256 = match size {
-        Some(size) if size <= MAX_HASH_SIZE => sha256_file(file).ok(),
+/// Hashes an open `file` if it is small enough. Returns its size and hash.
+pub fn size_and_hash(file: &File) -> (Option<u64>, Option<String>) {
+    let size = file.metadata().ok().map(|m| m.len());
+    let hash = match size {
+        Some(size) if size <= MAX_HASH_SIZE => sha256_of(file).ok(),
         _ => None,
     };
+    (size, hash)
+}
+
+/// Works out the full identity of the program at `path` (a drive-letter
+/// path), reading the file through one locked handle. `pid` is used for the
+/// Store package name, if the process is still running.
+pub fn identify(path: &str, pid: Option<u32>) -> AppIdentity {
+    let file_path = Path::new(path);
+    let package_family_name = pid.and_then(package_family_name);
+    let Ok(file) = open_locked(file_path) else {
+        return AppIdentity {
+            path: path.to_owned(),
+            signature: Signature::Unknown,
+            sha256: None,
+            size: None,
+            package_family_name,
+        };
+    };
+    let (size, sha256) = size_and_hash(&file);
     AppIdentity {
         path: path.to_owned(),
-        signature: verify_signature(file),
+        signature: verify_signature_of(&file, file_path),
         sha256,
         size,
-        package_family_name: pid.and_then(package_family_name),
+        package_family_name,
     }
 }
 
@@ -425,15 +472,58 @@ mod tests {
         Path::new(&root).join("System32").join(file)
     }
 
+    /// A program with a signature embedded in the file (not a catalog), if
+    /// one is installed. Edge and Git are present on GitHub's runners too.
+    fn embedded_signed_program() -> Option<PathBuf> {
+        let x86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
+        let x64 = std::env::var("ProgramFiles").unwrap_or_default();
+        [
+            Path::new(&x86).join(r"Microsoft\Edge\Application\msedge.exe"),
+            Path::new(&x64).join(r"Microsoft\Edge\Application\msedge.exe"),
+            Path::new(&x64).join(r"Git\cmd\git.exe"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
     #[test]
     fn hashes_files_with_sha256() {
         let dir = temp_dir("hash");
         let file = dir.join("abc.txt");
         std::fs::write(&file, b"abc").unwrap();
+        let open = open_locked(&file).unwrap();
+        // The position does not matter: hashing always starts at the start.
+        let mut reader = &open;
+        let mut first = [0u8; 1];
+        reader.read_exact(&mut first).unwrap();
         assert_eq!(
-            sha256_file(&file).unwrap(),
+            sha256_of(&open).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        drop(open);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_being_checked_cannot_be_changed_or_deleted() {
+        let dir = temp_dir("locked");
+        let file = dir.join("app.exe");
+        std::fs::write(&file, b"original").unwrap();
+        let locked = open_locked(&file).unwrap();
+
+        assert!(
+            std::fs::write(&file, b"swapped").is_err(),
+            "write must fail"
+        );
+        assert!(std::fs::remove_file(&file).is_err(), "delete must fail");
+        assert!(
+            std::fs::rename(&file, dir.join("moved.exe")).is_err(),
+            "rename must fail"
+        );
+        // Reading is still allowed.
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+
+        drop(locked);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -512,20 +602,6 @@ mod tests {
             "a modified file must not count as signed: {result:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A program with a signature embedded in the file (not a catalog), if
-    /// one is installed. Edge and Git are present on GitHub's runners too.
-    fn embedded_signed_program() -> Option<PathBuf> {
-        let x86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
-        let x64 = std::env::var("ProgramFiles").unwrap_or_default();
-        [
-            Path::new(&x86).join(r"Microsoft\Edge\Application\msedge.exe"),
-            Path::new(&x64).join(r"Microsoft\Edge\Application\msedge.exe"),
-            Path::new(&x64).join(r"Git\cmd\git.exe"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
     }
 
     #[test]
