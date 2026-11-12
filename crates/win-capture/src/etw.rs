@@ -2,9 +2,10 @@
 //! into [`CaptureEvent`]s.
 
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
@@ -14,13 +15,15 @@ use ferrisetw::trace::{UserTrace, stop_trace_by_name};
 use whereabouts_core::model::{CaptureEvent, NetEvent};
 
 use crate::dns::{
-    DNS_CLIENT_PROVIDER, DNS_QUERY_COMPLETED_EVENT, normalize_name, parse_query_results,
+    DNS_CLIENT_PROVIDER, DNS_QUERY_COMPLETED_EVENT, DNS_SERVICE_RESPONSE_EVENT, normalize_name,
+    parse_query_results,
 };
 use crate::events::{
     CAPTURED_EVENT_IDS, EventSpec, KERNEL_NETWORK_PROVIDER, KERNEL_PROCESS_KEYWORD,
     KERNEL_PROCESS_PROVIDER, PROCESS_START_EVENT, PROCESS_STOP_EVENT, RawFields, classify,
     filetime_to_system_time, to_net_event,
 };
+use crate::service::{DNS_CLIENT_SERVICE, service_process_id};
 
 /// Name of the ETW session. Only one Whereabouts capture runs at a time.
 pub const SESSION_NAME: &str = "Whereabouts-Capture";
@@ -57,6 +60,11 @@ pub struct CaptureCounts {
     pub dropped: u64,
     /// Events that could not be decoded.
     pub malformed: u64,
+    /// Events that claimed to come from the Windows DNS service but were
+    /// written by another process. Ordinary programs can write events under
+    /// any provider ID, so a non-zero value may mean a program is trying to
+    /// fake DNS labels.
+    pub rejected: u64,
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +72,47 @@ struct Counters {
     events: AtomicU64,
     dropped: AtomicU64,
     malformed: AtomicU64,
+    rejected: AtomicU64,
+}
+
+/// How often the DNS service's process ID may be looked up again, for
+/// example after the service restarted.
+const DNS_SERVICE_REFRESH: Duration = Duration::from_secs(30);
+
+/// Knows which process hosts the Windows DNS Client service.
+#[derive(Debug)]
+struct DnsService {
+    pid: AtomicU32,
+    last_lookup: Mutex<Instant>,
+}
+
+impl DnsService {
+    fn new() -> Self {
+        Self {
+            pid: AtomicU32::new(service_process_id(DNS_CLIENT_SERVICE).unwrap_or(0)),
+            last_lookup: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Returns `true` if `pid` is the DNS Client service's process. Looks
+    /// the service up again (at most every [`DNS_SERVICE_REFRESH`]) in case
+    /// it restarted with a new process ID.
+    fn is_service(&self, pid: u32) -> bool {
+        let known = self.pid.load(Ordering::Relaxed);
+        if known != 0 && pid == known {
+            return true;
+        }
+        let Ok(mut last) = self.last_lookup.lock() else {
+            return false;
+        };
+        if last.elapsed() < DNS_SERVICE_REFRESH {
+            return false;
+        }
+        *last = Instant::now();
+        let current = service_process_id(DNS_CLIENT_SERVICE).unwrap_or(0);
+        self.pid.store(current, Ordering::Relaxed);
+        current != 0 && pid == current
+    }
 }
 
 impl Counters {
@@ -139,13 +188,28 @@ impl Capture {
 
         let dns_counters = Arc::clone(&counters);
         let dns_sender = sender.clone();
+        let dns_service = DnsService::new();
         let dns = Provider::by_guid(DNS_CLIENT_PROVIDER)
-            .add_filter(EventFilter::ByEventIds(vec![DNS_QUERY_COMPLETED_EVENT]))
+            .add_filter(EventFilter::ByEventIds(vec![
+                DNS_QUERY_COMPLETED_EVENT,
+                DNS_SERVICE_RESPONSE_EVENT,
+            ]))
             .add_callback(move |record, locator| {
-                if record.event_id() != DNS_QUERY_COMPLETED_EVENT {
-                    return;
-                }
-                match decode_dns(record, locator) {
+                let kind = match record.event_id() {
+                    DNS_QUERY_COMPLETED_EVENT => DnsKind::App,
+                    DNS_SERVICE_RESPONSE_EVENT => {
+                        // Windows stamps the real writer's process ID on
+                        // each event; only the DNS service may confirm.
+                        if !dns_service.is_service(record.process_id()) {
+                            dns_counters.events.fetch_add(1, Ordering::Relaxed);
+                            dns_counters.rejected.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        DnsKind::Service
+                    }
+                    _ => return,
+                };
+                match decode_dns(record, locator, kind) {
                     DnsDecode::Answer(event) => {
                         dns_counters.deliver_lossy(&dns_sender, Some(event))
                     }
@@ -189,6 +253,7 @@ impl Capture {
             events: self.counters.events.load(Ordering::Relaxed),
             dropped: self.counters.dropped.load(Ordering::Relaxed),
             malformed: self.counters.malformed.load(Ordering::Relaxed),
+            rejected: self.counters.rejected.load(Ordering::Relaxed),
         }
     }
 
@@ -224,7 +289,16 @@ fn decode_net(record: &EventRecord, locator: &SchemaLocator, spec: EventSpec) ->
     Some(to_net_event(spec, &raw, timestamp))
 }
 
-/// Result of decoding a "DNS query completed" event.
+/// Which DNS event is being decoded.
+#[derive(Clone, Copy)]
+enum DnsKind {
+    /// Event 3008, logged by the app that asked.
+    App,
+    /// Event 3020, logged by the DNS Client service.
+    Service,
+}
+
+/// Result of decoding a DNS event.
 enum DnsDecode {
     /// A successful answer with at least one address.
     Answer(CaptureEvent),
@@ -236,13 +310,17 @@ enum DnsDecode {
     Malformed,
 }
 
-fn decode_dns(record: &EventRecord, locator: &SchemaLocator) -> DnsDecode {
+fn decode_dns(record: &EventRecord, locator: &SchemaLocator, kind: DnsKind) -> DnsDecode {
     let Ok(schema) = locator.event_schema(record) else {
         return DnsDecode::Malformed;
     };
     let parser = Parser::create(record, &schema);
+    let status_field = match kind {
+        DnsKind::App => "QueryStatus",
+        DnsKind::Service => "Status",
+    };
     let (Ok(status), Ok(name), Ok(results)) = (
-        parser.try_parse::<u32>("QueryStatus"),
+        parser.try_parse::<u32>(status_field),
         parser.try_parse::<String>("QueryName"),
         parser.try_parse::<String>("QueryResults"),
     ) else {
@@ -255,13 +333,21 @@ fn decode_dns(record: &EventRecord, locator: &SchemaLocator) -> DnsDecode {
     if parsed.addresses.is_empty() {
         return DnsDecode::Skip;
     }
-    DnsDecode::Answer(CaptureEvent::DnsAnswer {
-        // Event 3008 is logged in the requesting process.
-        pid: record.process_id(),
-        name,
-        aliases: parsed.aliases,
-        addresses: parsed.addresses,
-        timestamp: filetime_to_system_time(record.raw_timestamp()),
+    let timestamp = filetime_to_system_time(record.raw_timestamp());
+    DnsDecode::Answer(match kind {
+        DnsKind::App => CaptureEvent::DnsAnswer {
+            // Event 3008 is logged in the requesting process.
+            pid: record.process_id(),
+            name,
+            aliases: parsed.aliases,
+            addresses: parsed.addresses,
+            timestamp,
+        },
+        DnsKind::Service => CaptureEvent::DnsConfirmed {
+            name,
+            addresses: parsed.addresses,
+            timestamp,
+        },
     })
 }
 

@@ -34,6 +34,17 @@ fn collect(receiver: &Receiver<CaptureEvent>, wait: Duration) -> Vec<CaptureEven
     events
 }
 
+/// Empties the Windows DNS cache so the next lookup goes to the DNS service
+/// (which then logs a confirming event) instead of being answered from the
+/// cache.
+fn flush_dns_cache() {
+    let status = Command::new("ipconfig")
+        .arg("/flushdns")
+        .output()
+        .expect("ipconfig runs");
+    assert!(status.status.success(), "ipconfig /flushdns failed");
+}
+
 fn start_capture(queue: usize) -> (Capture, Receiver<CaptureEvent>) {
     let (sender, receiver) = mpsc::sync_channel(queue);
     let capture = Capture::start(sender).unwrap_or_else(|e| panic!("{e}"));
@@ -46,6 +57,7 @@ fn start_capture(queue: usize) -> (Capture, Receiver<CaptureEvent>) {
 #[ignore = "needs administrator rights and network access"]
 fn captures_a_short_lived_process_and_its_https_traffic() {
     let (capture, receiver) = start_capture(200_000);
+    flush_dns_cache();
 
     let mut child = Command::new("curl.exe")
         .args(["--silent", "--output", "NUL", "--max-time", "15", TARGET])
@@ -102,6 +114,21 @@ fn captures_a_short_lived_process_and_its_https_traffic() {
         let remote = n.remote.ip().to_canonical();
         answers.iter().any(|addresses| addresses.contains(&remote))
     });
+    let confirmed: Vec<&Vec<IpAddr>> = events
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::DnsConfirmed {
+                name, addresses, ..
+            } if name == "example.com" => Some(addresses),
+            _ => None,
+        })
+        .collect();
+    let connected_to_confirmed = traffic.iter().any(|n| {
+        let remote = n.remote.ip().to_canonical();
+        confirmed
+            .iter()
+            .any(|addresses| addresses.contains(&remote))
+    });
 
     assert!(started, "no ProcessStarted event for curl.exe (pid {pid})");
     assert!(
@@ -111,6 +138,14 @@ fn captures_a_short_lived_process_and_its_https_traffic() {
     assert!(
         connected_to_answer,
         "curl.exe's traffic did not go to an address from its DNS answer"
+    );
+    assert!(
+        connected_to_confirmed,
+        "the DNS service did not confirm the address curl.exe connected to"
+    );
+    assert_eq!(
+        counts.rejected, 0,
+        "genuine DNS service events were rejected: {counts:?}"
     );
     assert!(exited, "no ProcessExited event for curl.exe (pid {pid})");
     assert!(
@@ -149,4 +184,57 @@ fn stopping_does_not_hang_when_the_queue_is_full() {
         .recv_timeout(Duration::from_secs(15))
         .expect("Capture::stop did not return within 15 seconds");
     assert!(stopped, "Capture::stop returned an error");
+}
+
+#[test]
+#[ignore = "needs administrator rights and network access"]
+fn rejects_dns_service_events_forged_by_another_process() {
+    use windows::Win32::System::Diagnostics::Etw::{
+        EVENT_DESCRIPTOR, EventRegister, EventUnregister, EventWrite, REGHANDLE,
+    };
+    use windows::core::GUID;
+
+    let (capture, receiver) = start_capture(100_000);
+
+    // Register as the DNS Client provider from this ordinary test process
+    // and write events that pretend to be the DNS service's "query
+    // response" (3020). Any program can do this.
+    let provider = GUID::from_u128(0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d);
+    let mut handle = REGHANDLE::default();
+    // SAFETY: `provider` and `handle` are valid for the call; no callback.
+    let status = unsafe { EventRegister(&provider, None, None, &mut handle) };
+    assert_eq!(status, 0, "EventRegister failed");
+    let descriptor = EVENT_DESCRIPTOR {
+        Id: 3020,
+        Version: 0,
+        Channel: 0,
+        Level: 4,
+        Opcode: 0,
+        Task: 0,
+        Keyword: 0,
+    };
+    for _ in 0..5 {
+        // SAFETY: `handle` is registered and `descriptor` is valid; no data.
+        unsafe { EventWrite(handle, &descriptor, None) };
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = collect(&receiver, Duration::from_secs(3));
+    let counts = capture.counts();
+    // SAFETY: `handle` was registered above and is unregistered once.
+    unsafe { EventUnregister(handle) };
+    drop(receiver);
+    capture.stop().expect("capture stops cleanly");
+
+    assert!(
+        counts.rejected >= 1,
+        "forged DNS service events were not rejected: {counts:?}"
+    );
+    // The forged events carry no data, so even if they had been accepted
+    // they would show up as malformed, not as confirmations; the rejection
+    // counter is what proves they were refused before decoding.
+    assert_eq!(
+        counts.malformed, 0,
+        "forged events reached the decoder: {counts:?}"
+    );
 }

@@ -13,9 +13,18 @@
 //!   Some IPv4 answers appear in IPv4-mapped IPv6 form (`::ffff:1.2.3.4`).
 //! - `QueryStatus` is 0 on success; failed queries have no results.
 //!
-//! Names and results come from the network, so they are validated: names
-//! longer than a DNS name can be, or containing control characters, are
-//! rejected, and the number of answers kept per query is capped.
+//! Event 3020 ("query response") is logged by the DNS Client service itself
+//! with the same `QueryName`/`QueryResults` format. Any program can write
+//! events under this provider's ID, but not under the service's process ID,
+//! so 3020 events from the service's process confirm what an app's own 3008
+//! event claims.
+//!
+//! Names and results come from the network or from the app, so they are
+//! validated: only characters legal in DNS names are accepted (ASCII
+//! letters, digits, `-`, `_`, `.`), which also rules out control, bidi and
+//! invisible Unicode characters that could spoof what the user sees.
+//! Internationalised names arrive in their ASCII (punycode) form. The number
+//! of answers kept per query is capped.
 
 use std::net::IpAddr;
 
@@ -24,6 +33,9 @@ pub const DNS_CLIENT_PROVIDER: &str = "1c95126e-7eea-49a9-a3fe-a378b03ddb4d";
 
 /// Event ID of "DNS query completed", logged in the requesting process.
 pub const DNS_QUERY_COMPLETED_EVENT: u16 = 3008;
+
+/// Event ID of "DNS query response", logged by the DNS Client service.
+pub const DNS_SERVICE_RESPONSE_EVENT: u16 = 3020;
 
 /// Longest valid DNS name, in characters (RFC 1035, without trailing dot).
 pub const MAX_NAME_LEN: usize = 253;
@@ -44,13 +56,15 @@ pub struct DnsResults {
 }
 
 /// Normalises a DNS name: trims whitespace and a trailing dot, lowercases
-/// ASCII letters. Returns `None` if the name is empty, too long, or contains
-/// control characters or whitespace.
+/// it. Returns `None` if the name is empty, too long, or contains anything
+/// other than ASCII letters, digits, `-`, `_` and `.`.
 pub fn normalize_name(raw: &str) -> Option<String> {
     let name = raw.trim().trim_end_matches('.');
     let valid = !name.is_empty()
-        && name.chars().count() <= MAX_NAME_LEN
-        && !name.chars().any(|c| c.is_control() || c.is_whitespace());
+        && name.len() <= MAX_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
     valid.then(|| name.to_ascii_lowercase())
 }
 
@@ -174,5 +188,21 @@ mod tests {
         assert_eq!(normalize_name("has space.example"), None);
         assert_eq!(normalize_name(&"a".repeat(MAX_NAME_LEN + 1)), None);
         assert!(normalize_name(&"a".repeat(MAX_NAME_LEN)).is_some());
+    }
+
+    #[test]
+    fn rejects_unicode_that_could_spoof_the_display() {
+        // Right-to-left override: would display the rest reversed.
+        assert_eq!(normalize_name("evil\u{202e}moc.elgoog"), None);
+        // Zero-width space and soft hyphen: invisible.
+        assert_eq!(normalize_name("goo\u{200b}gle.com"), None);
+        assert_eq!(normalize_name("goo\u{00ad}gle.com"), None);
+        // Look-alike letter: Cyrillic "a" instead of Latin "a".
+        assert_eq!(normalize_name("\u{0430}pple.com"), None);
+        // Punycode (the ASCII form of internationalised names) is accepted.
+        assert_eq!(
+            normalize_name("xn--bcher-kva.example").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
     }
 }

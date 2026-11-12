@@ -83,7 +83,7 @@ function Invoke-IntegrationTests {
     $output = Get-LoggedOutput -Name 'integration'
     $output -split "`r?`n" | Where-Object { $_ -match '^test |test result|panicked|assert' } |
         ForEach-Object { Write-Log "    $_" }
-    if ($process.ExitCode -ne 0 -or $output -notmatch 'test result: ok\. 2 passed') {
+    if ($process.ExitCode -ne 0 -or $output -notmatch 'test result: ok\. 3 passed') {
         Write-Log "FAIL: integration tests (exit code $($process.ExitCode))"
         return $false
     }
@@ -96,6 +96,8 @@ function Invoke-ConsoleSmokeTest {
     $console = Start-Logged -FilePath $ServiceExe -Name 'console' -Arguments @(
         '--console', '--seconds', '12')
     Start-Sleep -Seconds 4
+    # Empty the DNS cache so curl's lookup is confirmed by the DNS service.
+    & ipconfig /flushdns | Out-Null
     $curl = Start-Process -FilePath 'curl.exe' -NoNewWindow -Wait -PassThru -ArgumentList @(
         '--silent', '--output', 'NUL', '--max-time', '15', $TestUrl)
     Write-Log "    curl.exe (pid $($curl.Id)) exited with $($curl.ExitCode)"
@@ -129,8 +131,9 @@ function Invoke-ConsoleSmokeTest {
         $passed = $false
     } else {
         Write-Log "    $($curlRows[-1].Trim())"
+        # A verified label has no "?" or "*" marker after the name.
         if ($curlRows[-1] -notmatch '\sexample\.com\s') {
-            Write-Log 'FAIL: curl.exe row is not labelled with example.com'
+            Write-Log 'FAIL: curl.exe row is not labelled with a verified example.com'
             $passed = $false
         }
     }
