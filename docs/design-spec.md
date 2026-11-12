@@ -150,6 +150,16 @@ A process name alone is not trustworthy (malware can call itself `tiktok.exe`). 
 - **File hash** (to notice when the binary changes, e.g. after an update)
 - **Package family name** for Microsoft Store / MSIX apps
 
+How it is implemented (`win-capture::identity`, verified on Windows 11, 2026-11-12):
+
+| Fact | Consequence |
+|---|---|
+| Many Windows programs (e.g. `curl.exe`) have no embedded signature; their hash is listed in a signed security catalog. | Files without an embedded signature are looked up in the catalogs by hash (SHA-256, then SHA-1). A renamed copy is still recognised; a modified copy is not. |
+| A file can be listed in several catalogs signed by different Microsoft certificates (`curl.exe`: "Microsoft Windows" and "Microsoft 3rd Party Application Component"). | The publisher shown is whichever catalog Windows returns first; both are genuine. |
+| `WinVerifyTrust` may contact certificate servers by default. | Revocation checks are off and only cached certificates are used (`WTD_REVOKE_NONE`, `WTD_CACHE_ONLY_URL_RETRIEVAL`). A live test checks that no network traffic is made. |
+| Process-start events give `\Device\HarddiskVolumeN\...` paths. | Mapped to drive letters with `QueryDosDevice`. |
+| Hashing and signature checks take time. | They run on a background thread, cached by path, size and modification time, and only for processes that use the network. |
+
 Known hard cases (documented, handled best-effort):
 - **`svchost.exe`** hosts many Windows services in one process. Where possible we resolve the owning service name; otherwise we show “Windows service host”.
 - **Short-lived processes** may exit before we look them up; we cache process info at process-start time (ETW process events).

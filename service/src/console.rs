@@ -7,7 +7,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
-use whereabouts_core::model::{CaptureEvent, NetEvent, Protocol};
+use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
+use whereabouts_win_capture::identity::DevicePaths;
+use whereabouts_win_capture::resolver::IdentityResolver;
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
 
 /// Maximum number of events waiting between the capture thread and us.
@@ -25,10 +27,16 @@ const MAX_CLOSED: usize = 2_000;
 /// after it has exited.
 const LATE_TRAFFIC_WINDOW: Duration = Duration::from_secs(10);
 
-/// A flow together with the app name it had when it was recorded.
+/// Most program identities kept for display.
+const MAX_IDENTITIES: usize = 20_000;
+
+/// A flow together with the app name and program path it had when
+/// recorded. The publisher is looked up from the path when drawing, so a
+/// signature check that finishes after the app exited still shows up.
 #[derive(Debug, Clone)]
 struct Row {
     app: String,
+    path: Option<String>,
     key: FlowKey,
     stats: FlowStats,
 }
@@ -58,7 +66,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     let started = Instant::now();
     let mut last_draw = Instant::now();
     let mut table = FlowTable::new();
-    let mut names = ProcessNames::default();
+    let mut names = ProcessNames::new();
     let mut closed = VecDeque::new();
     let mut exited = RecentlyExited::default();
     // Start time of each running process, so that a process is identified by
@@ -70,11 +78,11 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         match receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(CaptureEvent::Net(event)) => {
                 let current_start = starts.get(&event.pid).copied();
-                if let Some(app) = exited.owner(&event, current_start) {
-                    add_late_traffic(&mut closed, app, &event);
+                if let Some(owner) = exited.owner(&event, current_start) {
+                    add_late_traffic(&mut closed, &owner.app, owner.path.as_deref(), &event);
                 } else {
                     // Look the process up while it is still running.
-                    names.resolve(event.pid);
+                    names.note_traffic(event.pid);
                     let label = dns.lookup(event.pid, event.remote.ip(), event.timestamp);
                     table.record_labeled(&event, label);
                 }
@@ -85,12 +93,12 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 timestamp,
             }) => {
                 starts.insert(pid, timestamp);
-                names.set(pid, file_name(&image));
+                names.set_started(pid, &image);
             }
             Ok(CaptureEvent::ProcessExited { pid, timestamp }) => {
                 // Windows may reuse this ID, so close everything tied to it.
                 close(&mut closed, &names, table.take_process(pid));
-                exited.insert(pid, names.get(pid).to_owned(), timestamp);
+                exited.insert(pid, names.get(pid).to_owned(), names.path(pid), timestamp);
                 names.forget(pid);
                 starts.remove(&pid);
                 dns.forget_process(pid);
@@ -114,6 +122,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        names.poll();
         if last_draw.elapsed() >= REFRESH {
             exited.expire();
             dns.expire(SystemTime::now());
@@ -130,6 +139,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         }
     }
 
+    names.settle(Duration::from_secs(5));
     draw(&table, &closed, &names, capture.counts(), started.elapsed());
     // Release any process event waiting for queue space before stopping.
     drop(receiver);
@@ -139,31 +149,126 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Cache of process ID to executable file name.
-#[derive(Debug, Default)]
-struct ProcessNames(HashMap<u32, Option<String>>);
+/// Name and executable path of a process.
+#[derive(Debug)]
+struct ProcessInfo {
+    name: String,
+    /// Drive-letter path, if known.
+    path: Option<String>,
+    /// Whether its identity has been asked for. Only processes that use
+    /// the network are checked.
+    requested: bool,
+}
+
+/// What the console knows about each process, plus each program's
+/// identity (signature, hash), worked out by a background worker.
+#[derive(Debug)]
+struct ProcessNames {
+    processes: HashMap<u32, Option<ProcessInfo>>,
+    /// Identities by lowercase path.
+    identities: HashMap<String, AppIdentity>,
+    resolver: IdentityResolver,
+    devices: DevicePaths,
+}
 
 impl ProcessNames {
-    /// Looks up `pid` if it is not cached yet.
-    fn resolve(&mut self, pid: u32) {
-        self.0
-            .entry(pid)
-            .or_insert_with(|| process::image_path(pid).map(|path| file_name(&path).to_owned()));
+    fn new() -> Self {
+        Self {
+            processes: HashMap::new(),
+            identities: HashMap::new(),
+            resolver: IdentityResolver::start(),
+            devices: DevicePaths::load(),
+        }
     }
 
-    fn set(&mut self, pid: u32, name: &str) {
-        self.0.insert(pid, Some(name.to_owned()));
+    /// Called for each network event of `pid`: looks the process up if it
+    /// is not known yet, and asks for its program's identity once.
+    fn note_traffic(&mut self, pid: u32) {
+        if !self.processes.contains_key(&pid) {
+            let info = process::image_path(pid).map(|path| ProcessInfo {
+                name: file_name(&path).to_owned(),
+                path: self.devices.to_dos(&path),
+                requested: false,
+            });
+            self.processes.insert(pid, info);
+        }
+        let Some(Some(info)) = self.processes.get_mut(&pid) else {
+            return;
+        };
+        if info.requested {
+            return;
+        }
+        info.requested = match info.path.as_deref() {
+            Some(path) if !self.identities.contains_key(&path.to_ascii_lowercase()) => {
+                self.resolver.request(path, Some(pid))
+            }
+            _ => true,
+        };
+    }
+
+    /// Records a process from its start event. `image` may be a
+    /// `\Device\HarddiskVolumeN\...` path. Its identity is only checked
+    /// once it uses the network.
+    fn set_started(&mut self, pid: u32, image: &str) {
+        let info = ProcessInfo {
+            name: file_name(image).to_owned(),
+            path: self.devices.to_dos(image),
+            requested: false,
+        };
+        self.processes.insert(pid, Some(info));
+    }
+
+    /// Waits up to `limit` for identity checks still running, so a final
+    /// table is complete.
+    fn settle(&mut self, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while !self.resolver.is_idle() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            self.poll();
+        }
+        self.poll();
+    }
+
+    /// Collects identities the background worker has finished.
+    fn poll(&mut self) {
+        for identity in self.resolver.finished() {
+            if self.identities.len() >= MAX_IDENTITIES {
+                self.identities.clear();
+            }
+            self.identities
+                .insert(identity.path.to_ascii_lowercase(), identity);
+        }
     }
 
     fn forget(&mut self, pid: u32) {
-        self.0.remove(&pid);
+        self.processes.remove(&pid);
     }
 
     fn get(&self, pid: u32) -> &str {
-        self.0
+        self.processes
             .get(&pid)
-            .and_then(Option::as_deref)
-            .unwrap_or("(unknown)")
+            .and_then(Option::as_ref)
+            .map_or("(unknown)", |info| info.name.as_str())
+    }
+
+    /// Drive-letter path of `pid`'s program, if known.
+    fn path(&self, pid: u32) -> Option<String> {
+        self.processes
+            .get(&pid)
+            .and_then(Option::as_ref)
+            .and_then(|info| info.path.clone())
+    }
+
+    /// Publisher text for a program path: the signer, `UNSIGNED`, `INVALID
+    /// SIGNATURE`, `…` while being checked, or `-` if there is no file.
+    fn publisher(&self, path: Option<&str>) -> String {
+        match path {
+            Some(path) => self
+                .identities
+                .get(&path.to_ascii_lowercase())
+                .map_or_else(|| String::from("…"), AppIdentity::publisher_text),
+            None => String::from("-"),
+        }
     }
 }
 
@@ -171,6 +276,7 @@ impl ProcessNames {
 #[derive(Debug)]
 struct Exited {
     app: String,
+    path: Option<String>,
     /// Exit time reported by Windows.
     exited_at: SystemTime,
     /// When we learned about the exit, for expiring the entry.
@@ -182,25 +288,26 @@ struct Exited {
 struct RecentlyExited(HashMap<u32, Exited>);
 
 impl RecentlyExited {
-    fn insert(&mut self, pid: u32, app: String, exited_at: SystemTime) {
+    fn insert(&mut self, pid: u32, app: String, path: Option<String>, exited_at: SystemTime) {
         let noted = Instant::now();
         self.0.insert(
             pid,
             Exited {
                 app,
+                path,
                 exited_at,
                 noted,
             },
         );
     }
 
-    /// Returns the name of the exited process that `event` belongs to, if
-    /// it is late traffic from a process that exited recently.
+    /// Returns the exited process that `event` belongs to, if it is late
+    /// traffic from a process that exited recently.
     ///
     /// `current_start` is the start time of the process that now has the
     /// event's ID, if any. Traffic at or after that start belongs to the new
     /// process, even if the events arrive out of order.
-    fn owner(&self, event: &NetEvent, current_start: Option<SystemTime>) -> Option<&str> {
+    fn owner(&self, event: &NetEvent, current_start: Option<SystemTime>) -> Option<&Exited> {
         let exited = self.0.get(&event.pid)?;
         if exited.noted.elapsed() >= LATE_TRAFFIC_WINDOW {
             return None;
@@ -210,7 +317,7 @@ impl RecentlyExited {
         if newer_process {
             return None;
         }
-        Some(&exited.app)
+        Some(exited)
     }
 
     fn expire(&mut self) {
@@ -221,7 +328,7 @@ impl RecentlyExited {
 
 /// Adds traffic that arrived after its process exited to the matching
 /// closed flow, or starts a new closed flow for it.
-fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, event: &NetEvent) {
+fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, path: Option<&str>, event: &NetEvent) {
     if event.is_loopback() {
         return;
     }
@@ -241,6 +348,7 @@ fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, event: &NetEvent) {
     }
     closed.push_back(Row {
         app: app.to_owned(),
+        path: path.map(str::to_owned),
         key,
         stats,
     });
@@ -254,9 +362,18 @@ fn close(closed: &mut VecDeque<Row>, names: &ProcessNames, flows: Vec<(FlowKey, 
         }
         closed.push_back(Row {
             app: app_name(&key, names),
+            path: path_for(&key, names),
             key,
             stats,
         });
+    }
+}
+
+fn path_for(key: &FlowKey, names: &ProcessNames) -> Option<String> {
+    if key.is_global_overflow() {
+        None
+    } else {
+        names.path(key.pid)
     }
 }
 
@@ -280,6 +397,7 @@ fn draw(
         .into_iter()
         .map(|(key, stats)| Row {
             app: app_name(&key, names),
+            path: path_for(&key, names),
             key,
             stats,
         })
@@ -318,18 +436,18 @@ fn draw(
         );
     }
     println!(
-        "{:>6}  {:<22} {:<5} {:<34} {:<40} {:>10} {:>10}",
-        "PID", "APP", "PROTO", "DOMAIN", "REMOTE", "SENT", "RECEIVED"
+        "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<40} {:>10} {:>10}",
+        "PID", "APP", "PUBLISHER", "PROTO", "DOMAIN", "REMOTE", "SENT", "RECEIVED"
     );
     for row in rows.iter().take(TOP_ROWS) {
-        println!("{}", format_row(row));
+        println!("{}", format_row(row, &names.publisher(row.path.as_deref())));
     }
     if rows.len() > TOP_ROWS {
         println!("  … and {} more", rows.len() - TOP_ROWS);
     }
 }
 
-fn format_row(row: &Row) -> String {
+fn format_row(row: &Row, publisher: &str) -> String {
     let proto = match row.key.protocol {
         Protocol::Tcp => "TCP",
         Protocol::Udp => "UDP",
@@ -343,9 +461,10 @@ fn format_row(row: &Row) -> String {
         (domain_text(row), row.key.remote.to_string())
     };
     format!(
-        "{:>6}  {:<22} {:<5} {:<34} {:<40} {:>10} {:>10}",
+        "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<40} {:>10} {:>10}",
         row.key.pid,
-        truncate(&row.app, 22),
+        truncate(&row.app, 20),
+        truncate(publisher, 22),
         proto,
         domain,
         remote,
@@ -358,9 +477,9 @@ fn format_row(row: &Row) -> String {
 fn domain_text(row: &Row) -> String {
     match &row.stats.domain {
         Some(label) => match label.source {
-            LabelSource::Verified => truncate(&label.name, 34),
-            LabelSource::Unverified => format!("{}?", truncate(&label.name, 33)),
-            LabelSource::Inferred => format!("{}*", truncate(&label.name, 33)),
+            LabelSource::Verified => truncate(&label.name, 30),
+            LabelSource::Unverified => format!("{}?", truncate(&label.name, 29)),
+            LabelSource::Inferred => format!("{}*", truncate(&label.name, 29)),
         },
         None => String::from("-"),
     }
@@ -420,8 +539,8 @@ mod tests {
     #[test]
     fn late_traffic_merges_into_the_closed_flow() {
         let mut closed = VecDeque::new();
-        add_late_traffic(&mut closed, "curl.exe", &late_send(7, 600));
-        add_late_traffic(&mut closed, "curl.exe", &late_send(7, 24));
+        add_late_traffic(&mut closed, "curl.exe", None, &late_send(7, 600));
+        add_late_traffic(&mut closed, "curl.exe", None, &late_send(7, 24));
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].app, "curl.exe");
         assert_eq!(closed[0].stats.bytes_sent, 624);
@@ -430,27 +549,35 @@ mod tests {
     #[test]
     fn late_traffic_goes_to_the_exited_process() {
         let mut exited = RecentlyExited::default();
-        exited.insert(7, String::from("old.exe"), at(100));
+        exited.insert(7, String::from("old.exe"), None, at(100));
         let mut event = late_send(7, 24);
         event.timestamp = at(101);
-        assert_eq!(exited.owner(&event, None), Some("old.exe"));
+        assert_eq!(
+            exited.owner(&event, None).map(|e| e.app.as_str()),
+            Some("old.exe")
+        );
     }
 
     #[test]
     fn traffic_from_a_new_process_with_a_reused_id_is_not_late_traffic() {
         let mut exited = RecentlyExited::default();
-        exited.insert(7, String::from("old.exe"), at(100));
+        exited.insert(7, String::from("old.exe"), None, at(100));
         let new_start = Some(at(105));
 
         let mut new_traffic = late_send(7, 500);
         new_traffic.timestamp = at(106);
-        assert_eq!(exited.owner(&new_traffic, new_start), None);
+        assert!(exited.owner(&new_traffic, new_start).is_none());
 
         // Late traffic from the old process that arrives out of order, after
         // the new process's start event, still goes to the old process.
         let mut old_traffic = late_send(7, 24);
         old_traffic.timestamp = at(101);
-        assert_eq!(exited.owner(&old_traffic, new_start), Some("old.exe"));
+        assert_eq!(
+            exited
+                .owner(&old_traffic, new_start)
+                .map(|e| e.app.as_str()),
+            Some("old.exe")
+        );
     }
 
     #[test]

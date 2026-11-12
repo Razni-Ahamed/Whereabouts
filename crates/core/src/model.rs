@@ -16,20 +16,62 @@ pub enum Protocol {
     Udp,
 }
 
+/// Result of checking an executable's code signature.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Signature {
+    /// A valid signature that chains to a trusted root.
+    Signed {
+        /// The signer's name from the certificate, e.g. "Microsoft Windows".
+        publisher: String,
+        /// `true` if the file is signed through a Windows security catalog
+        /// (common for files that ship with Windows) rather than with a
+        /// signature embedded in the file.
+        via_catalog: bool,
+    },
+    /// No signature at all.
+    Unsigned,
+    /// A signature is present but is not valid or not trusted, for example
+    /// because the file was changed after signing.
+    Invalid {
+        /// The Windows error code (an `HRESULT`).
+        code: u32,
+    },
+    /// The signature could not be checked, for example because the file
+    /// could not be read.
+    Unknown,
+}
+
 /// Identity of an application.
 ///
 /// A process name alone is not trusted, because any program can name itself
-/// `tiktok.exe`. See the design spec, section 5.3.
+/// `tiktok.exe`. The signature and file hash identify what the program
+/// really is. See the design spec, section 5.3.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AppIdentity {
     /// Full path of the executable.
     pub path: String,
-    /// Publisher from the Authenticode signature, or `None` if unsigned.
-    pub publisher: Option<String>,
-    /// SHA-256 hash of the executable, hex-encoded.
-    pub sha256: String,
+    /// Result of checking the code signature.
+    pub signature: Signature,
+    /// SHA-256 hash of the executable, hex-encoded, if it could be read and
+    /// is not too large to hash.
+    pub sha256: Option<String>,
+    /// Size of the executable in bytes, if it could be read.
+    pub size: Option<u64>,
     /// Package family name for MSIX / Microsoft Store apps.
     pub package_family_name: Option<String>,
+}
+
+impl AppIdentity {
+    /// Short text for the publisher, for display: the signer's name, or a
+    /// warning if the program is unsigned or its signature is not valid.
+    pub fn publisher_text(&self) -> String {
+        match &self.signature {
+            Signature::Signed { publisher, .. } => publisher.clone(),
+            Signature::Unsigned => String::from("UNSIGNED"),
+            Signature::Invalid { .. } => String::from("INVALID SIGNATURE"),
+            Signature::Unknown => String::from("(not checked)"),
+        }
+    }
 }
 
 /// One network flow: an app talking to one remote endpoint.

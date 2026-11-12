@@ -50,6 +50,10 @@ This is the complete list. You can turn off both.
 
 Both downloads are digitally signed, and Whereabouts rejects any file that fails the signature check. Whereabouts monitors itself like every other app, so you can check this list against what it actually does.
 
+## Checking which app is which
+
+To tell you who really made an app, Whereabouts checks the program file's digital signature and computes its hash, on your computer. Windows normally lets signature checks contact certificate servers on the internet; Whereabouts turns that off, so this check never sends anything out. Only programs that use the network are checked.
+
 ## Learning and machine learning
 
 Whereabouts learns what is normal for each of your apps so it can warn you about unusual behaviour. This learning happens **only on your computer**. The learned profiles are stored encrypted, you can view and reset them, and nothing is ever shared, not even anonymised model updates.

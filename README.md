@@ -70,7 +70,7 @@ The background service and the desktop app are not ready yet, but you can alread
 cargo run -p whereabouts-service -- --console
 ```
 
-Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. It shows each app's connections with the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
+Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. It shows each app's connections with the app's publisher (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
 
 ## Building from source
 
