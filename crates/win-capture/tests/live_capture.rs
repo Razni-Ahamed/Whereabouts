@@ -242,3 +242,41 @@ fn rejects_dns_service_events_forged_by_another_process() {
         "forged events reached the decoder: {counts:?}"
     );
 }
+
+#[test]
+#[ignore = "needs administrator rights and network access"]
+fn checking_signatures_makes_no_network_requests() {
+    use whereabouts_win_capture::identity::identify;
+
+    let (capture, receiver) = start_capture(100_000);
+    let own_pid = std::process::id();
+
+    // Check several programs, including one with an embedded signature if
+    // installed, the way Whereabouts does for every app it sees.
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
+    let x86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
+    let programs = [
+        format!(r"{root}\System32\curl.exe"),
+        format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        format!(r"{x86}\Microsoft\Edge\Application\msedge.exe"),
+    ];
+    for program in &programs {
+        let _ = identify(program, None);
+    }
+
+    let events = collect(&receiver, Duration::from_secs(3));
+    drop(receiver);
+    capture.stop().expect("capture stops cleanly");
+
+    let own_traffic: Vec<&NetEvent> = events
+        .iter()
+        .filter_map(|e| match e {
+            CaptureEvent::Net(n) if n.pid == own_pid && !n.is_loopback() => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        own_traffic.is_empty(),
+        "checking signatures made network requests: {own_traffic:?}"
+    );
+}

@@ -83,7 +83,7 @@ function Invoke-IntegrationTests {
     $output = Get-LoggedOutput -Name 'integration'
     $output -split "`r?`n" | Where-Object { $_ -match '^test |test result|panicked|assert' } |
         ForEach-Object { Write-Log "    $_" }
-    if ($process.ExitCode -ne 0 -or $output -notmatch 'test result: ok\. 3 passed') {
+    if ($process.ExitCode -ne 0 -or $output -notmatch 'test result: ok\. 4 passed') {
         Write-Log "FAIL: integration tests (exit code $($process.ExitCode))"
         return $false
     }
@@ -101,6 +101,12 @@ function Invoke-ConsoleSmokeTest {
     $curl = Start-Process -FilePath 'curl.exe' -NoNewWindow -Wait -PassThru -ArgumentList @(
         '--silent', '--output', 'NUL', '--max-time', '15', $TestUrl)
     Write-Log "    curl.exe (pid $($curl.Id)) exited with $($curl.ExitCode)"
+    # A renamed copy must still be recognised by its signature.
+    $renamedPath = Join-Path $WorkDir 'renamed-tool.exe'
+    Copy-Item -Path (Join-Path $env:SystemRoot 'System32\curl.exe') -Destination $renamedPath
+    $renamed = Start-Process -FilePath $renamedPath -NoNewWindow -Wait -PassThru -ArgumentList @(
+        '--silent', '--output', 'NUL', '--max-time', '15', $TestUrl)
+    Write-Log "    renamed-tool.exe (pid $($renamed.Id)) exited with $($renamed.ExitCode)"
 
     if (-not $console.WaitForExit(60000)) {
         $console.Kill()
@@ -134,6 +140,23 @@ function Invoke-ConsoleSmokeTest {
         # A verified label has no "?" or "*" marker after the name.
         if ($curlRows[-1] -notmatch '\sexample\.com\s') {
             Write-Log 'FAIL: curl.exe row is not labelled with a verified example.com'
+            $passed = $false
+        }
+        # curl.exe is listed in more than one Microsoft-signed catalog
+        # ("Microsoft Windows", "Microsoft 3rd Party Application Component").
+        if ($curlRows[-1] -notmatch 'curl\.exe\s+Microsoft ') {
+            Write-Log 'FAIL: curl.exe row does not show a Microsoft publisher'
+            $passed = $false
+        }
+    }
+    $renamedRows = @($output -split "`r?`n" | Where-Object { $_ -match "^\s*$($renamed.Id)\s+renamed-tool\.exe\s" })
+    if ($renamedRows.Count -eq 0) {
+        Write-Log "FAIL: renamed-tool.exe (pid $($renamed.Id)) is not in the console table"
+        $passed = $false
+    } else {
+        Write-Log "    $($renamedRows[-1].Trim())"
+        if ($renamedRows[-1] -notmatch 'renamed-tool\.exe\s+Microsoft ') {
+            Write-Log 'FAIL: the renamed copy of curl.exe is not recognised as Microsoft-signed'
             $passed = $false
         }
     }

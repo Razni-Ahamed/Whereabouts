@@ -30,8 +30,10 @@
 pub mod dns;
 mod etw;
 pub mod events;
+pub mod identity;
 pub mod process;
 pub mod protection;
+pub mod resolver;
 pub mod service;
 
 pub use etw::{Capture, CaptureCounts, CaptureError, SESSION_NAME};
