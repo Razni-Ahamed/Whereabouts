@@ -1,0 +1,26 @@
+[package]
+name = "whereabouts-app"
+description = "Whereabouts desktop app: shows what the Whereabouts service sees"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "whereabouts"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+tauri.workspace = true
+whereabouts-client.workspace = true
+whereabouts-ipc.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[lints]
+workspace = true

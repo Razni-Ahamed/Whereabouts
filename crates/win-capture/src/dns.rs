@@ -78,10 +78,11 @@ pub fn parse_query_results(raw: &str) -> DnsResults {
         if let Some(record) = entry.strip_prefix("type:") {
             // "type: 5 <name>" is a CNAME. Other record types are ignored.
             let mut parts = record.split_whitespace();
-            if parts.next() == Some("5") && results.aliases.len() < MAX_ALIASES {
-                if let Some(alias) = parts.next().and_then(normalize_name) {
-                    results.aliases.push(alias);
-                }
+            if parts.next() == Some("5")
+                && results.aliases.len() < MAX_ALIASES
+                && let Some(alias) = parts.next().and_then(normalize_name)
+            {
+                results.aliases.push(alias);
             }
         } else if let Ok(address) = entry.parse::<IpAddr>() {
             let address = address.to_canonical();

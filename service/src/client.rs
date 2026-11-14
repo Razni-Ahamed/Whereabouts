@@ -1,14 +1,11 @@
 //! `--status`: asks a running Whereabouts over its local pipe how it is
 //! doing, and shows the top flows and apps.
 
-use std::io;
 use std::process::ExitCode;
 
+use whereabouts_client::{Client, Problem, ProblemKind};
 use whereabouts_core::text::display_safe;
-use whereabouts_ipc::{
-    DomainTrust, FlowView, PIPE_NAME, PROTOCOL_VERSION, Request, Response, Status,
-};
-use whereabouts_win_pipe::PipeConnection;
+use whereabouts_ipc::{DomainTrust, FlowView, PIPE_NAME, Request, Response, Status};
 
 use crate::console::{format_bytes, marked, truncate};
 
@@ -28,102 +25,56 @@ pub fn status() -> ExitCode {
     }
 }
 
-/// A connection to a verified Whereabouts service.
-struct Client(PipeConnection);
-
-impl Client {
-    /// Connects to `name`, checks that the program answering is
-    /// Whereabouts, and agrees on the protocol. Returns the service version.
-    fn connect(name: &str) -> Result<(Self, String), String> {
-        let connection =
-            whereabouts_win_pipe::connect(name).map_err(|error| match error.kind() {
-                io::ErrorKind::NotFound => String::from(
-                    "Whereabouts is not running. Start it with --console (as administrator).",
-                ),
-                io::ErrorKind::PermissionDenied => String::from(
-                    "access denied: only administrators and the account that started Whereabouts \
-                 may connect",
-                ),
-                _ => format!("could not connect to Whereabouts ({error})"),
-            })?;
-        // Before sending anything, make sure no other program has taken the
-        // pipe's name to pose as Whereabouts.
-        if !crate::server::is_trusted_server(connection.peer_pid(), connection.connected_by()) {
-            let mut message = String::from(
-                "the program answering on the Whereabouts pipe is not this copy of \
-                 Whereabouts, so it is not trusted",
-            );
-            // The usual reason: asking the installed service from another copy.
-            if let Some(installed) = crate::install::installed_exe() {
-                message.push_str(&format!(
-                    ". To ask the installed service, run \"{}\" --status",
-                    installed.display()
-                ));
-            }
-            return Err(message);
-        }
-        let mut client = Self(connection);
-        // The service hangs up at once on programs that are not its own
-        // file, before answering anything.
-        let greeting = client
-            .ask(&Request::Hello {
-                protocol: PROTOCOL_VERSION,
-            })
-            .map_err(|_| {
-                let mut message = String::from(
-                    "Whereabouts closed the connection: it only answers its own program",
-                );
-                if let Some(installed) = crate::install::installed_exe() {
-                    message.push_str(&format!(
-                        ". Run the installed copy: \"{}\" --status",
-                        installed.display()
-                    ));
-                }
-                message
-            })?;
-        match greeting {
-            Response::Hello { protocol, version } if protocol == PROTOCOL_VERSION => {
-                Ok((client, version))
-            }
-            Response::Hello { protocol, .. } => Err(format!(
-                "Whereabouts speaks protocol version {protocol}, this program speaks \
-                 {PROTOCOL_VERSION}"
-            )),
-            other => Err(unexpected(&other)),
-        }
+/// Explains a problem for the `--status` command, with what to do next.
+fn explain(problem: &Problem) -> String {
+    let installed = whereabouts_client::installed_service();
+    let hint = match problem.kind {
+        ProblemKind::NotRunning => Some(String::from(
+            "Install it with --install, or run --console (as administrator).",
+        )),
+        ProblemKind::Untrusted | ProblemKind::Refused => installed.map(|exe| {
+            format!(
+                "To ask the installed service, run \"{}\" --status",
+                exe.display()
+            )
+        }),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => format!("{} {hint}", problem.message),
+        None => problem.message.clone(),
     }
+}
 
-    fn ask(&mut self, request: &Request) -> Result<Response, String> {
-        whereabouts_ipc::write_message(&mut self.0, request)
-            .and_then(|()| whereabouts_ipc::read_message(&mut self.0))
-            .map_err(|e| format!("lost the connection to Whereabouts ({e})"))
-    }
+fn ask(client: &mut Client, request: &Request) -> Result<Response, String> {
+    client.ask(request).map_err(|problem| explain(&problem))
 }
 
 fn unexpected(response: &Response) -> String {
-    match response {
-        Response::Error { message } => format!("Whereabouts answered: {}", display_safe(message)),
-        _ => String::from("Whereabouts sent an unexpected answer"),
-    }
+    display_safe(&whereabouts_client::unexpected(response).message)
 }
 
 fn show_status(name: &str) -> Result<(), String> {
-    let (mut client, version) = Client::connect(name)?;
-    let status = match client.ask(&Request::Status {})? {
+    let mut client = Client::connect(name).map_err(|problem| explain(&problem))?;
+    let version = client.version().to_owned();
+    let status = match ask(&mut client, &Request::Status {})? {
         Response::Status(status) => status,
         other => return Err(unexpected(&other)),
     };
     print_status(&display_safe(&version), &status);
 
-    match client.ask(&Request::LiveFlows { limit: SHOW_FLOWS })? {
+    match ask(&mut client, &Request::LiveFlows { limit: SHOW_FLOWS })? {
         Response::LiveFlows { flows } => print_flows(&flows),
         other => return Err(unexpected(&other)),
     }
 
-    match client.ask(&Request::History {
-        hours: 24,
-        limit: SHOW_APPS,
-    })? {
+    match ask(
+        &mut client,
+        &Request::History {
+            hours: 24,
+            limit: SHOW_APPS,
+        },
+    )? {
         Response::History { apps } if apps.is_empty() => {
             println!("\nNothing saved in the last 24 hours.");
         }
@@ -169,7 +120,9 @@ fn print_status(version: &str, status: &Status) {
     );
     println!(
         "Kernel events protected from faking: {}",
-        yes_no(status.kernel_events_protected)
+        yes_no(whereabouts_client::kernel_events_protected(
+            status.kernel_events_protected
+        ))
     );
     if status.rejected > 0 {
         println!(
@@ -298,8 +251,8 @@ mod tests {
         let name = format!(r"\\.\pipe\whereabouts-client-test-{}", std::process::id());
         let state = Arc::new(Mutex::new(crate::server::LiveState::default()));
         crate::server::start(&name, None, state).unwrap();
-        let (mut client, version) = Client::connect(&name).unwrap();
-        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        let mut client = Client::connect(&name).unwrap();
+        assert_eq!(client.version(), env!("CARGO_PKG_VERSION"));
         assert!(matches!(
             client.ask(&Request::Status {}).unwrap(),
             Response::Status(_)

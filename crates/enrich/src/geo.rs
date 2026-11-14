@@ -116,15 +116,14 @@ impl GeoDatabases {
                 .and_then(|record| record.country.iso_code.map(str::to_owned))
                 .filter(|code| code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()));
         }
-        if let Some(reader) = &self.asn {
-            if let Some(record) = reader
+        if let Some(reader) = &self.asn
+            && let Some(record) = reader
                 .lookup(ip)
                 .ok()
                 .and_then(|found| found.decode::<Asn>().ok().flatten())
-            {
-                info.asn = record.autonomous_system_number;
-                info.network = record.autonomous_system_organization.map(clean_name);
-            }
+        {
+            info.asn = record.autonomous_system_number;
+            info.network = record.autonomous_system_organization.map(clean_name);
         }
         info
     }

@@ -23,13 +23,23 @@ A pull request that breaks any of these will not be merged, however useful the f
 1. Install [Rust](https://rustup.rs) (stable, MSVC toolchain).
 2. Install Visual Studio Build Tools with the **Desktop development with C++** workload.
 3. Install [Strawberry Perl](https://strawberryperl.com) (`winget install StrawberryPerl.StrawberryPerl`). The encrypted database (SQLCipher) needs OpenSSL, which is built from source and needs a native Windows Perl. If you build from **Git Bash**, its own Perl comes first on `PATH` and cannot build OpenSSL; set `OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe`. Keep the project in a short path (e.g. `D:\Projects\Whereabouts`): OpenSSL's deepest source files can exceed Windows' 260-character path limit in long paths.
-4. Clone and build:
+4. Install [Node.js](https://nodejs.org) LTS (24 or newer) for the desktop app's web UI.
+5. Clone and build. The desktop app embeds the built UI, so build the UI first:
 
    ```powershell
    git clone https://github.com/Razni-Ahamed/Whereabouts.git
    cd Whereabouts
+   cd ui; npm ci; npm run build; cd ..
    cargo build --workspace
    ```
+
+### Working on the desktop app
+
+The app is in `ui/`: a Svelte 5 + TypeScript web UI in `ui/src`, and the Tauri (Rust) side in `ui/src-tauri`.
+
+- **Design work in a browser:** `npm run dev` in `ui/` serves the UI at http://127.0.0.1:5173 with **made-up demo data** (marked "Demo data" in the top bar). This needs no service and no administrator rights.
+- **The real app:** `npm run tauri build -- --no-bundle` in `ui/` builds `target\release\whereabouts.exe`. It shows real data only from the **installed** service, which answers only programs installed next to it: build the service in release too (`cargo build --release -p whereabouts-service`), then run `target\release\whereabouts-service.exe --install` as administrator, which copies both programs to `%ProgramFiles%\Whereabouts`.
+- **Rules:** the UI loads nothing from the network: fonts, icons and the background are bundled or drawn in code. The content security policy in `tauri.conf.json` enforces it. The web view may call only the commands listed in `ui/src-tauri/build.rs`.
 
 ## Checks to run before opening a pull request
 
@@ -39,6 +49,7 @@ CI runs the same checks, so running them locally saves time:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cd ui; npm run check; cd ..
 ```
 
 ## Live tests

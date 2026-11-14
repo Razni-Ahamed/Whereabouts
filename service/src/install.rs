@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use whereabouts_client::{APP_PROGRAM, SERVICE_PROGRAM};
 use whereabouts_win_capture::identity::same_file;
 use whereabouts_win_pipe::current_user_sid;
-use whereabouts_win_secrets::{KnownFolder, known_folder};
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
     ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
@@ -21,9 +21,6 @@ use windows_service::service::{
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::service_mode::{SERVICE_NAME, describe};
-
-/// The installed program's file name.
-const PROGRAM: &str = "whereabouts-service.exe";
 
 /// Offline data files copied with the program (see `data/README.md`).
 const DATA_EXTENSIONS: [&str; 4] = ["mmdb", "tsv", "txt", "md"];
@@ -36,15 +33,8 @@ const DESCRIPTION: &str = "Shows which app connects where, without reading what 
 
 /// The installation folder, `%ProgramFiles%\Whereabouts`.
 fn install_dir() -> Result<PathBuf, String> {
-    known_folder(KnownFolder::ProgramFiles)
-        .map(|dir| dir.join("Whereabouts"))
+    whereabouts_client::install_dir()
         .map_err(|e| format!("could not find the Program Files folder ({e})"))
-}
-
-/// The installed program, if Whereabouts is installed.
-pub fn installed_exe() -> Option<PathBuf> {
-    let exe = install_dir().ok()?.join(PROGRAM);
-    exe.is_file().then_some(exe)
 }
 
 /// `--install`.
@@ -100,11 +90,15 @@ fn try_install() -> Result<(), String> {
     let folder = install_dir()?;
     std::fs::create_dir_all(&folder)
         .map_err(|e| format!("could not create {} ({e})", folder.display()))?;
-    let exe = folder.join(PROGRAM);
+    let exe = folder.join(SERVICE_PROGRAM);
     let source = std::env::current_exe().map_err(|e| e.to_string())?;
-    if !same_file(&source, &exe) {
-        std::fs::copy(&source, &exe)
-            .map_err(|e| format!("could not copy the program to {} ({e})", exe.display()))?;
+    copy_program(&source, &exe)?;
+    // The desktop app, when it was built next to this program.
+    let app_source = source.with_file_name(APP_PROGRAM);
+    let app = folder.join(APP_PROGRAM);
+    let has_app = app_source.is_file();
+    if has_app {
+        copy_program(&app_source, &app)?;
     }
     let data_files = copy_data(&crate::console::data_dir(), &folder.join("data"))?;
 
@@ -164,6 +158,14 @@ fn try_install() -> Result<(), String> {
 
     println!("Whereabouts is installed and running as a Windows service.");
     println!("  Program:   {}", exe.display());
+    if has_app {
+        println!("  App:       {}", app.display());
+    } else {
+        println!(
+            "  App:       not installed ({APP_PROGRAM} was not found next to this program; \
+             build it with `npm run tauri build` in ui/)"
+        );
+    }
     println!("  Data:      {data_files} offline data files");
     println!(
         "  History:   {} (encrypted)",
@@ -173,6 +175,20 @@ fn try_install() -> Result<(), String> {
     println!("Check on it with:  \"{}\" --status", exe.display());
     println!("Remove it with:    \"{}\" --uninstall", exe.display());
     Ok(())
+}
+
+/// Copies a program file, unless `from` already is `to`.
+fn copy_program(from: &Path, to: &Path) -> Result<(), String> {
+    if same_file(from, to) {
+        return Ok(());
+    }
+    std::fs::copy(from, to).map(|_| ()).map_err(|e| {
+        format!(
+            "could not copy {} to {} ({e})",
+            from.display(),
+            to.display()
+        )
+    })
 }
 
 /// Copies the offline data files from `from` to `to`. Returns how many.
@@ -306,7 +322,7 @@ fn remove_program_folder(folder: &Path) {
     }
     let running = std::env::current_exe().ok();
     let is_running_copy = |path: &Path| running.as_deref().is_some_and(|exe| same_file(exe, path));
-    if !is_running_copy(&folder.join(PROGRAM)) {
+    if !is_running_copy(&folder.join(SERVICE_PROGRAM)) {
         // The service may hold its file for a moment after stopping.
         for _ in 0..20 {
             if std::fs::remove_dir_all(folder).is_ok() || !folder.exists() {
@@ -319,6 +335,7 @@ fn remove_program_folder(folder: &Path) {
         return;
     }
     let _ = std::fs::remove_dir_all(folder.join("data"));
+    let _ = std::fs::remove_file(folder.join(APP_PROGRAM));
     println!(
         "Removed the program's data files. This program cannot delete itself while running: \
          delete the folder {} to finish.",

@@ -268,6 +268,19 @@ Implemented in M5a (`win-pipe` and `ipc` crates); `--console` serves the pipe an
 - Screens: **Overview** (top apps, top companies, map of countries), **App detail** (domains, timeline, upload/download), **Alerts** (with reasons and actions), **Rules**, **Settings**, and **Privacy** (what is stored, retention, export, delete, list of the app's own outbound requests).
 - The UI loads **no remote content**: no web fonts, no CDNs, no remote images.
 
+Implementation notes (M6, 2026-11-14):
+
+| Decision | Reason |
+|---|---|
+| **Svelte 5** + TypeScript, built with Vite (decision D8) | Compiles to small plain JavaScript with almost no runtime: few npm packages to trust. TypeScript stays on version 6 (code intelligence needs `tsserver.js`). |
+| Look: a **night chart**: deep ink navy, frosted glass, a signal-teal accent for what is normal and amber only for what deserves a look; Space Grotesk (display) and Inter (text) | Suits what Whereabouts is (a map of where data goes) and stays calm and professional. The background (coordinate grid, topographic contours, routes from this PC to destinations) is drawn in SVG, decorative only, with nothing to license or download. Fonts (OFL) and Lucide icons (ISC) are bundled. Motion stops when the system asks for reduced motion. |
+| Strict content security policy: scripts and fonts from the app only; no network except Tauri's own IPC | Enforces "no remote content". Inline styles are allowed (Svelte sets style attributes); inline scripts are not. |
+| The web view can call exactly two read-only commands, `live` and `history` (`AppManifest::commands`), and has no other Tauri permissions | Tauri v2 would otherwise allow every registered command. No file system, shell or network plugins. |
+| The app's Rust side holds one pipe connection, checked with the shared `whereabouts-client` crate before anything is sent, and reopens it after a restart of the service | Same checks as `--status`: the server must be the installed service (Service Control Manager process ID) or the same program. |
+| The service accepts the app because it runs from the **installation folder** next to the service (compared by folder ID; only administrators can write there) | The app is a different program file from the service, so "same file" alone would refuse it. Development builds elsewhere are refused; the UI shows **demo data** only in an ordinary browser, clearly marked. |
+| The Privacy screen counts Whereabouts' own internet connections from the live data | "Whereabouts makes no requests" is shown as a measurement, not a claim. |
+| Export and delete-all in the app come next | They need write commands over the pipe (designed separately, with the CSV streamed to the app rather than written by the SYSTEM service). Until then the screen shows the commands. |
+
 ---
 
 ## 6. Detection and learning
@@ -399,7 +412,7 @@ This is the complete list. Anything not on it is a bug.
 | Malware hiding inside a trusted process | Attributed to the host process | Stated limitation (§5.3) |
 | Malware swapping a signed app's file to borrow its publisher | Each process is checked through one locked handle; results are tied to content hash and process instance, not path. The file checked is the process's image per the **kernel's own record** (`QueryFullProcessImageName`, which follows renames and which the process cannot edit, unlike its module list in memory), locked at the process's first network activity and re-confirmed with the kernel after locking | If the running file cannot be confirmed (the process already exited, or cannot be queried), the file at its start path is checked and the publisher is marked `?` (unconfirmed) |
 | Malware faking DNS events to disguise its destinations | Labels verified against the DNS service's own events; forged service events rejected by process ID | A label the app reports for itself stays *unverified* (`?`) and is shown as such |
-| Malware writing fake *kernel* network/process events under the kernel providers' IDs | Windows refuses user-mode registration of these provider IDs (`EventRegister` → access denied, even as administrator; verified on Windows 11 2026-11-12 and checked on every CI run). Whereabouts re-checks at start-up and warns if a Windows version allows it. | Kernel-mode malware (a driver) can do anything; out of scope like other administrator-level malware |
+| Malware writing fake *kernel* network/process events under the kernel providers' IDs | Windows refuses user-mode registration of these provider IDs (`EventRegister` → access denied, even as administrator; verified on Windows 11 2026-11-12 and checked on every CI run). Whereabouts re-checks at start-up and warns if a Windows version allows it. **SYSTEM is allowed** to register them (seen with the installed service, 2026-11-14), so the service's own check can be a false alarm; the app and `--status` repeat the check from the user's ordinary account, which is the vantage point that matters. | Kernel-mode malware (a driver) can do anything; out of scope like other administrator-level malware |
 | Malware flooding the flow table to hide traffic | Per-process flow limits; excess traffic goes to a per-process overflow flow, so bytes stay visible and attributed | With thousands of processes flooding at once, the overflow limit is exhausted and further traffic lands in one shared flow without per-process attribution. This is counted and reported as a possible evasion attempt. |
 | Tampered list update | Signature check with built-in key | Key compromise → rotate key in an app update |
 | Supply-chain attack on dependencies | `Cargo.lock` committed, `cargo-audit` + `cargo-deny` in CI, minimal dependencies, review of new crates | – |

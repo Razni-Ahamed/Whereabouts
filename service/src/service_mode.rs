@@ -17,8 +17,7 @@ use windows_service::service_control_handler::{
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-/// The service's name in Windows.
-pub const SERVICE_NAME: &str = "Whereabouts";
+pub use whereabouts_client::SERVICE_NAME;
 
 /// The account allowed to use the pipe, from the service's command line.
 static CLIENT_USER: OnceLock<String> = OnceLock::new();
@@ -53,23 +52,6 @@ pub fn describe(error: &windows_service::Error) -> String {
         windows_service::Error::Winapi(io) => io.to_string(),
         other => other.to_string(),
     }
-}
-
-/// Process ID of the running Whereabouts service, as the Service Control
-/// Manager reports it. Any user may ask; only administrators can register
-/// a service under this name.
-pub fn process_id() -> Option<u32> {
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
-    let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
-        .ok()?;
-    let status = service.query_status().ok()?;
-    let running = matches!(
-        status.current_state,
-        ServiceState::Running | ServiceState::StopPending
-    );
-    status.process_id.filter(|&pid| running && pid != 0)
 }
 
 /// Whether the Whereabouts service is installed and not stopped.

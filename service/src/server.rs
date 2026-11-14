@@ -5,8 +5,10 @@
 //! - The pipe's permissions allow only SYSTEM, Administrators and the
 //!   account running Whereabouts, from this computer only.
 //! - The program on the other end must be Whereabouts itself: the file it
-//!   runs must be the same file as ours (compared by file ID, not by name).
-//!   Other programs are disconnected before anything is read from them.
+//!   runs must be the same file as ours, or another program installed next
+//!   to ours in the protected installation folder (the desktop app); see
+//!   [`peer::is_trusted_client`]. Other programs are disconnected before
+//!   anything is read from them.
 //!
 //! Clients can only send the typed requests of `whereabouts-ipc`, and every
 //! request's limits are clamped before it is answered.
@@ -15,12 +17,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use whereabouts_client::peer;
 use whereabouts_ipc::{
     AppTotals, FlowView, PROTOCOL_VERSION, Request, Response, Status, read_message, write_message,
 };
 use whereabouts_store::Store;
-use whereabouts_win_capture::identity::{is_same_file, lock_image_of};
-use whereabouts_win_capture::process::ProcessHandle;
 use whereabouts_win_pipe::{PipeConnection, PipeListener, current_user_sid};
 
 /// Most clients served at the same time.
@@ -60,43 +61,6 @@ pub fn start(name: &str, client_sid: Option<&str>, state: SharedState) -> Result
     Ok(())
 }
 
-/// Whether process `pid`, which connected at or before `connected_by`,
-/// runs the same program file as this process.
-///
-/// The process is opened first and checked only through that handle, so
-/// its ID cannot be handed to another process during the check. A process
-/// that started after `connected_by` has a reused ID: it is not the one that
-/// connected. Its running file is locked and confirmed with the kernel, as
-/// for app identity, then compared with our own file by file ID.
-pub fn is_whereabouts(pid: u32, connected_by: SystemTime) -> bool {
-    let Some(process) = ProcessHandle::open(pid) else {
-        return false;
-    };
-    if process
-        .start_time()
-        .is_none_or(|started| started > connected_by)
-    {
-        return false;
-    }
-    let Some((_, file)) = lock_image_of(&process) else {
-        return false;
-    };
-    let Ok(own) = std::env::current_exe() else {
-        return false;
-    };
-    is_same_file(&file, &own)
-}
-
-/// Whether a client can trust the pipe server `pid`: it is the installed
-/// Whereabouts service (its process ID per the Service Control Manager), or
-/// it runs the same program file as this process (console mode).
-///
-/// The first check is needed because a normal user cannot open a SYSTEM
-/// service's process to look at its file.
-pub fn is_trusted_server(pid: u32, connected_by: SystemTime) -> bool {
-    crate::service_mode::process_id() == Some(pid) || is_whereabouts(pid, connected_by)
-}
-
 /// Counts a client while it is being served, even if serving panics.
 struct Slot(Arc<AtomicUsize>);
 
@@ -118,7 +82,7 @@ fn accept_loop(mut listener: PipeListener, state: &SharedState) {
             }
         };
         // Dropping the connection disconnects the client.
-        if !is_whereabouts(connection.peer_pid(), connection.connected_by()) {
+        if !peer::is_trusted_client(connection.peer_pid(), connection.connected_by()) {
             continue;
         }
         // Only this thread adds clients, so the check cannot be raced past.
@@ -283,34 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn this_process_is_recognised_and_others_are_not() {
-        let now = SystemTime::now();
-        assert!(is_whereabouts(std::process::id(), now));
-        assert!(!is_whereabouts(0, now));
-        assert!(!is_whereabouts(4, now));
-    }
-
-    #[test]
-    fn a_process_that_started_after_the_connection_is_rejected() {
-        // As if the connecting process had exited and its ID been reused by
-        // this process: the connection predates our start.
-        let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-        assert!(!is_whereabouts(std::process::id(), long_ago));
-    }
-
-    #[test]
-    fn another_program_is_rejected() {
-        let mut child = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
-            .args(["/c", "ping -n 3 127.0.0.1 > nul"])
-            .spawn()
-            .unwrap();
-        let rejected = !is_whereabouts(child.id(), SystemTime::now());
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(rejected);
-    }
-
-    #[test]
     fn answers_are_limited_to_what_was_asked() {
         let state = shared(3);
         let mut store = None;
@@ -335,7 +271,10 @@ mod tests {
         let name = unique_name();
         start(&name, None, shared(3)).unwrap();
         let mut client = whereabouts_win_pipe::connect(&name).unwrap();
-        assert!(is_whereabouts(client.peer_pid(), client.connected_by()));
+        assert!(peer::runs_same_file(
+            client.peer_pid(),
+            client.connected_by()
+        ));
         let greeting = ask(
             &mut client,
             &Request::Hello {

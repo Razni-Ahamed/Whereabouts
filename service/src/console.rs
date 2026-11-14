@@ -79,16 +79,16 @@ const MAX_UNSAVED_EVICTED: usize = 10_000;
 
 impl Closed {
     fn push(&mut self, row: Row) {
-        if self.rows.len() >= MAX_CLOSED {
-            if let Some(old) = self.rows.pop_front() {
-                if !old.saved && self.keep_evicted {
-                    if self.unsaved_evicted.len() >= MAX_UNSAVED_EVICTED {
-                        self.unsaved_evicted.pop_front();
-                        self.lost += 1;
-                    }
-                    self.unsaved_evicted.push_back(old);
-                }
+        if self.rows.len() >= MAX_CLOSED
+            && let Some(old) = self.rows.pop_front()
+            && !old.saved
+            && self.keep_evicted
+        {
+            if self.unsaved_evicted.len() >= MAX_UNSAVED_EVICTED {
+                self.unsaved_evicted.pop_front();
+                self.lost += 1;
             }
+            self.unsaved_evicted.push_back(old);
         }
         self.rows.push_back(row);
     }
@@ -961,12 +961,12 @@ pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WHEREABOUTS_DATA") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("data"));
-            // target\debug\whereabouts-service.exe -> project\data
-            candidates.push(dir.join("..").join("..").join("data"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("data"));
+        // target\debug\whereabouts-service.exe -> project\data
+        candidates.push(dir.join("..").join("..").join("data"));
     }
     candidates.push(PathBuf::from("data"));
     candidates

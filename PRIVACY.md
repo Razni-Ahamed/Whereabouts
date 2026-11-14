@@ -38,7 +38,8 @@ Almost all of this is encrypted anyway. Whereabouts never decrypts traffic and n
 - You can **export** your data or **delete everything** at any time (today with `--export` and `--delete-all --yes`, or `--uninstall --delete-data`; later from the app).
 - The background service keeps a small **log of its own health** (`service.log`, at most about 1 MB, in the same protected folder). It never contains what was captured: no app names, domains or addresses. An export is a plain CSV file, so keep it private.
 - For **web browsers**, only the main domain of each site is saved (e.g. `example.com`, not `mail.example.com`).
-- The Whereabouts app reads your data from the background service over a **local channel** (a named pipe) that cannot be reached from the network and that only administrators, the system and the account running Whereabouts can open. The service also checks that the program connecting is Whereabouts itself.
+- The Whereabouts app reads your data from the background service over a **local channel** (a named pipe) that cannot be reached from the network and that only administrators, the system and the account running Whereabouts can open. The service also checks that the program connecting is Whereabouts itself (installed in its protected folder).
+- The **desktop app** loads nothing from the internet: its fonts, icons and background are part of the app, and its security policy blocks any other network access. Its Privacy screen counts Whereabouts' own internet connections, as seen by Whereabouts itself.
 
 We recommend turning on **BitLocker** so that someone who steals your computer's disk cannot read it.
 

@@ -63,10 +63,10 @@ impl TrackerList {
                 if let Some(domain) = parse_rule(rule, false) {
                     list.exceptions.insert(domain);
                 }
-            } else if let Some(rule) = line.strip_prefix("||") {
-                if let Some(domain) = parse_rule(rule, true) {
-                    list.domains.insert(domain);
-                }
+            } else if let Some(rule) = line.strip_prefix("||")
+                && let Some(domain) = parse_rule(rule, true)
+            {
+                list.domains.insert(domain);
             }
         }
         list
