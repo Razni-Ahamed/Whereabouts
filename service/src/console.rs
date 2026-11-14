@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
-use whereabouts_win_capture::identity::DevicePaths;
+use whereabouts_win_capture::identity::{DevicePaths, open_locked};
 use whereabouts_win_capture::resolver::IdentityResolver;
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
 
@@ -214,8 +214,19 @@ impl ProcessNames {
         if info.requested {
             return;
         }
+        // Check the file the process is actually running, which may differ
+        // from its start path if it renamed itself, and lock it now, while
+        // the process is alive, so it cannot be swapped before the check.
+        if let Some(running) =
+            process::running_image_device_path(pid).and_then(|device| self.devices.to_dos(&device))
+        {
+            info.path = Some(running);
+        }
         info.requested = match info.path.as_deref() {
-            Some(path) => self.resolver.request(info.token, path, Some(pid)),
+            Some(path) => {
+                let file = open_locked(std::path::Path::new(path)).ok();
+                self.resolver.request(info.token, path, file, Some(pid))
+            }
             None => true,
         };
     }
