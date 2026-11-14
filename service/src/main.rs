@@ -35,7 +35,13 @@ Options:
   --install            Install and start Whereabouts as a Windows service that
                        runs at boot (as administrator)
   --uninstall          Stop and remove the service; saved data is kept
-  --delete-data        With --uninstall, also delete all saved data
+  --delete-data        With --uninstall or --unregister, also delete all
+                       saved data
+  --register           Register and start the service for this program where
+                       it is (in %ProgramFiles%\\Whereabouts; used by the
+                       installer)
+  --unregister         Stop and remove the service but keep the program
+                       files (used by the installer)
   --version            Print the version
   --help               Print this help
 
@@ -51,6 +57,8 @@ enum Command {
     DeleteAll { confirmed: bool },
     Install,
     Uninstall { delete_data: bool },
+    Register,
+    Unregister { delete_data: bool },
     Service { client_user: String },
     Version,
     Help,
@@ -66,6 +74,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut yes = false;
     let mut install = false;
     let mut uninstall = false;
+    let mut register = false;
+    let mut unregister = false;
     let mut delete_data = false;
     let mut service = false;
     let mut client_user = None;
@@ -90,6 +100,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--yes" => yes = true,
             "--install" => install = true,
             "--uninstall" => uninstall = true,
+            "--register" => register = true,
+            "--unregister" => unregister = true,
             "--delete-data" => delete_data = true,
             "--service" => service = true,
             "--client-user" => {
@@ -114,6 +126,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         delete_all,
         install,
         uninstall,
+        register,
+        unregister,
         service,
     ]
     .iter()
@@ -122,7 +136,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     if chosen > 1 {
         return Err(String::from(
             "choose only one of --console, --status, --history, --export, --delete-all, \
-             --install, --uninstall",
+             --install, --uninstall, --register, --unregister",
         ));
     }
     if seconds.is_some() && !console {
@@ -131,8 +145,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     if yes && !delete_all {
         return Err(String::from("--yes only works with --delete-all"));
     }
-    if delete_data && !uninstall {
-        return Err(String::from("--delete-data only works with --uninstall"));
+    if delete_data && !uninstall && !unregister {
+        return Err(String::from(
+            "--delete-data only works with --uninstall or --unregister",
+        ));
     }
     if client_user.is_some() != service {
         return Err(String::from("--service and --client-user go together"));
@@ -151,6 +167,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         Command::Install
     } else if uninstall {
         Command::Uninstall { delete_data }
+    } else if register {
+        Command::Register
+    } else if unregister {
+        Command::Unregister { delete_data }
     } else if let Some(client_user) = client_user {
         Command::Service { client_user }
     } else {
@@ -168,6 +188,8 @@ fn main() -> ExitCode {
         Ok(Command::DeleteAll { confirmed }) => storage::delete_all(confirmed),
         Ok(Command::Install) => install::install(),
         Ok(Command::Uninstall { delete_data }) => install::uninstall(delete_data),
+        Ok(Command::Register) => install::register(),
+        Ok(Command::Unregister { delete_data }) => install::unregister(delete_data),
         Ok(Command::Service { client_user }) => service_mode::run(client_user),
         Ok(Command::Version) => {
             println!(
@@ -257,6 +279,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_installer_commands() {
+        assert_eq!(parse_args(&args(&["--register"])), Ok(Command::Register));
+        assert_eq!(
+            parse_args(&args(&["--unregister"])),
+            Ok(Command::Unregister { delete_data: false })
+        );
+        assert_eq!(
+            parse_args(&args(&["--unregister", "--delete-data"])),
+            Ok(Command::Unregister { delete_data: true })
+        );
+    }
+
+    #[test]
     fn rejects_bad_service_input() {
         assert!(parse_args(&args(&["--service"])).is_err());
         assert!(parse_args(&args(&["--client-user", "S-1-5-18"])).is_err());
@@ -264,6 +299,8 @@ mod tests {
         assert!(parse_args(&args(&["--service", "--client-user", "S-1)(A;;GA;;;WD"])).is_err());
         assert!(parse_args(&args(&["--delete-data"])).is_err());
         assert!(parse_args(&args(&["--install", "--uninstall"])).is_err());
+        assert!(parse_args(&args(&["--register", "--delete-data"])).is_err());
+        assert!(parse_args(&args(&["--register", "--unregister"])).is_err());
     }
 
     #[test]

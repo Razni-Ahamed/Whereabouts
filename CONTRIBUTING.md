@@ -41,6 +41,16 @@ The app is in `ui/`: a Svelte 5 + TypeScript web UI in `ui/src`, and the Tauri (
 - **The real app:** `npm run tauri build -- --no-bundle` in `ui/` builds `target\release\whereabouts.exe`. It shows real data only from the **installed** service, which answers only programs installed next to it: build the service in release too (`cargo build --release -p whereabouts-service`), then run `target\release\whereabouts-service.exe --install` as administrator, which copies both programs to `%ProgramFiles%\Whereabouts`.
 - **Rules:** the UI loads nothing from the network: fonts, icons and the background are bundled or drawn in code. The content security policy in `tauri.conf.json` enforces it. The web view may call only the commands listed in `ui/src-tauri/build.rs`.
 
+### Building the installer
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+```
+
+This downloads the offline data if it is missing, builds the service and the app in release mode, and builds the NSIS installer with the settings in `ui/src-tauri/tauri.installer.json` (kept apart from `tauri.conf.json` so ordinary builds do not need the data files). The installer and `SHA256SUMS.txt` end up in `target\dist`. The installer's own steps (refusing other install folders, registering and removing the service, asking about saved history) are in `ui/src-tauri/installer-hooks.nsh`.
+
+The **Release** workflow builds the installer on a fresh GitHub Windows machine, installs it silently, checks the service, uninstalls it and checks it is gone, for every pull request that touches the installer. Pushing a `v*` tag also creates a **draft** GitHub release with the installer and checksums, using the notes in `docs/releases/<tag>.md`; a maintainer reviews and publishes it.
+
 ## Checks to run before opening a pull request
 
 CI runs the same checks, so running them locally saves time:

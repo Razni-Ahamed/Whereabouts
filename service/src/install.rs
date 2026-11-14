@@ -1,9 +1,15 @@
-//! `--install` and `--uninstall`: set Whereabouts up as a Windows service.
+//! Setting Whereabouts up as a Windows service.
 //!
-//! The program is copied to `%ProgramFiles%\Whereabouts`, which only
-//! administrators can change, so the SYSTEM service never runs a file that
-//! a normal user could replace. The user who installs it becomes the
-//! account allowed to use the service's pipe.
+//! - `--install` / `--uninstall`: copy the programs to
+//!   `%ProgramFiles%\Whereabouts` and register the service (for builds from
+//!   source).
+//! - `--register` / `--unregister`: register or remove the service for the
+//!   program where it already is, which must be that folder (used by the
+//!   installer, which copies the files itself).
+//!
+//! Only administrators can change that folder, so the SYSTEM service never
+//! runs a file that a normal user could replace. The user who installs it
+//! becomes the account allowed to use the service's pipe.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -11,7 +17,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use whereabouts_client::{APP_PROGRAM, SERVICE_PROGRAM};
-use whereabouts_win_capture::identity::same_file;
+use whereabouts_win_capture::identity::{same_file, same_folder};
 use whereabouts_win_pipe::current_user_sid;
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
@@ -48,6 +54,31 @@ pub fn install() -> ExitCode {
     }
 }
 
+/// `--register`: registers and starts the service for this program, which
+/// must already be in the installation folder.
+pub fn register() -> ExitCode {
+    match try_register() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `--unregister`: stops and removes the service, leaving the program files
+/// (the installer removes those), optionally deleting all saved data too.
+pub fn unregister(delete_data: bool) -> ExitCode {
+    let result = remove_service().and_then(|()| finish_data(delete_data));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `--uninstall`, optionally deleting all saved data too.
 pub fn uninstall(delete_data: bool) -> ExitCode {
     match try_uninstall(delete_data) {
@@ -59,7 +90,9 @@ pub fn uninstall(delete_data: bool) -> ExitCode {
     }
 }
 
-fn try_install() -> Result<(), String> {
+/// Opens the Service Control Manager for creating a service, and checks
+/// Whereabouts is not registered yet.
+fn manager_for_create() -> Result<ServiceManager, String> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -79,36 +112,49 @@ fn try_install() -> Result<(), String> {
              data is kept), then --install.",
         ));
     }
-    let client_sid =
-        current_user_sid().map_err(|e| format!("could not read the current account ({e})"))?;
-
     // Prepare the saved data as this account, which may have created the
     // key of an older version: it is moved to machine scope now, so the
     // service (SYSTEM) can read it.
     drop(crate::storage::open()?);
+    Ok(manager)
+}
 
+fn try_register() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let folder = install_dir()?;
-    std::fs::create_dir_all(&folder)
-        .map_err(|e| format!("could not create {} ({e})", folder.display()))?;
-    let exe = folder.join(SERVICE_PROGRAM);
-    let source = std::env::current_exe().map_err(|e| e.to_string())?;
-    copy_program(&source, &exe)?;
-    // The desktop app, when it was built next to this program.
-    let app_source = source.with_file_name(APP_PROGRAM);
-    let app = folder.join(APP_PROGRAM);
-    let has_app = app_source.is_file();
-    if has_app {
-        copy_program(&app_source, &app)?;
+    let in_place = exe
+        .parent()
+        .is_some_and(|parent| same_folder(parent, &folder));
+    if !in_place {
+        return Err(format!(
+            "--register only works for the program installed in {} (this one is {}); use \
+             --install instead",
+            folder.display(),
+            exe.display()
+        ));
     }
-    let data_files = copy_data(&crate::console::data_dir(), &folder.join("data"))?;
+    let manager = manager_for_create()?;
+    create_service(&manager, &exe)?;
+    println!(
+        "The Whereabouts service is registered and running ({}).",
+        exe.display()
+    );
+    Ok(())
+}
 
+/// Registers the service for the program `exe` (LocalSystem, automatic
+/// start, restart after failures, the current user as the pipe's client),
+/// starts it and waits until it runs.
+fn create_service(manager: &ServiceManager, exe: &Path) -> Result<(), String> {
+    let client_sid =
+        current_user_sid().map_err(|e| format!("could not read the current account ({e})"))?;
     let info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from("Whereabouts"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: exe.clone(),
+        executable_path: exe.to_path_buf(),
         launch_arguments: vec![
             OsString::from("--service"),
             OsString::from("--client-user"),
@@ -154,7 +200,26 @@ fn try_install() -> Result<(), String> {
     service
         .start::<&OsStr>(&[])
         .map_err(|e| format!("could not start the service ({})", describe(&e)))?;
-    wait_for(&service, ServiceState::Running, Duration::from_secs(30))?;
+    wait_for(&service, ServiceState::Running, Duration::from_secs(30))
+}
+
+fn try_install() -> Result<(), String> {
+    let manager = manager_for_create()?;
+    let folder = install_dir()?;
+    std::fs::create_dir_all(&folder)
+        .map_err(|e| format!("could not create {} ({e})", folder.display()))?;
+    let exe = folder.join(SERVICE_PROGRAM);
+    let source = std::env::current_exe().map_err(|e| e.to_string())?;
+    copy_program(&source, &exe)?;
+    // The desktop app, when it was built next to this program.
+    let app_source = source.with_file_name(APP_PROGRAM);
+    let app = folder.join(APP_PROGRAM);
+    let has_app = app_source.is_file();
+    if has_app {
+        copy_program(&app_source, &app)?;
+    }
+    let data_files = copy_data(&crate::console::data_dir(), &folder.join("data"))?;
+    create_service(&manager, &exe)?;
 
     println!("Whereabouts is installed and running as a Windows service.");
     println!("  Program:   {}", exe.display());
@@ -254,6 +319,14 @@ fn wait_for(service: &Service, state: ServiceState, limit: Duration) -> Result<(
 }
 
 fn try_uninstall(delete_data: bool) -> Result<(), String> {
+    remove_service()?;
+    remove_program_folder(&install_dir()?);
+    finish_data(delete_data)
+}
+
+/// Stops (letting it save its last flows) and removes the service, if it is
+/// registered.
+fn remove_service() -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| {
             format!(
@@ -296,9 +369,11 @@ fn try_uninstall(delete_data: bool) -> Result<(), String> {
             ));
         }
     }
+    Ok(())
+}
 
-    remove_program_folder(&install_dir()?);
-
+/// Deletes all saved data if asked, otherwise says where it is kept.
+fn finish_data(delete_data: bool) -> Result<(), String> {
     let home = crate::storage::home_dir();
     if delete_data {
         crate::storage::delete_folder()?;
