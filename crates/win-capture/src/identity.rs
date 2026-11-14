@@ -54,7 +54,9 @@ use windows::Win32::Security::WinTrust::{
     WTD_STATEACTION_VERIFY, WTD_UI_NONE, WTHelperGetProvSignerFromChain,
     WTHelperProvDataFromStateData, WinVerifyTrust,
 };
-use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, QueryDosDeviceW};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ID_INFO, FILE_SHARE_READ, FileIdInfo, GetFileInformationByHandleEx, QueryDosDeviceW,
+};
 use windows::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::{HSTRING, PCWSTR, PWSTR, w};
@@ -79,14 +81,43 @@ pub fn open_locked(path: &Path) -> io::Result<File> {
 /// follows renames), not from anything the process can edit. Between
 /// asking for the path and opening the file, the program could rename its
 /// file; once the file is locked it cannot be renamed any more, so the
-/// kernel is asked again and the result is used only if the path is the
-/// same. Returns `None` if the process has exited, cannot be queried, or
-/// its file changed in between.
+/// kernel is asked again and the result is used only if:
+///
+/// - the path is **exactly** the same (not just ignoring case: Windows
+///   allows case-sensitive folders, where `App.exe` and `app.exe` are
+///   different files), and
+/// - the file at that path **is** the locked file (same volume and file ID).
+///
+/// Returns `None` if the process has exited, cannot be queried, or its file
+/// changed in between.
 pub fn lock_running_image(pid: u32) -> Option<(String, File)> {
     let path = image_path(pid)?;
     let file = open_locked(Path::new(&path)).ok()?;
     let again = image_path(pid)?;
-    again.eq_ignore_ascii_case(&path).then_some((path, file))
+    if again != path {
+        return None;
+    }
+    let at_path = File::open(Path::new(&again)).ok()?;
+    let same_file = file_id(&file)? == file_id(&at_path)?;
+    same_file.then_some((path, file))
+}
+
+/// Returns the volume serial number and 128-bit file ID of an open file:
+/// what identifies the file itself, whatever its name.
+fn file_id(file: &File) -> Option<(u64, [u8; 16])> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `info` is a writable FILE_ID_INFO and its exact size is
+    // passed; the handle stays open for the call.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            struct_size::<FILE_ID_INFO>(),
+        )
+    }
+    .ok()?;
+    Some((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
 /// Returns the SHA-256 hash of `file`'s whole content, hex-encoded. Reads
@@ -547,6 +578,34 @@ mod tests {
 
         drop(locked);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_ids_identify_files_not_names() {
+        let dir = temp_dir("file-id");
+        let a = dir.join("a.exe");
+        let b = dir.join("b.exe");
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"one").unwrap();
+        let id_a = file_id(&File::open(&a).unwrap()).unwrap();
+        let id_b = file_id(&File::open(&b).unwrap()).unwrap();
+        assert_ne!(id_a, id_b, "same content, different files");
+        // A rename keeps the file's ID.
+        let moved = dir.join("moved.exe");
+        std::fs::rename(&a, &moved).unwrap();
+        assert_eq!(file_id(&File::open(&moved).unwrap()).unwrap(), id_a);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn locks_and_confirms_this_process_image() {
+        let (path, _file) = lock_running_image(std::process::id()).expect("own process");
+        let me = std::env::current_exe().unwrap();
+        assert!(
+            path.eq_ignore_ascii_case(&me.to_string_lossy()),
+            "{path} vs {}",
+            me.display()
+        );
     }
 
     #[test]
