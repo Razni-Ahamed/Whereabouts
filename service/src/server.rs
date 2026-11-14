@@ -11,7 +11,6 @@
 //! Clients can only send the typed requests of `whereabouts-ipc`, and every
 //! request's limits are clamped before it is answered.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -20,8 +19,8 @@ use whereabouts_ipc::{
     AppTotals, FlowView, PROTOCOL_VERSION, Request, Response, Status, read_message, write_message,
 };
 use whereabouts_store::Store;
-use whereabouts_win_capture::identity::same_file;
-use whereabouts_win_capture::process;
+use whereabouts_win_capture::identity::{is_same_file, lock_image_of};
+use whereabouts_win_capture::process::ProcessHandle;
 use whereabouts_win_pipe::{PipeConnection, PipeListener, current_user_sid};
 
 /// Most clients served at the same time.
@@ -55,15 +54,31 @@ pub fn start(name: &str, state: SharedState) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether process `pid` runs the same program file as this process.
-pub fn is_whereabouts(pid: u32) -> bool {
-    let Some(peer) = process::image_path(pid) else {
+/// Whether process `pid`, which connected at or before `connected_by`,
+/// runs the same program file as this process.
+///
+/// The process is opened first and checked only through that handle, so
+/// its ID cannot be handed to another process during the check. A process
+/// that started after `connected_by` has a reused ID: it is not the one that
+/// connected. Its running file is locked and confirmed with the kernel, as
+/// for app identity, then compared with our own file by file ID.
+pub fn is_whereabouts(pid: u32, connected_by: SystemTime) -> bool {
+    let Some(process) = ProcessHandle::open(pid) else {
+        return false;
+    };
+    if process
+        .start_time()
+        .is_none_or(|started| started > connected_by)
+    {
+        return false;
+    }
+    let Some((_, file)) = lock_image_of(&process) else {
         return false;
     };
     let Ok(own) = std::env::current_exe() else {
         return false;
     };
-    same_file(Path::new(&peer), &own)
+    is_same_file(&file, &own)
 }
 
 /// Counts a client while it is being served, even if serving panics.
@@ -87,7 +102,7 @@ fn accept_loop(mut listener: PipeListener, state: &SharedState) {
             }
         };
         // Dropping the connection disconnects the client.
-        if !is_whereabouts(connection.peer_pid()) {
+        if !is_whereabouts(connection.peer_pid(), connection.connected_by()) {
             continue;
         }
         // Only this thread adds clients, so the check cannot be raced past.
@@ -253,9 +268,30 @@ mod tests {
 
     #[test]
     fn this_process_is_recognised_and_others_are_not() {
-        assert!(is_whereabouts(std::process::id()));
-        assert!(!is_whereabouts(0));
-        assert!(!is_whereabouts(4));
+        let now = SystemTime::now();
+        assert!(is_whereabouts(std::process::id(), now));
+        assert!(!is_whereabouts(0, now));
+        assert!(!is_whereabouts(4, now));
+    }
+
+    #[test]
+    fn a_process_that_started_after_the_connection_is_rejected() {
+        // As if the connecting process had exited and its ID been reused by
+        // this process: the connection predates our start.
+        let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        assert!(!is_whereabouts(std::process::id(), long_ago));
+    }
+
+    #[test]
+    fn another_program_is_rejected() {
+        let mut child = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/c", "ping -n 3 127.0.0.1 > nul"])
+            .spawn()
+            .unwrap();
+        let rejected = !is_whereabouts(child.id(), SystemTime::now());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(rejected);
     }
 
     #[test]
@@ -283,7 +319,7 @@ mod tests {
         let name = unique_name();
         start(&name, shared(3)).unwrap();
         let mut client = whereabouts_win_pipe::connect(&name).unwrap();
-        assert!(is_whereabouts(client.peer_pid()));
+        assert!(is_whereabouts(client.peer_pid(), client.connected_by()));
         let greeting = ask(
             &mut client,
             &Request::Hello {

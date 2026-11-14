@@ -36,7 +36,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use whereabouts_core::model::{AppIdentity, Signature};
 
-use crate::process::image_path;
+use crate::process::ProcessHandle;
 use windows::Win32::Foundation::{
     APPMODEL_ERROR_NO_PACKAGE, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND,
     TRUST_E_NOSIGNATURE, TRUST_E_PROVIDER_UNKNOWN, TRUST_E_SUBJECT_FORM_UNKNOWN,
@@ -91,15 +91,32 @@ pub fn open_locked(path: &Path) -> io::Result<File> {
 /// Returns `None` if the process has exited, cannot be queried, or its file
 /// changed in between.
 pub fn lock_running_image(pid: u32) -> Option<(String, File)> {
-    let path = image_path(pid)?;
+    lock_image_of(&ProcessHandle::open(pid)?)
+}
+
+/// Like [`lock_running_image`], for a process already opened (so its ID
+/// cannot be reused in between).
+pub fn lock_image_of(process: &ProcessHandle) -> Option<(String, File)> {
+    let path = process.image_path()?;
     let file = open_locked(Path::new(&path)).ok()?;
-    let again = image_path(pid)?;
+    let again = process.image_path()?;
     if again != path {
         return None;
     }
     let at_path = File::open(Path::new(&again)).ok()?;
     let same_file = file_id(&file)? == file_id(&at_path)?;
     same_file.then_some((path, file))
+}
+
+/// Whether the open `file` is the file at `path`, compared by file ID.
+pub fn is_same_file(file: &File, path: &Path) -> bool {
+    match (
+        file_id(file),
+        File::open(path).ok().as_ref().and_then(file_id),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Whether `a` and `b` are the same file, compared by file ID rather than by
