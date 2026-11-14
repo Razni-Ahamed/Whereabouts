@@ -5,11 +5,9 @@
 
 #![allow(unsafe_code)]
 
-use windows::Win32::Foundation::{CloseHandle, HMODULE};
-use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetMappedFileNameW};
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ, QueryFullProcessImageNameW,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -20,6 +18,11 @@ const SYSTEM_PID: u32 = 4;
 const MAX_PATH_UNITS: usize = 32_768;
 
 /// Returns the full executable path of process `pid`, if it can be read.
+///
+/// This is the kernel's own record of the process's image file, not
+/// anything the process can edit in its memory. It follows the file: if
+/// the program renamed its own file after starting, this returns the new
+/// name (verified on Windows 11 by `tests/running_image.rs`).
 ///
 /// Returns `None` for the idle process (PID 0), for processes that have
 /// already exited, and for protected processes that deny access. PID 4 is
@@ -57,49 +60,6 @@ pub fn image_path(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..len]))
 }
 
-/// Returns the device path (`\Device\HarddiskVolumeN\...`) of the file that
-/// process `pid` is **actually running**, as mapped in its memory.
-///
-/// Unlike [`image_path`], which reports the path the program was started
-/// from, this follows the file itself: if the program renamed its own file
-/// after starting (and perhaps put a different file at the old path), this
-/// returns the new name of the real file. Returns `None` if the process has
-/// exited or cannot be opened (e.g. protected processes).
-pub fn running_image_device_path(pid: u32) -> Option<String> {
-    if pid == 0 || pid == SYSTEM_PID {
-        return None;
-    }
-    // SAFETY: OpenProcess has no memory-safety preconditions.
-    let handle =
-        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
-
-    let mut module = HMODULE::default();
-    let mut needed = 0u32;
-    // SAFETY: `module` has room for exactly one module handle, which is the
-    // size passed; the first module of a process is its main executable.
-    let enumerated = unsafe {
-        EnumProcessModules(
-            handle,
-            &mut module,
-            u32::try_from(std::mem::size_of::<HMODULE>()).unwrap_or(0),
-            &mut needed,
-        )
-    };
-    let path = if enumerated.is_ok() && !module.is_invalid() {
-        let mut buffer = vec![0u16; MAX_PATH_UNITS];
-        // SAFETY: `buffer` is a writable slice; the function writes at most
-        // its length. `module` is an address in the target process.
-        let len = unsafe { GetMappedFileNameW(handle, module.0.cast_const(), &mut buffer) };
-        let len = usize::try_from(len).unwrap_or(0).min(buffer.len());
-        (len > 0).then(|| String::from_utf16_lossy(&buffer[..len]))
-    } else {
-        None
-    };
-    // SAFETY: `handle` came from OpenProcess above and is closed exactly once.
-    let _ = unsafe { CloseHandle(handle) };
-    path
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,22 +78,6 @@ mod tests {
             path.eq_ignore_ascii_case(&expected.to_string_lossy()),
             "{path} vs {}",
             expected.display()
-        );
-    }
-
-    #[test]
-    fn finds_the_file_this_process_is_running() {
-        let device = running_image_device_path(std::process::id()).expect("own process");
-        let exe = std::env::current_exe().unwrap();
-        let name = exe
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_ascii_lowercase();
-        assert!(device.starts_with(r"\Device\"), "{device}");
-        assert!(
-            device.to_ascii_lowercase().ends_with(&name),
-            "{device} vs {name}"
         );
     }
 

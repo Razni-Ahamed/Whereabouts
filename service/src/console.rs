@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
-use whereabouts_win_capture::identity::{DevicePaths, open_locked};
+use whereabouts_win_capture::identity::{DevicePaths, lock_running_image};
 use whereabouts_win_capture::resolver::IdentityResolver;
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
 
@@ -26,6 +26,9 @@ const MAX_CLOSED: usize = 2_000;
 /// it. Windows sends a few bytes (such as TLS close messages) for a process
 /// after it has exited.
 const LATE_TRAFFIC_WINDOW: Duration = Duration::from_secs(10);
+
+/// Width of the PUBLISHER column.
+const PUBLISHER_WIDTH: usize = 22;
 
 /// Most program identities kept for display.
 const MAX_IDENTITIES: usize = 20_000;
@@ -63,6 +66,9 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         "Domains: plain = confirmed by the Windows DNS service · ? = reported only by the app"
     );
     println!("         itself (could be false) · * = guessed from another app's lookup");
+    println!(
+        "Publisher: from the program's code signature · ? = checked by file path only; not          confirmed as the file the process ran (e.g. it had already exited)"
+    );
 
     let started = Instant::now();
     let mut last_draw = Instant::now();
@@ -214,20 +220,23 @@ impl ProcessNames {
         if info.requested {
             return;
         }
-        // Check the file the process is actually running, which may differ
-        // from its start path if it renamed itself, and lock it now, while
-        // the process is alive, so it cannot be swapped before the check.
-        if let Some(running) =
-            process::running_image_device_path(pid).and_then(|device| self.devices.to_dos(&device))
-        {
-            info.path = Some(running);
-        }
-        info.requested = match info.path.as_deref() {
-            Some(path) => {
-                let file = open_locked(std::path::Path::new(path)).ok();
-                self.resolver.request(info.token, path, file, Some(pid))
+        // Check the file the process is actually running, per the kernel's
+        // record (which follows renames), locked while the process is alive
+        // so it cannot be swapped before the check. If that cannot be
+        // confirmed (e.g. the process already exited), the file at its start
+        // path is checked and the result is marked as unconfirmed.
+        info.requested = match lock_running_image(pid) {
+            Some((path, file)) => {
+                let requested = self
+                    .resolver
+                    .request(info.token, &path, Some(file), Some(pid));
+                info.path = Some(path);
+                requested
             }
-            None => true,
+            None => match info.path.as_deref() {
+                Some(path) => self.resolver.request(info.token, path, None, Some(pid)),
+                None => true,
+            },
         };
     }
 
@@ -289,13 +298,22 @@ impl ProcessNames {
     /// Publisher text for a process instance: the signer, `UNSIGNED`,
     /// `INVALID SIGNATURE`, `…` while being checked, or `-` if there is no
     /// program file.
+    ///
+    /// A `?` at the end means the file was checked by path only and could
+    /// not be confirmed as the file the process ran.
     fn publisher(&self, token: Option<u64>) -> String {
-        match token {
-            Some(token) => self
-                .identities
-                .get(&token)
-                .map_or_else(|| String::from("…"), AppIdentity::publisher_text),
-            None => String::from("-"),
+        let Some(token) = token else {
+            return String::from("-");
+        };
+        match self.identities.get(&token) {
+            None => String::from("…"),
+            Some(identity) if identity.confirmed_running => {
+                truncate(&identity.publisher_text(), PUBLISHER_WIDTH)
+            }
+            Some(identity) => format!(
+                "{}?",
+                truncate(&identity.publisher_text(), PUBLISHER_WIDTH - 1)
+            ),
         }
     }
 }
@@ -492,7 +510,7 @@ fn format_row(row: &Row, publisher: &str) -> String {
         "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<40} {:>10} {:>10}",
         row.key.pid,
         truncate(&row.app, 20),
-        truncate(publisher, 22),
+        truncate(publisher, PUBLISHER_WIDTH),
         proto,
         domain,
         remote,

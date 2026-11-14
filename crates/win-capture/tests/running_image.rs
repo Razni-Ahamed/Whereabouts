@@ -7,8 +7,8 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use whereabouts_core::model::Signature;
-use whereabouts_win_capture::identity::{DevicePaths, identify};
-use whereabouts_win_capture::process::running_image_device_path;
+use whereabouts_win_capture::identity::{identify, lock_running_image};
+use whereabouts_win_capture::process::image_path;
 
 const HELPER_ENV: &str = "WHEREABOUTS_SLEEP_HELPER";
 
@@ -56,7 +56,7 @@ fn renamed_running_program_is_checked_by_its_real_file() {
     // Wait until it is running, then rename its file away and put a
     // Microsoft-signed program at the old path.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while running_image_device_path(pid).is_none() && Instant::now() < deadline {
+    while image_path(pid).is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     std::fs::rename(&start_path, &moved_path).expect("a running program's file can be renamed");
@@ -69,16 +69,20 @@ fn renamed_running_program_is_checked_by_its_real_file() {
         "precondition: the old path now holds a signed file: {fooled:?}"
     );
 
-    // ...but the file the process is really running is the moved, unsigned one.
-    let device = running_image_device_path(pid).expect("process is running");
-    let real = DevicePaths::load()
-        .to_dos(&device)
-        .expect("device path maps to a drive letter");
+    // ...but the kernel's record of the running image follows the rename,
+    // so the file locked and checked is the moved, unsigned one.
+    let (real, file) = lock_running_image(pid).expect("process is running");
     assert!(
         real.to_ascii_lowercase().ends_with("moved.exe"),
         "expected the renamed file, got {real}"
     );
+    drop(file);
     assert_eq!(identify(&real, None).signature, Signature::Unsigned);
+
+    // While the running image is locked, it cannot be renamed again.
+    let (_, locked) = lock_running_image(pid).expect("process is running");
+    assert!(std::fs::rename(&moved_path, dir.join("again.exe")).is_err());
+    drop(locked);
 
     drop(child);
     let _ = std::fs::remove_dir_all(dir);

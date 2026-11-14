@@ -59,6 +59,12 @@ pub struct AppIdentity {
     pub size: Option<u64>,
     /// Package family name for MSIX / Microsoft Store apps.
     pub package_family_name: Option<String>,
+    /// `true` if the file checked was confirmed to be the file the process
+    /// was running (by the kernel's record, while the file was locked).
+    /// `false` if it was checked by path only, for example because the
+    /// process had already exited; the result could then be for a different
+    /// file than the one that ran.
+    pub confirmed_running: bool,
 }
 
 impl AppIdentity {

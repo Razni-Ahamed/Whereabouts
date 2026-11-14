@@ -35,6 +35,8 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 use whereabouts_core::model::{AppIdentity, Signature};
+
+use crate::process::image_path;
 use windows::Win32::Foundation::{
     APPMODEL_ERROR_NO_PACKAGE, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND,
     TRUST_E_NOSIGNATURE, TRUST_E_PROVIDER_UNKNOWN, TRUST_E_SUBJECT_FORM_UNKNOWN,
@@ -68,6 +70,23 @@ pub fn open_locked(path: &Path) -> io::Result<File> {
         .read(true)
         .share_mode(FILE_SHARE_READ.0)
         .open(path)
+}
+
+/// Opens and locks the file that process `pid` is running, and confirms it
+/// is still that file. Returns its path and the locked handle.
+///
+/// The path comes from the kernel's record of the process image (which
+/// follows renames), not from anything the process can edit. Between
+/// asking for the path and opening the file, the program could rename its
+/// file; once the file is locked it cannot be renamed any more, so the
+/// kernel is asked again and the result is used only if the path is the
+/// same. Returns `None` if the process has exited, cannot be queried, or
+/// its file changed in between.
+pub fn lock_running_image(pid: u32) -> Option<(String, File)> {
+    let path = image_path(pid)?;
+    let file = open_locked(Path::new(&path)).ok()?;
+    let again = image_path(pid)?;
+    again.eq_ignore_ascii_case(&path).then_some((path, file))
 }
 
 /// Returns the SHA-256 hash of `file`'s whole content, hex-encoded. Reads
@@ -426,7 +445,8 @@ pub fn size_and_hash(file: &File) -> (Option<u64>, Option<String>) {
 
 /// Works out the full identity of the program at `path` (a drive-letter
 /// path), reading the file through one locked handle. `pid` is used for the
-/// Store package name, if the process is still running.
+/// Store package name, if the process is still running. The result is not
+/// confirmed to be a running process's file; see [`lock_running_image`].
 pub fn identify(path: &str, pid: Option<u32>) -> AppIdentity {
     let file_path = Path::new(path);
     let package_family_name = pid.and_then(package_family_name);
@@ -437,6 +457,7 @@ pub fn identify(path: &str, pid: Option<u32>) -> AppIdentity {
             sha256: None,
             size: None,
             package_family_name,
+            confirmed_running: false,
         };
     };
     let (size, sha256) = size_and_hash(&file);
@@ -446,6 +467,7 @@ pub fn identify(path: &str, pid: Option<u32>) -> AppIdentity {
         sha256,
         size,
         package_family_name,
+        confirmed_running: false,
     }
 }
 
