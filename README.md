@@ -70,7 +70,13 @@ The background service and the desktop app are not ready yet, but you can alread
 cargo run -p whereabouts-service -- --console
 ```
 
-Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. It shows each app's connections with the app's publisher (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
+For company and country information, first download the offline databases (once; see [data/README.md](data/README.md)):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\update-data.ps1
+```
+
+Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
 
 ## Building from source
 
