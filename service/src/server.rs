@@ -39,11 +39,17 @@ pub struct LiveState {
 pub type SharedState = Arc<Mutex<LiveState>>;
 
 /// Creates the pipe `name` and starts answering clients in the background.
-/// Fails if the pipe already exists (for example, Whereabouts is already
-/// running, or another program took the name).
-pub fn start(name: &str, state: SharedState) -> Result<(), String> {
-    let sid =
-        current_user_sid().map_err(|e| format!("could not read the current account ({e})"))?;
+/// `client_sid` is the account allowed to connect besides SYSTEM and
+/// Administrators; `None` means the account running this process. Fails if
+/// the pipe already exists (for example, Whereabouts is already running, or
+/// another program took the name).
+pub fn start(name: &str, client_sid: Option<&str>, state: SharedState) -> Result<(), String> {
+    let sid = match client_sid {
+        Some(sid) => sid.to_owned(),
+        None => {
+            current_user_sid().map_err(|e| format!("could not read the current account ({e})"))?
+        }
+    };
     let listener = PipeListener::bind(name, &sid).map_err(|e| {
         format!("could not create the pipe {name} ({e}); is Whereabouts already running?")
     })?;
@@ -81,6 +87,16 @@ pub fn is_whereabouts(pid: u32, connected_by: SystemTime) -> bool {
     is_same_file(&file, &own)
 }
 
+/// Whether a client can trust the pipe server `pid`: it is the installed
+/// Whereabouts service (its process ID per the Service Control Manager), or
+/// it runs the same program file as this process (console mode).
+///
+/// The first check is needed because a normal user cannot open a SYSTEM
+/// service's process to look at its file.
+pub fn is_trusted_server(pid: u32, connected_by: SystemTime) -> bool {
+    crate::service_mode::process_id() == Some(pid) || is_whereabouts(pid, connected_by)
+}
+
 /// Counts a client while it is being served, even if serving panics.
 struct Slot(Arc<AtomicUsize>);
 
@@ -96,7 +112,7 @@ fn accept_loop(mut listener: PipeListener, state: &SharedState) {
         let connection = match listener.accept() {
             Ok(connection) => connection,
             Err(error) => {
-                eprintln!("warning: pipe: {error}");
+                report!("warning: pipe: {error}");
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -317,7 +333,7 @@ mod tests {
     #[test]
     fn serves_requests_over_the_pipe() {
         let name = unique_name();
-        start(&name, shared(3)).unwrap();
+        start(&name, None, shared(3)).unwrap();
         let mut client = whereabouts_win_pipe::connect(&name).unwrap();
         assert!(is_whereabouts(client.peer_pid(), client.connected_by()));
         let greeting = ask(
@@ -343,7 +359,7 @@ mod tests {
     #[test]
     fn a_client_must_say_hello_in_our_protocol_first() {
         let name = unique_name();
-        start(&name, shared(1)).unwrap();
+        start(&name, None, shared(1)).unwrap();
 
         // Skipping Hello: the connection is closed without an answer.
         let mut client = whereabouts_win_pipe::connect(&name).unwrap();
@@ -366,7 +382,7 @@ mod tests {
     fn garbage_closes_the_connection() {
         use std::io::{Read, Write};
         let name = unique_name();
-        start(&name, shared(1)).unwrap();
+        start(&name, None, shared(1)).unwrap();
         let mut client = whereabouts_win_pipe::connect(&name).unwrap();
         client.write_all(&[0xFF; 16]).unwrap();
         let mut buffer = [0u8; 1];

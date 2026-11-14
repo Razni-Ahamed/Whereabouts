@@ -64,7 +64,7 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 
 ## Trying the current build
 
-The background service and the desktop app are not ready yet, but you can already watch live connections per app in a terminal. Open **PowerShell as administrator** in the project folder and run:
+The desktop app is not ready yet, but you can already watch live connections per app in a terminal, or install the background service. Open **PowerShell as administrator** in the project folder and run:
 
 ```powershell
 cargo run -p whereabouts-service -- --console
@@ -84,6 +84,20 @@ cargo run -p whereabouts-service -- --history            # top apps of the last 
 cargo run -p whereabouts-service -- --export flows.csv   # everything saved, as CSV
 cargo run -p whereabouts-service -- --delete-all --yes   # delete all saved data
 ```
+
+To keep Whereabouts running in the background, starting with Windows whoever is logged in, install it as a service (as administrator):
+
+```powershell
+cargo run -p whereabouts-service -- --install
+```
+
+This copies the program and its offline data to `%ProgramFiles%\Whereabouts` (which only administrators can change) and starts the **Whereabouts** service, running as LocalSystem. Ask it how it is doing, as yourself, with the installed copy:
+
+```powershell
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --status
+```
+
+Remove it with `--uninstall` (your saved history is kept) or `--uninstall --delete-data` (everything is deleted). While the service runs, `--console` refuses to start, because two captures cannot run at once.
  It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received.
 
 ## Building from source

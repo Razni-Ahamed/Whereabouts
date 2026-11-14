@@ -8,7 +8,9 @@
        - the ignored integration tests in crates/win-capture/tests/live_capture.rs
        - a smoke test of `whereabouts-service --console` while curl.exe downloads a page,
          including `--status` over the local pipe as administrator and as a normal user
-    3. Prints PASS or FAIL and exits with 0 on success, 1 on failure.
+    3. With -Service, also installs Whereabouts as a Windows service, checks it, and
+       removes it again (the saved-data folder too, unless it existed before).
+    4. Prints PASS or FAIL and exits with 0 on success, 1 on failure.
 
     The tests make a few HTTPS requests to example.com. Logs, which contain
     this computer's connection metadata, are written to a temporary folder
@@ -16,9 +18,14 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -Service
 #>
 [CmdletBinding()]
 param(
+    # Also test the Windows service: install, check, uninstall.
+    [switch]$Service,
     # Internal: set when the script re-runs itself with administrator rights.
     [switch]$Elevated,
     # Internal: folder where the elevated run writes its logs.
@@ -61,6 +68,31 @@ function Start-Logged {
     return $process
 }
 
+# Runs a program to the end and returns its output.
+function Invoke-Program {
+    param([string]$FilePath, [string]$Name, [string[]]$Arguments)
+    $process = Start-Logged -FilePath $FilePath -Name $Name -Arguments $Arguments
+    if (-not $process.WaitForExit(120000)) { $process.Kill() }
+    return Get-LoggedOutput -Name $Name
+}
+
+# Runs a program as a normal user: the same account without administrator
+# rights ("basic user", runas /trustlevel:0x20000). Returns its output.
+function Invoke-AsNormalUser {
+    param([string]$FilePath, [string]$Name, [string]$Arguments)
+    $log = Join-Path $WorkDir "$Name.log"
+    $cmd = Join-Path $WorkDir "$Name.cmd"
+    Set-Content -Path $cmd -Encoding ascii -Value "@`"$FilePath`" $Arguments > `"$log`" 2>&1"
+    & runas.exe /trustlevel:0x20000 $cmd | Out-Null
+    $deadline = (Get-Date).AddSeconds(15)
+    while (-not (Test-Path $log) -or (Get-Item $log).Length -eq 0) {
+        if ((Get-Date) -gt $deadline) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $log) { return Get-Content -Raw $log } else { return '' }
+}
+
 function Get-LoggedOutput {
     param([string]$Name)
     $text = ''
@@ -97,9 +129,7 @@ function Invoke-IntegrationTests {
 
 function Invoke-Service {
     param([string]$Name, [string[]]$Arguments)
-    $process = Start-Logged -FilePath $ServiceExe -Name $Name -Arguments $Arguments
-    if (-not $process.WaitForExit(60000)) { $process.Kill() }
-    return Get-LoggedOutput -Name $Name
+    return Invoke-Program -FilePath $ServiceExe -Name $Name -Arguments $Arguments
 }
 
 function Invoke-ConsoleSmokeTest {
@@ -133,18 +163,7 @@ function Invoke-ConsoleSmokeTest {
     } else {
         Write-Log '    --status as administrator: answered'
     }
-    $basicLog = Join-Path $WorkDir 'status-basic.log'
-    $basicCmd = Join-Path $WorkDir 'status-basic.cmd'
-    Set-Content -Path $basicCmd -Encoding ascii -Value "@`"$ServiceExe`" --status > `"$basicLog`" 2>&1"
-    # 0x20000 = "basic user": the same account without administrator rights.
-    & runas.exe /trustlevel:0x20000 $basicCmd | Out-Null
-    $deadline = (Get-Date).AddSeconds(15)
-    while (-not (Test-Path $basicLog) -or (Get-Item $basicLog).Length -eq 0) {
-        if ((Get-Date) -gt $deadline) { break }
-        Start-Sleep -Milliseconds 200
-    }
-    Start-Sleep -Milliseconds 500
-    $basic = if (Test-Path $basicLog) { Get-Content -Raw $basicLog } else { '' }
+    $basic = Invoke-AsNormalUser -FilePath $ServiceExe -Name 'status-basic' -Arguments '--status'
     if ($basic -notmatch 'is running') {
         Write-Log 'FAIL: --status as a normal user did not get an answer from the console'
         Write-Log $basic
@@ -282,11 +301,118 @@ function Invoke-StorageTest {
     return $passed
 }
 
+function Invoke-ServiceTest {
+    Write-Log '--- extra  Windows service (installed, checked, then removed) ---'
+    # The service uses the real data folder, so these commands must too.
+    Remove-Item Env:WHEREABOUTS_HOME -ErrorAction SilentlyContinue
+    $installDir = Join-Path $env:ProgramFiles 'Whereabouts'
+    $installed = Join-Path $installDir 'whereabouts-service.exe'
+    $dataHome = Join-Path $env:ProgramData 'Whereabouts'
+    $hadData = Test-Path $dataHome
+    if (Get-Service -Name 'Whereabouts' -ErrorAction SilentlyContinue) {
+        Write-Log 'FAIL: the Whereabouts service is already installed; uninstall it first'
+        return $false
+    }
+    $passed = $true
+    function Fail([string]$Message, [string]$Details = '') {
+        Write-Log "FAIL: $Message"
+        if ($Details) { Write-Log $Details }
+        Set-Variable -Name passed -Value $false -Scope 1
+    }
+
+    $out = Invoke-Service -Name 'install' -Arguments @('--install')
+    $svc = Get-CimInstance Win32_Service -Filter "Name='Whereabouts'"
+    if (-not $svc -or $svc.State -ne 'Running') {
+        Fail 'the service is not running after --install' $out
+    } else {
+        Write-Log "    installed: $($svc.State), start $($svc.StartMode), as $($svc.StartName)"
+        if ($svc.StartMode -ne 'Auto') { Fail 'the service does not start automatically' }
+        if ($svc.StartName -ne 'LocalSystem') { Fail 'the service does not run as LocalSystem' }
+        if (-not $svc.PathName.StartsWith("`"$installed`"")) { Fail "unexpected service path $($svc.PathName)" }
+    }
+
+    # Normal users must not be able to change the program SYSTEM runs.
+    # WriteData, AppendData, Delete, ChangePermissions, TakeOwnership,
+    # GenericWrite, GenericAll.
+    $writeRights = 0x2 -bor 0x4 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    foreach ($path in @($installDir, $installed)) {
+        $open = @((Get-Acl $path).Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and
+            ($_.IdentityReference.Value -in @('BUILTIN\Users', 'NT AUTHORITY\Authenticated Users', 'Everyone', 'NT AUTHORITY\INTERACTIVE', $me)) -and
+            (([int64]$_.FileSystemRights -band $writeRights) -ne 0)
+        })
+        if ($open.Count -gt 0) { Fail "normal users can change $path" ($open | Out-String) }
+    }
+    Write-Log '    program folder: not changeable by normal users'
+
+    & ipconfig /flushdns | Out-Null
+    $curl = Start-Process -FilePath 'curl.exe' -NoNewWindow -Wait -PassThru -ArgumentList @(
+        '--silent', '--output', 'NUL', '--max-time', '15', $TestUrl)
+    Write-Log "    curl.exe (pid $($curl.Id)) exited with $($curl.ExitCode)"
+    Start-Sleep -Seconds 4
+
+    $status = Invoke-Program -FilePath $installed -Name 'svc-status' -Arguments @('--status')
+    if ($status -notmatch 'is running' -or $status -notmatch 'saving history: yes') {
+        Fail '--status (installed copy, administrator) did not get a full answer' $status
+    } else { Write-Log '    --status from the installed copy, as administrator: answered' }
+    $basic = Invoke-AsNormalUser -FilePath $installed -Name 'svc-status-basic' -Arguments '--status'
+    if ($basic -notmatch 'is running') {
+        Fail '--status (installed copy, normal user) did not get an answer' $basic
+    } else { Write-Log '    --status from the installed copy, as a normal user: answered' }
+    $other = Invoke-Service -Name 'svc-status-other' -Arguments @('--status')
+    # The other copy trusts the service (the Service Control Manager vouches
+    # for it), but the service refuses a program that is not its own file.
+    if ($other -notmatch 'only answers its own program') {
+        Fail 'the service did not refuse another copy of the program' $other
+    } else { Write-Log '    --status from another copy of the program: refused by the service' }
+    $console = Invoke-Service -Name 'svc-console' -Arguments @('--console', '--seconds', '1')
+    if ($console -notmatch 'service is running') {
+        Fail '--console started while the service was running' $console
+    } else { Write-Log '    --console while the service runs: refused' }
+
+    $out = Invoke-Service -Name 'uninstall' -Arguments @('--uninstall')
+    if (Get-Service -Name 'Whereabouts' -ErrorAction SilentlyContinue) { Fail 'the service is still installed' $out }
+    if (Test-Path $installDir) { Fail "$installDir is still there" $out }
+    if (-not (Get-Service -Name 'Whereabouts' -ErrorAction SilentlyContinue) -and -not (Test-Path $installDir)) { Write-Log '    --uninstall: service and program folder removed' }
+
+    # Saved by the service (SYSTEM), read by an administrator: the key is
+    # shared through machine-scope DPAPI.
+    $csv = Join-Path $WorkDir 'service-export.csv'
+    $null = Invoke-Service -Name 'svc-export' -Arguments @('--export', $csv)
+    $curlSaved = (Test-Path $csv) -and (Select-String -Path $csv -Pattern 'curl\.exe' -Quiet)
+    if (-not $curlSaved) { Fail 'the flows the service saved could not be read, or curl.exe is missing' }
+    else { Write-Log '    history saved by the service: readable by an administrator, includes curl.exe' }
+    Remove-Item $csv -ErrorAction SilentlyContinue
+
+    $logFile = Join-Path $dataHome 'service.log'
+    $logText = if (Test-Path $logFile) { Get-Content -Raw $logFile } else { '' }
+    if ($logText -notmatch 'service started' -or $logText -notmatch 'service stopped') {
+        Fail 'the service log does not show a clean start and stop' $logText
+    } elseif ($logText -match 'error:') {
+        Fail 'the service log has errors' $logText
+    } else { Write-Log '    service log: clean start and stop, no errors' }
+
+    if (-not $hadData) {
+        $out = Invoke-Service -Name 'delete-data' -Arguments @('--uninstall', '--delete-data')
+        if (Test-Path $dataHome) { Fail "$dataHome was not deleted" $out }
+        else { Write-Log '    --uninstall --delete-data: data folder deleted' }
+    } else {
+        Write-Log "    kept $dataHome (it existed before this test)"
+    }
+    if ($passed) { Write-Log 'ok: Windows service' }
+    return $passed
+}
+
 function Invoke-LiveTests {
     $integration = Invoke-IntegrationTests
     $console = Invoke-ConsoleSmokeTest
     $storage = Invoke-StorageTest
-    return ($integration -and $console -and $storage)
+    # (PowerShell names ignore case: a variable called $service would
+    # overwrite the -Service switch.)
+    $serviceOk = $true
+    if ($Service) { $serviceOk = Invoke-ServiceTest }
+    return ($integration -and $console -and $storage -and $serviceOk)
 }
 
 # --- Elevated part -----------------------------------------------------------
@@ -315,11 +441,12 @@ if (Test-IsAdministrator) {
     # Created as the normal user, so it is owned by that account.
     New-Item -ItemType Directory -Path (Join-Path $WorkDir 'planted-home') | Out-Null
     Write-Host 'Running live tests as administrator. Please approve the UAC prompt...'
+    $elevatedArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', "`"$PSCommandPath`"", '-Elevated', '-WorkDir', "`"$WorkDir`"")
+    if ($Service) { $elevatedArgs += '-Service' }
     try {
         $child = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
-            -WindowStyle Hidden -ArgumentList @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                '-File', "`"$PSCommandPath`"", '-Elevated', '-WorkDir', "`"$WorkDir`"")
+            -WindowStyle Hidden -ArgumentList $elevatedArgs
     } catch {
         Write-Host 'FAIL: administrator rights were not granted (UAC prompt declined?)'
         exit 1

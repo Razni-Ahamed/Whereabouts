@@ -3,10 +3,14 @@
 //!
 //! - The database key is 32 random bytes from the system's secure random
 //!   number generator.
-//! - It is stored only after being encrypted with DPAPI for the **current
-//!   account** (for the background service, that is SYSTEM). Only the same
-//!   account on the same computer can decrypt it, so copying the key file
-//!   and database elsewhere gives nothing readable.
+//! - It is stored only after being encrypted with DPAPI for **this
+//!   computer** (machine scope), so that the background service (SYSTEM)
+//!   and administrators' commands (`--history`, `--export`) can both use
+//!   it. Copying the key file and database to another computer gives
+//!   nothing readable. On this computer, the key file is protected by the
+//!   folder's permissions (SYSTEM and Administrators only).
+//!   Machine-scope DPAPI keys can be recovered by someone holding an
+//!   unencrypted disk, which is why BitLocker is recommended.
 //! - The data folder is restricted to SYSTEM and Administrators and owned
 //!   by Administrators. Ordinary users can create folders in
 //!   `%ProgramData%`, so an existing folder (or file) is only trusted if it
@@ -31,7 +35,7 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom, CRYPT_INTEGER_BLOB,
-    CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
@@ -45,7 +49,11 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
     OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
-use windows::core::{BOOL, HRESULT, HSTRING, w};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+};
+use windows::core::{BOOL, GUID, HRESULT, HSTRING, w};
 
 /// Length of the database key in bytes (256 bits).
 pub const KEY_LEN: usize = 32;
@@ -95,8 +103,21 @@ unsafe fn take_output(output: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     bytes
 }
 
-/// Encrypts `data` with DPAPI for the current account.
-pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+/// Who can decrypt what [`protect`] encrypts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Only the account that encrypted it, on this computer.
+    User,
+    /// Any account on this computer (so protect the file itself).
+    Machine,
+}
+
+/// Encrypts `data` with DPAPI for `scope`.
+pub fn protect(data: &[u8], scope: Scope) -> io::Result<Vec<u8>> {
+    let flags = match scope {
+        Scope::User => CRYPTPROTECT_UI_FORBIDDEN,
+        Scope::Machine => CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE,
+    };
     let input = blob(data);
     let entropy = blob(ENTROPY);
     let mut output = CRYPT_INTEGER_BLOB::default();
@@ -109,7 +130,7 @@ pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
             Some(&entropy),
             None,
             None,
-            CRYPTPROTECT_UI_FORBIDDEN,
+            flags,
             &mut output,
         )
     }
@@ -118,7 +139,8 @@ pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(unsafe { take_output(output) })
 }
 
-/// Decrypts a DPAPI blob made by [`protect`] on this computer and account.
+/// Decrypts a DPAPI blob made by [`protect`] on this computer (and, for
+/// [`Scope::User`], by this account).
 pub fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
     let input = blob(data);
     let entropy = blob(ENTROPY);
@@ -140,32 +162,93 @@ pub fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(unsafe { take_output(output) })
 }
 
-/// Loads the database key from `path`, or creates a new random one and
-/// saves it there (DPAPI-protected) if the file does not exist yet.
-pub fn load_or_create_key(path: &Path) -> io::Result<[u8; KEY_LEN]> {
-    match std::fs::read(path) {
-        Ok(protected) => {
-            let key = unprotect(&protected)?;
-            key.try_into().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stored key has the wrong length",
-                )
-            })
+/// Reads and decrypts a stored key.
+fn read_key(path: &Path) -> io::Result<[u8; KEY_LEN]> {
+    let key = unprotect(&std::fs::read(path)?)?;
+    key.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored key has the wrong length",
+        )
+    })
+}
+
+/// Saves `key`, protected for this computer, to the new file `path`.
+fn write_key(path: &Path, key: &[u8; KEY_LEN]) -> io::Result<()> {
+    let protected = protect(key, Scope::Machine)?;
+    // `create_new` never overwrites an existing key.
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(&protected)?;
+    file.sync_all()
+}
+
+/// Loads the database key from `path` (protected for this computer).
+///
+/// If there is none yet, a key from an older version at `legacy`
+/// (protected for the account that made it) is moved to `path` and the
+/// old file deleted; this works only for that same account. Otherwise a
+/// new random key is created.
+pub fn load_or_create_key(path: &Path, legacy: &Path) -> io::Result<[u8; KEY_LEN]> {
+    match read_key(path) {
+        Ok(key) => {
+            // Finish a move that was interrupted after the new file was
+            // written.
+            if legacy.exists() {
+                std::fs::remove_file(legacy)?;
+            }
+            return Ok(key);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let key: [u8; KEY_LEN] = random_bytes(KEY_LEN)?
-                .try_into()
-                .map_err(|_| io::Error::other("wrong random length"))?;
-            let protected = protect(&key)?;
-            // `create_new` never overwrites an existing key.
-            let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-            file.write_all(&protected)?;
-            file.sync_all()?;
-            Ok(key)
-        }
-        Err(error) => Err(error),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
     }
+    let key = match read_key(legacy) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => random_bytes(KEY_LEN)?
+            .try_into()
+            .map_err(|_| io::Error::other("wrong random length"))?,
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "the key from an older version can only be read by the administrator \
+                     account that first ran Whereabouts; run any Whereabouts command once \
+                     as that account ({error})"
+                ),
+            ));
+        }
+    };
+    write_key(path, &key)?;
+    if legacy.exists() {
+        std::fs::remove_file(legacy)?;
+    }
+    Ok(key)
+}
+
+/// A folder Windows knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownFolder {
+    /// `C:\Program Files` (the 64-bit one on 64-bit Windows).
+    ProgramFiles,
+    /// `C:\ProgramData`.
+    ProgramData,
+}
+
+/// The real location of `folder`, asked from Windows rather than read from
+/// an environment variable (which a user's own programs could change).
+pub fn known_folder(folder: KnownFolder) -> io::Result<std::path::PathBuf> {
+    let id: &GUID = match folder {
+        KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
+        KnownFolder::ProgramData => &FOLDERID_ProgramData,
+    };
+    // SAFETY: `id` is a valid folder ID; the returned string is allocated
+    // by the shell and freed below with CoTaskMemFree.
+    let text = unsafe { SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None) }
+        .map_err(|e| io::Error::other(format!("SHGetKnownFolderPath failed: {e}")))?;
+    // SAFETY: `text` is a valid null-terminated string from the call.
+    let path = unsafe { text.to_string() }.map_err(io::Error::other);
+    // SAFETY: allocated by SHGetKnownFolderPath; freed exactly once.
+    unsafe { CoTaskMemFree(Some(text.0.cast())) };
+    Ok(std::path::PathBuf::from(path?))
 }
 
 /// A security descriptor made from [`FOLDER_SDDL`], freed when dropped.
@@ -399,14 +482,29 @@ mod tests {
     #[test]
     fn dpapi_round_trip() {
         let secret = b"not really a secret";
-        let protected = protect(secret).unwrap();
-        assert!(!protected.windows(secret.len()).any(|w| w == secret));
-        assert_eq!(unprotect(&protected).unwrap(), secret);
+        for scope in [Scope::User, Scope::Machine] {
+            let protected = protect(secret, scope).unwrap();
+            assert!(!protected.windows(secret.len()).any(|w| w == secret));
+            assert_eq!(unprotect(&protected).unwrap(), secret);
+        }
+    }
+
+    /// DPAPI blob flags (offset 40 of the blob layout), for tests only.
+    fn blob_flags(blob: &[u8]) -> u32 {
+        u32::from_le_bytes(blob[40..44].try_into().unwrap())
+    }
+
+    #[test]
+    fn machine_scope_is_recorded_in_the_blob() {
+        let user = protect(b"x", Scope::User).unwrap();
+        let machine = protect(b"x", Scope::Machine).unwrap();
+        assert_eq!(blob_flags(&user) & CRYPTPROTECT_LOCAL_MACHINE, 0);
+        assert_ne!(blob_flags(&machine) & CRYPTPROTECT_LOCAL_MACHINE, 0);
     }
 
     #[test]
     fn tampered_blobs_are_rejected() {
-        let mut protected = protect(b"secret").unwrap();
+        let mut protected = protect(b"secret", Scope::Machine).unwrap();
         let last = protected.len() - 1;
         protected[last] ^= 0xff;
         assert!(unprotect(&protected).is_err());
@@ -488,18 +586,55 @@ mod tests {
 
     #[test]
     fn key_is_created_once_and_then_reloaded() {
-        let dir = std::env::temp_dir().join(format!("whereabouts-key-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("store.key");
-        let _ = std::fs::remove_file(&path);
+        let dir = temp("key");
+        let path = dir.join("database.key");
+        let legacy = dir.join("store.key");
 
-        let created = load_or_create_key(&path).unwrap();
-        let reloaded = load_or_create_key(&path).unwrap();
+        let created = load_or_create_key(&path, &legacy).unwrap();
+        let reloaded = load_or_create_key(&path, &legacy).unwrap();
         assert_eq!(created, reloaded);
-        // The file holds the protected key, not the key itself.
+        // The file holds the key protected for this computer, not the key.
         let on_disk = std::fs::read(&path).unwrap();
         assert!(!on_disk.windows(KEY_LEN).any(|w| w == created));
-
+        assert_ne!(blob_flags(&on_disk) & CRYPTPROTECT_LOCAL_MACHINE, 0);
+        assert!(!legacy.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_older_account_key_is_moved_to_machine_scope() {
+        let dir = temp("legacy");
+        let path = dir.join("database.key");
+        let legacy = dir.join("store.key");
+        let old_key = [7u8; KEY_LEN];
+        std::fs::write(&legacy, protect(&old_key, Scope::User).unwrap()).unwrap();
+
+        assert_eq!(load_or_create_key(&path, &legacy).unwrap(), old_key);
+        assert!(!legacy.exists(), "the old file is deleted");
+        let moved = std::fs::read(&path).unwrap();
+        assert_ne!(blob_flags(&moved) & CRYPTPROTECT_LOCAL_MACHINE, 0);
+        assert_eq!(load_or_create_key(&path, &legacy).unwrap(), old_key);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_older_key_is_an_error_not_a_new_key() {
+        let dir = temp("bad-legacy");
+        let path = dir.join("database.key");
+        let legacy = dir.join("store.key");
+        std::fs::write(&legacy, b"not a DPAPI blob").unwrap();
+        let error = load_or_create_key(&path, &legacy).unwrap_err();
+        assert!(error.to_string().contains("older version"), "{error}");
+        assert!(!path.exists(), "no new key may replace the old one");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn known_folders_are_found() {
+        let program_files = known_folder(KnownFolder::ProgramFiles).unwrap();
+        let program_data = known_folder(KnownFolder::ProgramData).unwrap();
+        assert!(program_files.is_absolute() && program_files.is_dir());
+        assert!(program_data.is_absolute() && program_data.is_dir());
+        assert_ne!(program_files, program_data);
     }
 }

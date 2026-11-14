@@ -1,7 +1,9 @@
 //! `--console` mode: live table of network flows per app.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -95,16 +97,51 @@ impl Closed {
 /// How often retention runs while the console is open.
 const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
 
-/// Runs the console view until `limit` passes, or forever if `None`.
+/// How the engine runs.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Stop after this long; `None` to run until stopped.
+    pub limit: Option<Duration>,
+    /// Print the live table (console mode).
+    pub show_table: bool,
+    /// Stop when this becomes `true` (service mode).
+    pub stop: Option<Arc<AtomicBool>>,
+    /// Account allowed to use the pipe; `None` for the current account.
+    pub client_sid: Option<String>,
+    /// Offline data folder; `None` to search for it (see [`data_dir`]).
+    pub data_dir: Option<PathBuf>,
+}
+
+/// `--console`: runs the engine with the live table until `limit` passes,
+/// or forever if `None`.
 pub fn run(limit: Option<Duration>) -> ExitCode {
-    let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
-    let capture = match Capture::start(sender) {
-        Ok(capture) => capture,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
+    // Two captures cannot run at once: starting one ends the other's
+    // Windows event session.
+    if crate::service_mode::is_running() {
+        eprintln!(
+            "error: the Whereabouts service is running. See what it sees with --status, or \
+             stop it first (as administrator: sc stop Whereabouts)."
+        );
+        return ExitCode::FAILURE;
+    }
+    let options = Options {
+        limit,
+        show_table: true,
+        ..Options::default()
     };
+    match run_engine(&options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            report!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Captures, labels, saves and serves flows until stopped (see [`Options`]).
+pub fn run_engine(options: &Options) -> Result<(), String> {
+    let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
+    let capture = Capture::start(sender).map_err(|error| error.to_string())?;
     println!("Whereabouts is watching network connections. Press Ctrl+C to stop.");
     if !capture.kernel_events_protected() {
         println!(
@@ -119,7 +156,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     println!("Publisher: from the program's code signature · ? = checked by file path only, not");
     println!("           confirmed as the file the process ran (e.g. it had already exited)");
 
-    let (enricher, data) = Enricher::load(&data_dir());
+    let (enricher, data) = Enricher::load(&options.data_dir.clone().unwrap_or_else(data_dir));
     println!(
         "Offline data: {} tracker domains · {} company domains{}",
         data.tracker_domains,
@@ -145,7 +182,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
             Some(store)
         }
         Err(error) => {
-            eprintln!("warning: history will not be saved: {error}");
+            report!("warning: history will not be saved: {error}");
             None
         }
     };
@@ -153,7 +190,11 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
 
     let live: crate::server::SharedState =
         Arc::new(Mutex::new(crate::server::LiveState::default()));
-    let serving = match crate::server::start(PIPE_NAME, Arc::clone(&live)) {
+    let serving = match crate::server::start(
+        PIPE_NAME,
+        options.client_sid.as_deref(),
+        Arc::clone(&live),
+    ) {
         Ok(()) => {
             println!(
                 "Answering Whereabouts clients on {PIPE_NAME} (try --status in another terminal)"
@@ -161,7 +202,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
             true
         }
         Err(error) => {
-            eprintln!("warning: {error}");
+            report!("warning: {error}");
             false
         }
     };
@@ -262,16 +303,28 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 };
                 publish(&live, &view, &names, &enricher, status);
             }
-            draw(
-                &view,
-                &names,
-                &enricher,
-                capture.counts(),
-                started.elapsed(),
-            );
+            if options.show_table {
+                draw(
+                    &view,
+                    &names,
+                    &enricher,
+                    capture.counts(),
+                    started.elapsed(),
+                );
+            }
             last_draw = Instant::now();
         }
-        if limit.is_some_and(|limit| started.elapsed() >= limit) {
+        if options
+            .limit
+            .is_some_and(|limit| started.elapsed() >= limit)
+        {
+            break;
+        }
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
+        {
             break;
         }
     }
@@ -297,22 +350,24 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         let saved = active.len();
         match store.insert_flows(&active) {
             Ok(()) => println!("Saved {saved} active flows."),
-            Err(error) => eprintln!("warning: could not save active flows: {error}"),
+            Err(error) => report!("warning: could not save active flows: {error}"),
         }
     }
-    draw(
-        &View::collect(&table, &closed, &names),
-        &names,
-        &enricher,
-        capture.counts(),
-        started.elapsed(),
-    );
+    if options.show_table {
+        draw(
+            &View::collect(&table, &closed, &names),
+            &names,
+            &enricher,
+            capture.counts(),
+            started.elapsed(),
+        );
+    }
     // Release any process event waiting for queue space before stopping.
     drop(receiver);
     if let Err(error) = capture.stop() {
-        eprintln!("warning: {error}");
+        report!("warning: {error}");
     }
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 /// Name and executable path of a process.
@@ -607,7 +662,7 @@ fn save_closed(
         row.saved = true;
     }
     if closed.lost > 0 {
-        eprintln!(
+        report!(
             "warning: {} finished flows could not be kept for saving (too many at once)",
             closed.lost
         );
@@ -617,7 +672,7 @@ fn save_closed(
         return;
     }
     if let Err(error) = store.insert_flows(&records) {
-        eprintln!("warning: could not save {} flows: {error}", records.len());
+        report!("warning: could not save {} flows: {error}", records.len());
     }
 }
 
@@ -900,7 +955,7 @@ fn owner_and_country(row: &Row, enricher: &Enricher) -> (String, String) {
 /// Finds the folder with the offline data files: `WHEREABOUTS_DATA`, a
 /// `data` folder next to the program or in the current folder, or the
 /// project's `data` folder for development builds.
-fn data_dir() -> std::path::PathBuf {
+pub fn data_dir() -> PathBuf {
     use std::path::PathBuf;
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::var_os("WHEREABOUTS_DATA") {

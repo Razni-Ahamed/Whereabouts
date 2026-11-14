@@ -48,16 +48,40 @@ impl Client {
             })?;
         // Before sending anything, make sure no other program has taken the
         // pipe's name to pose as Whereabouts.
-        if !crate::server::is_whereabouts(connection.peer_pid(), connection.connected_by()) {
-            return Err(String::from(
+        if !crate::server::is_trusted_server(connection.peer_pid(), connection.connected_by()) {
+            let mut message = String::from(
                 "the program answering on the Whereabouts pipe is not this copy of \
                  Whereabouts, so it is not trusted",
-            ));
+            );
+            // The usual reason: asking the installed service from another copy.
+            if let Some(installed) = crate::install::installed_exe() {
+                message.push_str(&format!(
+                    ". To ask the installed service, run \"{}\" --status",
+                    installed.display()
+                ));
+            }
+            return Err(message);
         }
         let mut client = Self(connection);
-        match client.ask(&Request::Hello {
-            protocol: PROTOCOL_VERSION,
-        })? {
+        // The service hangs up at once on programs that are not its own
+        // file, before answering anything.
+        let greeting = client
+            .ask(&Request::Hello {
+                protocol: PROTOCOL_VERSION,
+            })
+            .map_err(|_| {
+                let mut message = String::from(
+                    "Whereabouts closed the connection: it only answers its own program",
+                );
+                if let Some(installed) = crate::install::installed_exe() {
+                    message.push_str(&format!(
+                        ". Run the installed copy: \"{}\" --status",
+                        installed.display()
+                    ));
+                }
+                message
+            })?;
+        match greeting {
             Response::Hello { protocol, version } if protocol == PROTOCOL_VERSION => {
                 Ok((client, version))
             }
@@ -273,7 +297,7 @@ mod tests {
     fn connects_to_a_running_service() {
         let name = format!(r"\\.\pipe\whereabouts-client-test-{}", std::process::id());
         let state = Arc::new(Mutex::new(crate::server::LiveState::default()));
-        crate::server::start(&name, state).unwrap();
+        crate::server::start(&name, None, state).unwrap();
         let (mut client, version) = Client::connect(&name).unwrap();
         assert_eq!(version, env!("CARGO_PKG_VERSION"));
         assert!(matches!(
