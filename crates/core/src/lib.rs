@@ -13,4 +13,5 @@ pub mod dns;
 pub mod entropy;
 pub mod flow;
 pub mod model;
+pub mod privacy;
 pub mod stats;

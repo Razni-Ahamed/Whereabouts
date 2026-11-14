@@ -33,9 +33,10 @@ Almost all of this is encrypted anyway. Whereabouts never decrypts traffic and n
 
 ## Where your data is kept
 
-- In an **encrypted database** on your computer, readable only by the Whereabouts service and administrators.
+- In an **encrypted database** on your computer (`%ProgramData%\Whereabouts`), in a folder only administrators and the system can open. The whole file is encrypted; its key is itself encrypted with Windows' DPAPI for the account running Whereabouts, so copying the files to another computer gives nothing readable. Deleted data is overwritten.
 - **Old data is deleted automatically**: individual connections after 30 days, hourly summaries after 180 days. You can change these limits.
-- You can **export** your data or **delete everything** at any time from the app.
+- You can **export** your data or **delete everything** at any time (today with `--export` and `--delete-all --yes`; later from the app). An export is a plain CSV file, so keep it private.
+- For **web browsers**, only the main domain of each site is saved (e.g. `example.com`, not `mail.example.com`).
 
 We recommend turning on **BitLocker** so that someone who steals your computer's disk cannot read it.
 
