@@ -5,9 +5,14 @@
 //! saves finished flows to the encrypted store; `--history`, `--export` and
 //! `--delete-all` work with what was saved.
 
+#[macro_use]
+mod log;
+
 mod client;
 mod console;
+mod install;
 mod server;
+mod service_mode;
 mod storage;
 
 use std::path::PathBuf;
@@ -27,11 +32,15 @@ Options:
   --history            Show what is saved: top apps of the last 24 hours
   --export <FILE>      Write all saved flows to a CSV file
   --delete-all --yes   Delete all saved flows and totals (cannot be undone)
+  --install            Install and start Whereabouts as a Windows service that
+                       runs at boot (as administrator)
+  --uninstall          Stop and remove the service; saved data is kept
+  --delete-data        With --uninstall, also delete all saved data
   --version            Print the version
   --help               Print this help
 
 Saved data is kept in %ProgramData%\\Whereabouts (readable by administrators
-only), encrypted. Running as a Windows service is not implemented yet.";
+only), encrypted. Windows starts the installed service with --service.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -40,6 +49,9 @@ enum Command {
     History,
     Export(PathBuf),
     DeleteAll { confirmed: bool },
+    Install,
+    Uninstall { delete_data: bool },
+    Service { client_user: String },
     Version,
     Help,
 }
@@ -52,6 +64,11 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut export = None;
     let mut delete_all = false;
     let mut yes = false;
+    let mut install = false;
+    let mut uninstall = false;
+    let mut delete_data = false;
+    let mut service = false;
+    let mut client_user = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -71,18 +88,41 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             }
             "--delete-all" => delete_all = true,
             "--yes" => yes = true,
+            "--install" => install = true,
+            "--uninstall" => uninstall = true,
+            "--delete-data" => delete_data = true,
+            "--service" => service = true,
+            "--client-user" => {
+                let value = iter.next().ok_or("--client-user needs an account ID")?;
+                let valid = value.starts_with("S-")
+                    && value[2..].bytes().all(|b| b.is_ascii_digit() || b == b'-');
+                if !valid {
+                    return Err(format!("{value:?} is not an account ID (S-1-...)"));
+                }
+                client_user = Some(value.clone());
+            }
             "--version" | "-V" => return Ok(Command::Version),
             "--help" | "-h" => return Ok(Command::Help),
             other => return Err(format!("unknown option {other:?}")),
         }
     }
-    let chosen = [console, status, history, export.is_some(), delete_all]
-        .iter()
-        .filter(|&&on| on)
-        .count();
+    let chosen = [
+        console,
+        status,
+        history,
+        export.is_some(),
+        delete_all,
+        install,
+        uninstall,
+        service,
+    ]
+    .iter()
+    .filter(|&&on| on)
+    .count();
     if chosen > 1 {
         return Err(String::from(
-            "choose only one of --console, --status, --history, --export, --delete-all",
+            "choose only one of --console, --status, --history, --export, --delete-all, \
+             --install, --uninstall",
         ));
     }
     if seconds.is_some() && !console {
@@ -90,6 +130,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     if yes && !delete_all {
         return Err(String::from("--yes only works with --delete-all"));
+    }
+    if delete_data && !uninstall {
+        return Err(String::from("--delete-data only works with --uninstall"));
+    }
+    if client_user.is_some() != service {
+        return Err(String::from("--service and --client-user go together"));
     }
     Ok(if console {
         Command::Console { limit: seconds }
@@ -101,6 +147,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         Command::Export(path)
     } else if delete_all {
         Command::DeleteAll { confirmed: yes }
+    } else if install {
+        Command::Install
+    } else if uninstall {
+        Command::Uninstall { delete_data }
+    } else if let Some(client_user) = client_user {
+        Command::Service { client_user }
     } else {
         Command::Help
     })
@@ -114,6 +166,9 @@ fn main() -> ExitCode {
         Ok(Command::History) => storage::show_history(),
         Ok(Command::Export(path)) => storage::export(&path),
         Ok(Command::DeleteAll { confirmed }) => storage::delete_all(confirmed),
+        Ok(Command::Install) => install::install(),
+        Ok(Command::Uninstall { delete_data }) => install::uninstall(delete_data),
+        Ok(Command::Service { client_user }) => service_mode::run(client_user),
         Ok(Command::Version) => {
             println!(
                 "whereabouts-service {} (IPC protocol v{})",
@@ -176,6 +231,39 @@ mod tests {
             parse_args(&args(&["--delete-all", "--yes"])),
             Ok(Command::DeleteAll { confirmed: true })
         );
+    }
+
+    #[test]
+    fn parses_service_commands() {
+        assert_eq!(parse_args(&args(&["--install"])), Ok(Command::Install));
+        assert_eq!(
+            parse_args(&args(&["--uninstall"])),
+            Ok(Command::Uninstall { delete_data: false })
+        );
+        assert_eq!(
+            parse_args(&args(&["--uninstall", "--delete-data"])),
+            Ok(Command::Uninstall { delete_data: true })
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--service",
+                "--client-user",
+                "S-1-5-21-1-2-3-1001"
+            ])),
+            Ok(Command::Service {
+                client_user: String::from("S-1-5-21-1-2-3-1001")
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_service_input() {
+        assert!(parse_args(&args(&["--service"])).is_err());
+        assert!(parse_args(&args(&["--client-user", "S-1-5-18"])).is_err());
+        assert!(parse_args(&args(&["--service", "--client-user", "WD"])).is_err());
+        assert!(parse_args(&args(&["--service", "--client-user", "S-1)(A;;GA;;;WD"])).is_err());
+        assert!(parse_args(&args(&["--delete-data"])).is_err());
+        assert!(parse_args(&args(&["--install", "--uninstall"])).is_err());
     }
 
     #[test]
