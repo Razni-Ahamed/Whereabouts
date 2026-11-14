@@ -55,7 +55,7 @@ CI runs the same live tests on GitHub's Windows runners (job "Live ETW tests").
 
 ## Code guidelines
 
-- **`unsafe` code** is forbidden in `core`, `enrich`, `ipc` and `store`. It is allowed only in the Windows API crates (`win-capture`, `win-firewall`), and every `unsafe` block needs a `// SAFETY:` comment explaining why it is sound.
+- **`unsafe` code** is forbidden in `core`, `enrich`, `ipc` and `store`. It is allowed only in the Windows API crates (`win-capture`, `win-firewall`, `win-pipe`, `win-secrets`), and every `unsafe` block needs a `// SAFETY:` comment explaining why it is sound.
 - **Treat network data as untrusted.** Domain names and other values from the network must be length-limited and validated, and never used to build file paths or SQL strings. Use parameterised queries.
 - **Dependencies:** add new crates only when they are clearly needed. Explain why in the pull request. Their licences must be compatible with GPL-3.0 (CI checks this with `cargo-deny`).
 - **Tests:** new logic needs tests. Bug fixes need a test that fails without the fix.

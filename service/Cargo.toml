@@ -15,6 +15,7 @@ whereabouts-enrich.workspace = true
 whereabouts-ipc.workspace = true
 whereabouts-store.workspace = true
 whereabouts-win-capture.workspace = true
+whereabouts-win-pipe.workspace = true
 whereabouts-win-secrets.workspace = true
 
 [lints]

@@ -79,11 +79,12 @@ powershell -ExecutionPolicy Bypass -File scripts\update-data.ps1
 Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. Finished flows are saved, encrypted, in `%ProgramData%\Whereabouts`. Afterwards, also as administrator:
 
 ```powershell
+cargo run -p whereabouts-service -- --status             # while --console runs: status, top flows and apps
 cargo run -p whereabouts-service -- --history            # top apps of the last 24 hours
 cargo run -p whereabouts-service -- --export flows.csv   # everything saved, as CSV
 cargo run -p whereabouts-service -- --delete-all --yes   # delete all saved data
 ```
- It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
+ It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received.
 
 ## Building from source
 
@@ -110,6 +111,8 @@ cargo test --workspace
 | `crates/store` | Encrypted local storage |
 | `crates/ipc` | Messages between the service and the app |
 | `crates/win-capture` | Windows network event capture |
+| `crates/win-pipe` | Locked-down local pipe between the service and the app |
+| `crates/win-secrets` | Database key protection (DPAPI) and the restricted data folder |
 | `crates/win-firewall` | Windows Filtering Platform block rules |
 | `service` | The background Windows service |
 | `ui` | The desktop app (Tauri), coming in v0.1 |

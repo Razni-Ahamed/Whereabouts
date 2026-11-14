@@ -5,7 +5,9 @@
 //! saves finished flows to the encrypted store; `--history`, `--export` and
 //! `--delete-all` work with what was saved.
 
+mod client;
 mod console;
+mod server;
 mod storage;
 
 use std::path::PathBuf;
@@ -20,6 +22,8 @@ Options:
                        save finished flows (must run as administrator;
                        stop with Ctrl+C)
   --seconds <N>        With --console, stop after N seconds
+  --status             Ask the running Whereabouts how it is doing, and show
+                       the top flows and apps
   --history            Show what is saved: top apps of the last 24 hours
   --export <FILE>      Write all saved flows to a CSV file
   --delete-all --yes   Delete all saved flows and totals (cannot be undone)
@@ -32,6 +36,7 @@ only), encrypted. Running as a Windows service is not implemented yet.";
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Console { limit: Option<Duration> },
+    Status,
     History,
     Export(PathBuf),
     DeleteAll { confirmed: bool },
@@ -42,6 +47,7 @@ enum Command {
 fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut console = false;
     let mut seconds = None;
+    let mut status = false;
     let mut history = false;
     let mut export = None;
     let mut delete_all = false;
@@ -57,6 +63,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     .map_err(|_| format!("--seconds expects a whole number, got {value:?}"))?;
                 seconds = Some(Duration::from_secs(n));
             }
+            "--status" => status = true,
             "--history" => history = true,
             "--export" => {
                 let value = iter.next().ok_or("--export needs a file name")?;
@@ -69,13 +76,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             other => return Err(format!("unknown option {other:?}")),
         }
     }
-    let chosen = [console, history, export.is_some(), delete_all]
+    let chosen = [console, status, history, export.is_some(), delete_all]
         .iter()
         .filter(|&&on| on)
         .count();
     if chosen > 1 {
         return Err(String::from(
-            "choose only one of --console, --history, --export, --delete-all",
+            "choose only one of --console, --status, --history, --export, --delete-all",
         ));
     }
     if seconds.is_some() && !console {
@@ -86,6 +93,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     Ok(if console {
         Command::Console { limit: seconds }
+    } else if status {
+        Command::Status
     } else if history {
         Command::History
     } else if let Some(path) = export {
@@ -101,6 +110,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Ok(Command::Console { limit }) => console::run(limit),
+        Ok(Command::Status) => client::status(),
         Ok(Command::History) => storage::show_history(),
         Ok(Command::Export(path)) => storage::export(&path),
         Ok(Command::DeleteAll { confirmed }) => storage::delete_all(confirmed),
@@ -152,6 +162,7 @@ mod tests {
 
     #[test]
     fn parses_storage_commands() {
+        assert_eq!(parse_args(&args(&["--status"])), Ok(Command::Status));
         assert_eq!(parse_args(&args(&["--history"])), Ok(Command::History));
         assert_eq!(
             parse_args(&args(&["--export", "out.csv"])),
@@ -176,5 +187,6 @@ mod tests {
         assert!(parse_args(&args(&["--export"])).is_err());
         assert!(parse_args(&args(&["--yes"])).is_err());
         assert!(parse_args(&args(&["--console", "--history"])).is_err());
+        assert!(parse_args(&args(&["--status", "--console"])).is_err());
     }
 }

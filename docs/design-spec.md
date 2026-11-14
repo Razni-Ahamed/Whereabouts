@@ -250,9 +250,17 @@ Main tables (simplified):
 
 ### 5.8 Service ↔ UI communication
 
-- **Named pipe** with a security descriptor that allows only SYSTEM and the interactive user who installed the app.
-- The service checks the **connecting process's signature** and refuses unsigned clients in release builds.
-- Messages are typed (shared `ipc` crate) and versioned. The UI can read data and send commands (block, unblock, mark as fine, delete data). It cannot run arbitrary queries.
+Implemented in M5a (`win-pipe` and `ipc` crates); `--console` serves the pipe and `--status` is a client.
+
+- **Named pipe** `\\.\pipe\Whereabouts`. Its permissions give full access to SYSTEM and Administrators and read/write access to the account running Whereabouts (in service mode, the user who installed it). **Network logons are denied** and remote clients are rejected (`PIPE_REJECT_REMOTE_CLIENTS`): the pipe works on this computer only.
+- **No squatting:** the service creates the pipe as its *first instance* (`FILE_FLAG_FIRST_PIPE_INSTANCE`), so it fails, rather than silently sharing the name, if another program created it first. It always keeps one instance waiting, so the name stays its own while it runs.
+- **Both sides check who is on the other end** before trusting it. The service asks Windows for the client's process ID and the client asks for the server's; each side then requires that process's running file (the kernel's image path) to be **the same file** as its own, compared by volume and file ID, not by name. Other programs are disconnected before anything is read from them. When the desktop app (a separate program) arrives in M6, this becomes "a Whereabouts program from the protected install folder, signed by the same publisher".
+- **Clients cannot be impersonated:** clients connect at the *anonymous* security level, so even an impostor server could not act with the client's rights.
+- **Messages** are typed (`ipc` crate) and versioned: each is a 4-byte length and JSON, at most 1 MiB, and larger lengths are refused before anything is read. Unknown message types and fields are refused. The first message must be `Hello` with the same protocol version. Limits are clamped (500 rows, 30 days of history). At most 4 clients are served at once.
+- **Requests so far:** `Hello`, `Status` (counters and health), `LiveFlows` (current flows, largest first) and `History` (per-app totals). Commands (block, unblock, mark as fine, delete data) come later. Clients cannot run arbitrary queries.
+- **Trust levels travel as fields**, not as markers in text (`publisher_confirmed`, `domain_trust`), so a display that shortens text cannot cut them off.
+- **Text from watched programs** (app file names, publisher names from code signatures) is made safe to show: control characters and invisible Unicode formatting characters (such as right-to-left overrides) are replaced with `?`, so a program cannot rewrite the terminal or disguise its name.
+- **Limitation:** the pipe check stops *other programs* from connecting directly. Malware running as the same user could still start or control a Whereabouts client and read what that user can see in the app (their own flows and history). Protecting an account from programs running as that account is outside what Whereabouts can do.
 
 ### 5.9 UI
 
@@ -383,7 +391,9 @@ This is the complete list. Anything not on it is a bug.
 
 | Adversary | Protection | Limitation |
 |---|---|---|
-| Other non-admin users or processes on the PC | DB file ACLs, DB encryption, named-pipe ACL + client signature check | – |
+| Other non-admin users or processes on the PC | DB file ACLs, DB encryption, named-pipe permissions (SYSTEM, Administrators and the account running Whereabouts; no network access) + client check (must be the same program file, compared by file ID) | Malware running as the *same* user can start or control a Whereabouts client and read what that user can see (§5.8) |
+| A program posing as the Whereabouts service on its pipe | The service creates the pipe as its first instance or fails; clients check the server's program file before sending anything, and connect at the anonymous level so they cannot be impersonated | – |
+| A program disguising its name or publisher with control or invisible Unicode characters | Replaced with `?` before display; domain names are limited to plain ASCII | – |
 | Someone with the disk (stolen laptop) | SQLCipher + DPAPI | DPAPI machine-scope keys can be recovered from an unencrypted Windows disk. **We recommend BitLocker** and say so in the UI. |
 | Malware with admin/SYSTEM rights | None. It can stop our service or read memory. | **Out of scope**, stated clearly. We may still observe its network activity before it acts. |
 | Malware hiding inside a trusted process | Attributed to the host process | Stated limitation (§5.3) |
