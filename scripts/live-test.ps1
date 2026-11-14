@@ -6,7 +6,8 @@
     1. Builds everything as the current user.
     2. Runs the live tests with administrator rights (one UAC prompt):
        - the ignored integration tests in crates/win-capture/tests/live_capture.rs
-       - a smoke test of `whereabouts-service --console` while curl.exe downloads a page
+       - a smoke test of `whereabouts-service --console` while curl.exe downloads a page,
+         including `--status` over the local pipe as administrator and as a normal user
     3. Prints PASS or FAIL and exits with 0 on success, 1 on failure.
 
     The tests make a few HTTPS requests to example.com. Logs, which contain
@@ -94,12 +95,19 @@ function Invoke-IntegrationTests {
     return $true
 }
 
+function Invoke-Service {
+    param([string]$Name, [string[]]$Arguments)
+    $process = Start-Logged -FilePath $ServiceExe -Name $Name -Arguments $Arguments
+    if (-not $process.WaitForExit(60000)) { $process.Kill() }
+    return Get-LoggedOutput -Name $Name
+}
+
 function Invoke-ConsoleSmokeTest {
     Write-Log '--- 2/3  Console smoke test ---'
     # Save into a temporary folder, never the real %ProgramData%\Whereabouts.
     $env:WHEREABOUTS_HOME = Join-Path $WorkDir 'home'
     $console = Start-Logged -FilePath $ServiceExe -Name 'console' -Arguments @(
-        '--console', '--seconds', '12')
+        '--console', '--seconds', '16')
     Start-Sleep -Seconds 4
     # Empty the DNS cache so curl's lookup is confirmed by the DNS service.
     & ipconfig /flushdns | Out-Null
@@ -112,6 +120,38 @@ function Invoke-ConsoleSmokeTest {
     $renamed = Start-Process -FilePath $renamedPath -NoNewWindow -Wait -PassThru -ArgumentList @(
         '--silent', '--output', 'NUL', '--max-time', '15', $TestUrl)
     Write-Log "    renamed-tool.exe (pid $($renamed.Id)) exited with $($renamed.ExitCode)"
+
+    # While the console runs, ask it for its status over the local pipe:
+    # as administrator, and as a normal user (as the desktop app will).
+    Start-Sleep -Seconds 3
+    $statusOk = $true
+    $status = Invoke-Service -Name 'status' -Arguments @('--status')
+    if ($status -notmatch 'is running' -or $status -notmatch 'Top flows now') {
+        Write-Log 'FAIL: --status (as administrator) did not get an answer from the console'
+        Write-Log $status
+        $statusOk = $false
+    } else {
+        Write-Log '    --status as administrator: answered'
+    }
+    $basicLog = Join-Path $WorkDir 'status-basic.log'
+    $basicCmd = Join-Path $WorkDir 'status-basic.cmd'
+    Set-Content -Path $basicCmd -Encoding ascii -Value "@`"$ServiceExe`" --status > `"$basicLog`" 2>&1"
+    # 0x20000 = "basic user": the same account without administrator rights.
+    & runas.exe /trustlevel:0x20000 $basicCmd | Out-Null
+    $deadline = (Get-Date).AddSeconds(15)
+    while (-not (Test-Path $basicLog) -or (Get-Item $basicLog).Length -eq 0) {
+        if ((Get-Date) -gt $deadline) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 500
+    $basic = if (Test-Path $basicLog) { Get-Content -Raw $basicLog } else { '' }
+    if ($basic -notmatch 'is running') {
+        Write-Log 'FAIL: --status as a normal user did not get an answer from the console'
+        Write-Log $basic
+        $statusOk = $false
+    } else {
+        Write-Log '    --status as a normal user: answered'
+    }
 
     if (-not $console.WaitForExit(60000)) {
         $console.Kill()
@@ -165,15 +205,9 @@ function Invoke-ConsoleSmokeTest {
             $passed = $false
         }
     }
+    if (-not $statusOk) { $passed = $false }
     if ($passed) { Write-Log 'ok: console smoke test' }
     return $passed
-}
-
-function Invoke-Service {
-    param([string]$Name, [string[]]$Arguments)
-    $process = Start-Logged -FilePath $ServiceExe -Name $Name -Arguments $Arguments
-    if (-not $process.WaitForExit(60000)) { $process.Kill() }
-    return Get-LoggedOutput -Name $Name
 }
 
 function Invoke-StorageTest {

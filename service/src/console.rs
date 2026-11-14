@@ -3,13 +3,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
 use whereabouts_core::privacy::is_web_browser;
+use whereabouts_core::text::display_safe;
 use whereabouts_enrich::{ATTRIBUTION, Enricher, Scope, registrable_domain};
+use whereabouts_ipc::{DomainTrust, FlowView, MAX_ROWS, PIPE_NAME, Status};
 use whereabouts_store::{FlowRecord, Store};
 use whereabouts_win_capture::identity::{DevicePaths, lock_running_image};
 use whereabouts_win_capture::resolver::IdentityResolver;
@@ -35,6 +38,9 @@ const PUBLISHER_WIDTH: usize = 22;
 
 /// Most program identities kept for display.
 const MAX_IDENTITIES: usize = 20_000;
+
+/// Longest text sent to clients per field, in characters.
+const CLIENT_TEXT: usize = 256;
 
 /// A flow together with the app name and process instance it had when
 /// recorded. The publisher is looked up from the instance's token when
@@ -145,6 +151,21 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     };
     let mut last_retention = Instant::now();
 
+    let live: crate::server::SharedState =
+        Arc::new(Mutex::new(crate::server::LiveState::default()));
+    let serving = match crate::server::start(PIPE_NAME, Arc::clone(&live)) {
+        Ok(()) => {
+            println!(
+                "Answering Whereabouts clients on {PIPE_NAME} (try --status in another terminal)"
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("warning: {error}");
+            false
+        }
+    };
+
     let started = Instant::now();
     let mut last_draw = Instant::now();
     let mut table = FlowTable::new();
@@ -223,9 +244,26 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                     last_retention = Instant::now();
                 }
             }
+            let view = View::collect(&table, &closed, &names);
+            if serving {
+                let counts = capture.counts();
+                let status = Status {
+                    uptime_secs: started.elapsed().as_secs(),
+                    events: counts.events,
+                    dropped: counts.dropped,
+                    unreadable: counts.malformed,
+                    rejected: counts.rejected,
+                    over_limit: view.over_limit,
+                    unattributed: view.unattributed,
+                    active_flows: u64::try_from(view.active).unwrap_or(u64::MAX),
+                    kernel_events_protected: capture.kernel_events_protected(),
+                    saving: store.is_some(),
+                    tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
+                };
+                publish(&live, &view, &names, &enricher, status);
+            }
             draw(
-                &table,
-                &closed,
+                &view,
                 &names,
                 &enricher,
                 capture.counts(),
@@ -263,8 +301,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         }
     }
     draw(
-        &table,
-        &closed,
+        &View::collect(&table, &closed, &names),
         &names,
         &enricher,
         capture.counts(),
@@ -428,19 +465,23 @@ impl ProcessNames {
     ///
     /// A `?` at the end means the file was checked by path only and could
     /// not be confirmed as the file the process ran.
-    fn publisher(&self, token: Option<u64>) -> String {
+    ///
+    /// The text is made safe to show and shortened to `max` characters.
+    fn publisher(&self, token: Option<u64>, max: usize) -> String {
+        let (text, confirmed) = self.publisher_parts(token);
+        marked(&text, if confirmed { "" } else { "?" }, max)
+    }
+
+    /// Publisher text (not yet made safe to show) and whether it was
+    /// confirmed as the running file. Placeholders count as confirmed:
+    /// there is nothing to qualify.
+    fn publisher_parts(&self, token: Option<u64>) -> (String, bool) {
         let Some(token) = token else {
-            return String::from("-");
+            return (String::from("-"), true);
         };
         match self.identities.get(&token) {
-            None => String::from("…"),
-            Some(identity) if identity.confirmed_running => {
-                truncate(&identity.publisher_text(), PUBLISHER_WIDTH)
-            }
-            Some(identity) => format!(
-                "{}?",
-                truncate(&identity.publisher_text(), PUBLISHER_WIDTH - 1)
-            ),
+            None => (String::from("…"), true),
+            Some(identity) => (identity.publisher_text(), identity.confirmed_running),
         }
     }
 }
@@ -636,44 +677,130 @@ fn app_name(key: &FlowKey, names: &ProcessNames) -> String {
     }
 }
 
+/// All current rows, active and recently closed, largest first, with the
+/// table's counters: what one refresh shows.
+#[derive(Debug)]
+struct View {
+    rows: Vec<Row>,
+    active: usize,
+    closed: usize,
+    over_limit: u64,
+    unattributed: u64,
+}
+
+impl View {
+    fn collect(table: &FlowTable, closed: &Closed, names: &ProcessNames) -> Self {
+        let mut rows: Vec<Row> = table
+            .snapshot()
+            .into_iter()
+            .map(|(key, stats)| Row {
+                app: app_name(&key, names),
+                token: token_for(&key, names),
+                key,
+                stats,
+                closed_at: None,
+                saved: false,
+            })
+            .collect();
+        let active = rows.len();
+        rows.extend(closed.rows.iter().cloned());
+        rows.sort_by(|a, b| {
+            b.stats
+                .total_bytes()
+                .cmp(&a.stats.total_bytes())
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        Self {
+            rows,
+            active,
+            closed: closed.rows.len(),
+            over_limit: table.overflowed_events(),
+            unattributed: table.shared_overflow_events(),
+        }
+    }
+}
+
+/// Replaces what clients see with the latest view.
+fn publish(
+    live: &Mutex<crate::server::LiveState>,
+    view: &View,
+    names: &ProcessNames,
+    enricher: &Enricher,
+    status: Status,
+) {
+    let max = usize::try_from(MAX_ROWS).unwrap_or(usize::MAX);
+    let flows: Vec<FlowView> = view
+        .rows
+        .iter()
+        .take(max)
+        .map(|row| flow_view(row, names, enricher))
+        .collect();
+    let mut live = live.lock().unwrap_or_else(PoisonError::into_inner);
+    live.status = status;
+    live.flows = flows;
+}
+
+/// A row as clients see it. Texts are made safe to show and bounded.
+fn flow_view(row: &Row, names: &ProcessNames, enricher: &Enricher) -> FlowView {
+    let (domain, owner, country, remote) = if row.key.is_overflow() {
+        (
+            None,
+            None,
+            None,
+            String::from("(many destinations: flow limit reached)"),
+        )
+    } else {
+        let (owner, country) = owner_and_country(row, enricher);
+        (
+            row.stats.domain.as_ref(),
+            (owner != "-").then(|| truncate(&owner, CLIENT_TEXT)),
+            (country != "--").then_some(country),
+            row.key.remote.to_string(),
+        )
+    };
+    let (publisher, publisher_confirmed) = names.publisher_parts(row.token);
+    FlowView {
+        pid: row.key.pid,
+        app: truncate(&row.app, CLIENT_TEXT),
+        publisher: truncate(&publisher, CLIENT_TEXT),
+        publisher_confirmed,
+        protocol: String::from(protocol_text(row.key.protocol)),
+        domain: domain.map(|label| truncate(&label.name, CLIENT_TEXT)),
+        domain_trust: domain.map(|label| domain_trust(label.source)),
+        owner,
+        country,
+        remote,
+        bytes_sent: row.stats.bytes_sent,
+        bytes_received: row.stats.bytes_received,
+        active: row.closed_at.is_none(),
+    }
+}
+
+fn protocol_text(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Tcp => "TCP",
+        Protocol::Udp => "UDP",
+    }
+}
+
 fn draw(
-    table: &FlowTable,
-    closed: &Closed,
+    view: &View,
     names: &ProcessNames,
     enricher: &Enricher,
     counts: CaptureCounts,
     elapsed: Duration,
 ) {
-    let mut rows: Vec<Row> = table
-        .snapshot()
-        .into_iter()
-        .map(|(key, stats)| Row {
-            app: app_name(&key, names),
-            token: token_for(&key, names),
-            key,
-            stats,
-            closed_at: None,
-            saved: false,
-        })
-        .collect();
-    let active = rows.len();
-    rows.extend(closed.rows.iter().cloned());
-    rows.sort_by(|a, b| {
-        b.stats
-            .total_bytes()
-            .cmp(&a.stats.total_bytes())
-            .then_with(|| a.key.cmp(&b.key))
-    });
-
+    let rows = &view.rows;
     println!();
     println!(
-        "── {}s · {active} active flows · {} closed · {} events · {} dropped · {} unreadable · {} over limit ──",
+        "── {}s · {} active flows · {} closed · {} events · {} dropped · {} unreadable · {} over limit ──",
         elapsed.as_secs(),
-        closed.rows.len(),
+        view.active,
+        view.closed,
         counts.events,
         counts.dropped,
         counts.malformed,
-        table.overflowed_events()
+        view.over_limit
     );
     if counts.rejected > 0 {
         println!(
@@ -682,11 +809,11 @@ fn draw(
             counts.rejected
         );
     }
-    if table.shared_overflow_events() > 0 {
+    if view.unattributed > 0 {
         println!(
             "!! {} events could not be attributed to a process: many processes are flooding the \
              flow table at once, which may be an attempt to evade monitoring.",
-            table.shared_overflow_events()
+            view.unattributed
         );
     }
     println!(
@@ -694,7 +821,10 @@ fn draw(
         "PID", "APP", "PUBLISHER", "PROTO", "DOMAIN", "OWNER", "CC", "REMOTE", "SENT", "RECEIVED"
     );
     for row in rows.iter().take(TOP_ROWS) {
-        println!("{}", format_row(row, &names.publisher(row.token), enricher));
+        println!(
+            "{}",
+            format_row(row, &names.publisher(row.token, PUBLISHER_WIDTH), enricher)
+        );
     }
     if rows.len() > TOP_ROWS {
         println!("  … and {} more", rows.len() - TOP_ROWS);
@@ -702,10 +832,7 @@ fn draw(
 }
 
 fn format_row(row: &Row, publisher: &str, enricher: &Enricher) -> String {
-    let proto = match row.key.protocol {
-        Protocol::Tcp => "TCP",
-        Protocol::Udp => "UDP",
-    };
+    let proto = protocol_text(row.key.protocol);
     let (domain, owner, country, remote) = if row.key.is_overflow() {
         (
             String::from("(many)"),
@@ -715,7 +842,12 @@ fn format_row(row: &Row, publisher: &str, enricher: &Enricher) -> String {
         )
     } else {
         let (owner, country) = owner_and_country(row, enricher);
-        (domain_text(row), owner, country, row.key.remote.to_string())
+        (
+            domain_text(row, 30).unwrap_or_else(|| String::from("-")),
+            owner,
+            country,
+            row.key.remote.to_string(),
+        )
     };
     format!(
         "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<26} {:<2} {:<40} {:>10} {:>10}",
@@ -789,16 +921,30 @@ fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| PathBuf::from("data"))
 }
 
-/// Domain column text: the name with a trust marker, or `-`.
-fn domain_text(row: &Row) -> String {
-    match &row.stats.domain {
-        Some(label) => match label.source {
-            LabelSource::Verified => truncate(&label.name, 30),
-            LabelSource::Unverified => format!("{}?", truncate(&label.name, 29)),
-            LabelSource::Inferred => format!("{}*", truncate(&label.name, 29)),
-        },
-        None => String::from("-"),
+/// Domain text with its trust marker, at most `max` characters, if the
+/// flow has a domain.
+fn domain_text(row: &Row, max: usize) -> Option<String> {
+    let label = row.stats.domain.as_ref()?;
+    Some(marked(
+        &label.name,
+        domain_trust(label.source).marker(),
+        max,
+    ))
+}
+
+fn domain_trust(source: LabelSource) -> DomainTrust {
+    match source {
+        LabelSource::Verified => DomainTrust::Verified,
+        LabelSource::Unverified => DomainTrust::AppReported,
+        LabelSource::Inferred => DomainTrust::Guessed,
     }
+}
+
+/// Like [`truncate`], but keeps `marker` (such as a `?` trust marker) at
+/// the end: only the text before it is shortened.
+pub(crate) fn marked(text: &str, marker: &str, max: usize) -> String {
+    let room = max.saturating_sub(marker.chars().count());
+    format!("{}{marker}", truncate(text, room))
 }
 
 /// Returns the last component of a Windows or Unix path.
@@ -806,10 +952,12 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// Shortens `text` to at most `max` characters, marking the cut with `…`.
+/// Makes `text` safe to show (see [`display_safe`]) and shortens it to at
+/// most `max` characters, marking the cut with `…`.
 pub(crate) fn truncate(text: &str, max: usize) -> String {
+    let text = display_safe(text);
     if text.chars().count() <= max {
-        text.to_owned()
+        text
     } else {
         let kept: String = text.chars().take(max.saturating_sub(1)).collect();
         format!("{kept}…")

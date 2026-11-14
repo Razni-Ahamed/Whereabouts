@@ -102,6 +102,16 @@ pub fn lock_running_image(pid: u32) -> Option<(String, File)> {
     same_file.then_some((path, file))
 }
 
+/// Whether `a` and `b` are the same file, compared by file ID rather than by
+/// name (so case, `..`, short names or links cannot fool it). `false` if
+/// either cannot be opened.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (File::open(a), File::open(b)) {
+        (Ok(a), Ok(b)) => matches!((file_id(&a), file_id(&b)), (Some(x), Some(y)) if x == y),
+        _ => false,
+    }
+}
+
 /// Returns the volume serial number and 128-bit file ID of an open file:
 /// what identifies the file itself, whatever its name.
 fn file_id(file: &File) -> Option<(u64, [u8; 16])> {
@@ -578,6 +588,21 @@ mod tests {
 
         drop(locked);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_file_compares_files_not_names() {
+        let dir = temp_dir("same-file");
+        let a = dir.join("a.exe");
+        let b = dir.join("b.exe");
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"one").unwrap();
+        assert!(same_file(&a, &a));
+        // The same file by another spelling of its path.
+        let folder = dir.file_name().unwrap();
+        assert!(same_file(&a, &dir.join("..").join(folder).join("A.EXE")));
+        assert!(!same_file(&a, &b), "same content, different files");
+        assert!(!same_file(&a, &dir.join("missing.exe")));
     }
 
     #[test]

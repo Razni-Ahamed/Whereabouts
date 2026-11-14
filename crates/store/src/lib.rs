@@ -202,6 +202,9 @@ impl Store {
             }
             Err(error) => return Err(error.into()),
         }
+        // The service and its pipe clients' requests use separate
+        // connections; wait for a moment rather than fail if one is writing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "secure_delete", true)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let store = Self { conn };
