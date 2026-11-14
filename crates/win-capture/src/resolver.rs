@@ -31,7 +31,9 @@ const MAX_CACHED: usize = 10_000;
 struct Request {
     token: u64,
     path: String,
-    /// The file, already opened and locked by the caller, if it could be.
+    /// The file, already opened and locked by the caller and confirmed to
+    /// be the process's running image (see
+    /// [`crate::identity::lock_running_image`]), if it could be.
     file: Option<File>,
     pid: Option<u32>,
 }
@@ -80,9 +82,10 @@ impl IdentityResolver {
     /// Asks for the identity of the program at `path` (a drive-letter
     /// path) for one process instance, identified by `token`.
     ///
-    /// Pass `file` if the caller already opened and locked the program file
-    /// (see [`crate::identity::open_locked`]), ideally while the process was
-    /// still running; it is then checked instead of reopening `path`.
+    /// Pass `file` if the caller locked the process's running image with
+    /// [`crate::identity::lock_running_image`]; it is then checked instead of
+    /// reopening `path`, and the result is marked as confirmed. Without it,
+    /// `path` is opened and the result is marked as unconfirmed.
     ///
     /// Returns `true` if the request is queued or already waiting, `false`
     /// if the queue is full (ask again later).
@@ -134,6 +137,7 @@ impl IdentityResolver {
 fn identify_cached(cache: &mut HashMap<String, Signature>, request: &Request) -> AppIdentity {
     let path = Path::new(&request.path);
     let package_family_name = request.pid.and_then(package_family_name);
+    let confirmed_running = request.file.is_some();
     let opened = match &request.file {
         Some(file) => file.try_clone(),
         None => open_locked(path),
@@ -145,6 +149,7 @@ fn identify_cached(cache: &mut HashMap<String, Signature>, request: &Request) ->
             sha256: None,
             size: None,
             package_family_name,
+            confirmed_running: false,
         };
     };
     let (size, sha256) = size_and_hash(&file);
@@ -169,6 +174,7 @@ fn identify_cached(cache: &mut HashMap<String, Signature>, request: &Request) ->
         sha256,
         size,
         package_family_name,
+        confirmed_running,
     }
 }
 
@@ -206,6 +212,8 @@ mod tests {
         assert_eq!(done[1].0, 2);
         assert!(matches!(done[0].1.signature, Signature::Signed { .. }));
         assert_eq!(done[0].1.signature, done[1].1.signature);
+        // Checked by path only: not confirmed as a running process's file.
+        assert!(!done[0].1.confirmed_running);
         assert!(resolver.is_idle());
     }
 
