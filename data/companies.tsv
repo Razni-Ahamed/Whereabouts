@@ -1,0 +1,123 @@
+# Whereabouts company list: which company runs a tracking or analytics
+# service, and what kind of service it is.
+#
+# Written for Whereabouts and licensed like the rest of the project
+# (GPL-3.0-or-later). It is NOT copied from any non-commercial list.
+# Ownership is as of November 2026; corrections are welcome.
+#
+# Format: domain <TAB> company <TAB> category
+#   - domain matches itself and all its subdomains
+#   - category is one of: ads, analytics, attribution, customer-data,
+#     diagnostics, messaging, session-replay, social
+#
+# Keep entries to services whose main purpose is tracking, advertising,
+# analytics, diagnostics or messaging. General cloud, CDN and API domains
+# are named by the IP network owner instead.
+
+# Google
+doubleclick.net	Google	ads
+googlesyndication.com	Google	ads
+googleadservices.com	Google	ads
+google-analytics.com	Google	analytics
+googletagmanager.com	Google	analytics
+app-measurement.com	Google (Firebase)	analytics
+firebaselogging-pa.googleapis.com	Google (Firebase)	analytics
+crashlytics.com	Google (Firebase)	diagnostics
+
+# Meta
+facebook.net	Meta	social
+graph.facebook.com	Meta	social
+
+# Microsoft
+clarity.ms	Microsoft (Clarity)	session-replay
+bat.bing.com	Microsoft	ads
+adnxs.com	Microsoft (Xandr)	ads
+events.data.microsoft.com	Microsoft	analytics
+vortex.data.microsoft.com	Microsoft	analytics
+ads.linkedin.com	LinkedIn	ads
+
+# Amazon
+amazon-adsystem.com	Amazon	ads
+
+# Adobe
+demdex.net	Adobe	customer-data
+omtrdc.net	Adobe	analytics
+2o7.net	Adobe	analytics
+everesttech.net	Adobe	ads
+
+# Oracle
+bluekai.com	Oracle	customer-data
+
+# X (Twitter)
+ads-twitter.com	X	ads
+analytics.twitter.com	X	analytics
+
+# Other social platforms
+ct.pinterest.com	Pinterest	ads
+tr.snapchat.com	Snap	ads
+sc-static.net	Snap	ads
+analytics.tiktok.com	ByteDance (TikTok)	analytics
+pangle.io	ByteDance (Pangle)	ads
+
+# Advertising
+criteo.com	Criteo	ads
+criteo.net	Criteo	ads
+taboola.com	Taboola	ads
+outbrain.com	Outbrain	ads
+applovin.com	AppLovin	ads
+applvn.com	AppLovin	ads
+unityads.unity3d.com	Unity	ads
+supersonicads.com	Unity (ironSource)	ads
+
+# Audience measurement and web analytics
+scorecardresearch.com	Comscore	analytics
+imrworldwide.com	Nielsen	analytics
+quantserve.com	Quantcast	analytics
+quantcount.com	Quantcast	analytics
+chartbeat.com	Chartbeat	analytics
+chartbeat.net	Chartbeat	analytics
+cloudflareinsights.com	Cloudflare	analytics
+mc.yandex.ru	Yandex (Metrica)	analytics
+appmetrica.yandex.net	Yandex (AppMetrica)	analytics
+hs-analytics.net	HubSpot	analytics
+hs-scripts.com	HubSpot	analytics
+
+# Product analytics
+mixpanel.com	Mixpanel	analytics
+amplitude.com	Amplitude	analytics
+heapanalytics.com	Heap	analytics
+posthog.com	PostHog	analytics
+optimizely.com	Optimizely	analytics
+
+# Customer data platforms
+segment.io	Twilio (Segment)	customer-data
+segment.com	Twilio (Segment)	customer-data
+
+# Session recording
+hotjar.com	Hotjar	session-replay
+hotjar.io	Hotjar	session-replay
+fullstory.com	FullStory	session-replay
+mouseflow.com	Mouseflow	session-replay
+
+# Mobile app install attribution
+branch.io	Branch	attribution
+app.link	Branch	attribution
+appsflyer.com	AppsFlyer	attribution
+appsflyersdk.com	AppsFlyer	attribution
+kochava.com	Kochava	attribution
+singular.net	Singular	attribution
+
+# Customer messaging and push notifications
+braze.com	Braze	messaging
+appboy.com	Braze	messaging
+onesignal.com	OneSignal	messaging
+urbanairship.com	Airship	messaging
+intercom.io	Intercom	messaging
+
+# Crash and error reporting
+sentry.io	Sentry	diagnostics
+bugsnag.com	Bugsnag	diagnostics
+newrelic.com	New Relic	diagnostics
+nr-data.net	New Relic	diagnostics
+datadoghq.com	Datadog	diagnostics
+datadoghq.eu	Datadog	diagnostics

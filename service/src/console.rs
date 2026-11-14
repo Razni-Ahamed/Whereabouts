@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
+use whereabouts_enrich::{ATTRIBUTION, Enricher, Scope};
 use whereabouts_win_capture::identity::{DevicePaths, lock_running_image};
 use whereabouts_win_capture::resolver::IdentityResolver;
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
@@ -66,9 +67,24 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
         "Domains: plain = confirmed by the Windows DNS service · ? = reported only by the app"
     );
     println!("         itself (could be false) · * = guessed from another app's lookup");
+    println!("Publisher: from the program's code signature · ? = checked by file path only, not");
+    println!("           confirmed as the file the process ran (e.g. it had already exited)");
+
+    let (enricher, data) = Enricher::load(&data_dir());
     println!(
-        "Publisher: from the program's code signature · ? = checked by file path only; not          confirmed as the file the process ran (e.g. it had already exited)"
+        "Offline data: {} tracker domains · {} company domains{}",
+        data.tracker_domains,
+        data.company_domains,
+        if data.missing.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · missing {} (run scripts/update-data.ps1)",
+                data.missing.join(", ")
+            )
+        }
     );
+    println!("Data credits: {ATTRIBUTION}");
 
     let started = Instant::now();
     let mut last_draw = Instant::now();
@@ -138,7 +154,14 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 &names,
                 table.take_idle(SystemTime::now(), IDLE_AFTER),
             );
-            draw(&table, &closed, &names, capture.counts(), started.elapsed());
+            draw(
+                &table,
+                &closed,
+                &names,
+                &enricher,
+                capture.counts(),
+                started.elapsed(),
+            );
             last_draw = Instant::now();
         }
         if limit.is_some_and(|limit| started.elapsed() >= limit) {
@@ -147,7 +170,14 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     }
 
     names.settle(Duration::from_secs(5));
-    draw(&table, &closed, &names, capture.counts(), started.elapsed());
+    draw(
+        &table,
+        &closed,
+        &names,
+        &enricher,
+        capture.counts(),
+        started.elapsed(),
+    );
     // Release any process event waiting for queue space before stopping.
     drop(receiver);
     if let Err(error) = capture.stop() {
@@ -435,6 +465,7 @@ fn draw(
     table: &FlowTable,
     closed: &VecDeque<Row>,
     names: &ProcessNames,
+    enricher: &Enricher,
     counts: CaptureCounts,
     elapsed: Duration,
 ) {
@@ -482,41 +513,103 @@ fn draw(
         );
     }
     println!(
-        "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<40} {:>10} {:>10}",
-        "PID", "APP", "PUBLISHER", "PROTO", "DOMAIN", "REMOTE", "SENT", "RECEIVED"
+        "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<26} {:<2} {:<40} {:>10} {:>10}",
+        "PID", "APP", "PUBLISHER", "PROTO", "DOMAIN", "OWNER", "CC", "REMOTE", "SENT", "RECEIVED"
     );
     for row in rows.iter().take(TOP_ROWS) {
-        println!("{}", format_row(row, &names.publisher(row.token)));
+        println!("{}", format_row(row, &names.publisher(row.token), enricher));
     }
     if rows.len() > TOP_ROWS {
         println!("  … and {} more", rows.len() - TOP_ROWS);
     }
 }
 
-fn format_row(row: &Row, publisher: &str) -> String {
+fn format_row(row: &Row, publisher: &str, enricher: &Enricher) -> String {
     let proto = match row.key.protocol {
         Protocol::Tcp => "TCP",
         Protocol::Udp => "UDP",
     };
-    let (domain, remote) = if row.key.is_overflow() {
+    let (domain, owner, country, remote) = if row.key.is_overflow() {
         (
             String::from("(many)"),
+            String::from("-"),
+            String::from("--"),
             String::from("(many destinations: flow limit reached)"),
         )
     } else {
-        (domain_text(row), row.key.remote.to_string())
+        let (owner, country) = owner_and_country(row, enricher);
+        (domain_text(row), owner, country, row.key.remote.to_string())
     };
     format!(
-        "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<40} {:>10} {:>10}",
+        "{:>6}  {:<20} {:<22} {:<5} {:<30} {:<26} {:<2} {:<40} {:>10} {:>10}",
         row.key.pid,
         truncate(&row.app, 20),
         truncate(publisher, PUBLISHER_WIDTH),
         proto,
         domain,
+        truncate(&owner, 26),
+        country,
         remote,
         format_bytes(row.stats.bytes_sent),
         format_bytes(row.stats.bytes_received)
     )
+}
+
+/// OWNER and CC column texts for a row.
+///
+/// The owner is the company and kind of service when the domain is a known
+/// tracking or analytics service, otherwise the organisation that runs the
+/// IP address's network. A domain the app only reported about itself (`?`)
+/// could be fake, so its company is not used; the network owner, which
+/// comes from the IP address itself, is shown instead.
+fn owner_and_country(row: &Row, enricher: &Enricher) -> (String, String) {
+    let ip = enricher.ip(row.key.remote.ip());
+    let country = ip.country.clone().unwrap_or_else(|| String::from("--"));
+    match ip.scope {
+        Scope::Local => return (String::from("local network"), country),
+        Scope::Multicast => return (String::from("multicast"), country),
+        Scope::Internet => {}
+    }
+    let trusted_domain = row
+        .stats
+        .domain
+        .as_ref()
+        .filter(|label| label.source != LabelSource::Unverified);
+    if let Some(label) = trusted_domain {
+        let info = enricher.domain(&label.name);
+        if let Some(company) = info.company {
+            return (format!("{} · {}", company.name, company.category), country);
+        }
+        if info.tracker {
+            let network = ip.network.as_deref().unwrap_or("unknown");
+            return (format!("tracker · {network}"), country);
+        }
+    }
+    (ip.network.unwrap_or_else(|| String::from("-")), country)
+}
+
+/// Finds the folder with the offline data files: `WHEREABOUTS_DATA`, a
+/// `data` folder next to the program or in the current folder, or the
+/// project's `data` folder for development builds.
+fn data_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("WHEREABOUTS_DATA") {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("data"));
+            // target\debug\whereabouts-service.exe -> project\data
+            candidates.push(dir.join("..").join("..").join("data"));
+        }
+    }
+    candidates.push(PathBuf::from("data"));
+    candidates
+        .iter()
+        .find(|dir| dir.join(whereabouts_enrich::EASYPRIVACY_FILE).is_file())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("data"))
 }
 
 /// Domain column text: the name with a trust marker, or `-`.
@@ -564,6 +657,72 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use whereabouts_core::dns::DomainLabel;
+    use whereabouts_enrich::{CompanyList, GeoDatabases, TrackerList};
+
+    fn enricher() -> Enricher {
+        Enricher::from_parts(
+            TrackerList::parse("||tracker.example^\n"),
+            CompanyList::built_in(),
+            GeoDatabases::default(),
+        )
+    }
+
+    fn row_to(remote: &str, domain: Option<(&str, LabelSource)>) -> Row {
+        let mut stats = FlowStats::new(SystemTime::UNIX_EPOCH);
+        stats.domain = domain.map(|(name, source)| DomainLabel {
+            name: Arc::from(name),
+            source,
+        });
+        Row {
+            app: String::from("app.exe"),
+            token: None,
+            key: FlowKey {
+                pid: 7,
+                protocol: Protocol::Tcp,
+                remote: remote.parse().unwrap(),
+            },
+            stats,
+        }
+    }
+
+    #[test]
+    fn owner_shows_the_company_behind_known_services() {
+        let row = row_to(
+            "142.250.0.1:443",
+            Some(("app-measurement.com", LabelSource::Verified)),
+        );
+        let (owner, _) = owner_and_country(&row, &enricher());
+        assert_eq!(owner, "Google (Firebase) · analytics");
+    }
+
+    #[test]
+    fn owner_marks_listed_trackers_without_a_known_company() {
+        let row = row_to(
+            "203.0.113.5:443",
+            Some(("x.tracker.example", LabelSource::Inferred)),
+        );
+        let (owner, _) = owner_and_country(&row, &enricher());
+        assert!(owner.starts_with("tracker · "), "{owner}");
+    }
+
+    #[test]
+    fn a_name_only_the_app_reported_never_supplies_the_company() {
+        // The app could claim any name, so the network owner is used instead.
+        let row = row_to(
+            "203.0.113.5:443",
+            Some(("app-measurement.com", LabelSource::Unverified)),
+        );
+        let (owner, _) = owner_and_country(&row, &enricher());
+        assert_eq!(owner, "-");
+    }
+
+    #[test]
+    fn local_addresses_are_labelled_as_such() {
+        let row = row_to("192.168.1.1:53", None);
+        assert_eq!(owner_and_country(&row, &enricher()).0, "local network");
+    }
     use whereabouts_core::model::NetEventKind;
 
     fn at(secs: u64) -> SystemTime {

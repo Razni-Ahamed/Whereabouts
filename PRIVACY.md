@@ -50,6 +50,12 @@ This is the complete list. You can turn off both.
 
 Both downloads are digitally signed, and Whereabouts rejects any file that fails the signature check. Whereabouts monitors itself like every other app, so you can check this list against what it actually does.
 
+## Company and country information
+
+To show who is behind a connection and in which country, Whereabouts uses databases stored on your computer (DB-IP for countries and network owners, EasyPrivacy for tracker domains, and its own company list). It never sends an address or a domain name to an online lookup service.
+
+Data credits: IP geolocation by [DB-IP](https://db-ip.com) (CC BY 4.0). Tracker list: EasyPrivacy by the [EasyList authors](https://easylist.to) (GPL-3.0). Domain suffixes: [Public Suffix List](https://publicsuffix.org) (MPL-2.0).
+
 ## Checking which app is which
 
 To tell you who really made an app, Whereabouts checks the program file's digital signature and computes its hash, on your computer. Windows normally lets signature checks contact certificate servers on the internet; Whereabouts turns that off, so this check never sends anything out. Only programs that use the network are checked.

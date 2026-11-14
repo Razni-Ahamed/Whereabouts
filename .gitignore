@@ -21,6 +21,12 @@
 *.pcapng
 *.etl
 
+# Third-party offline databases: downloaded by scripts/update-data.ps1
+/data/*.mmdb
+/data/*.mmdb.gz
+/data/easyprivacy.txt
+/data/SOURCES.generated.txt
+
 # Lab, ML and experiment artefacts
 lab/output/
 lab/data/raw/

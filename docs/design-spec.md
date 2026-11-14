@@ -201,6 +201,14 @@ Facts about the DNS Client provider (`Microsoft-Windows-DNS-Client`), verified o
 
 All of these ship inside the app and update through signed downloads (§7).
 
+**Decision D3 (2026-11-14):** Disconnect, DuckDuckGo Tracker Radar and Ghostery TrackerDB are all CC BY-NC-SA 4.0 (non-commercial) and are **not** used. Whereabouts uses EasyPrivacy (GPL-3.0-or-later / CC BY-SA 3.0) for "is this a tracker", its own `data/companies.tsv` (GPL) for the company behind well-known services, and DB-IP Lite ASN data for the network owner of every other address. Implemented in the `enrich` crate. During development the third-party files are downloaded by `scripts/update-data.ps1` and not committed; signed in-app updates come in v0.2.
+
+| Fact (verified 2026-11-14) | Consequence |
+|---|---|
+| EasyPrivacy lists many trackers with request-type options, e.g. `\|\|google-analytics.com^$script,third-party,xmlhttprequest`. | Whole-domain rules whose options only name request types count; rules limited to particular websites (`$domain=`), paths, or with other options do not. |
+| DB-IP Lite has gaps (e.g. no owner for some Cloudflare IPv6 ranges) and gives one country for addresses used worldwide. | Shown as `-`; country documented as an estimate for CDN addresses. |
+| A domain name the app reported about itself may be fake (§5.4). | The OWNER column never takes the company from an *unverified* name; it falls back to the IP's network owner, which comes from the address itself. |
+
 ### 5.6 Blocking
 
 - Blocking uses **user-mode WFP filters**. No custom kernel driver is needed, which avoids the cost and risk of a signed driver.
