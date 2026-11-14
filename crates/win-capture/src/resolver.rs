@@ -12,6 +12,7 @@
 //! every time.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
@@ -30,6 +31,8 @@ const MAX_CACHED: usize = 10_000;
 struct Request {
     token: u64,
     path: String,
+    /// The file, already opened and locked by the caller, if it could be.
+    file: Option<File>,
     pid: Option<u32>,
 }
 
@@ -75,16 +78,28 @@ impl IdentityResolver {
     }
 
     /// Asks for the identity of the program at `path` (a drive-letter
-    /// path) for one process instance, identified by `token`. Returns
-    /// `true` if the request is queued or already waiting, `false` if the
-    /// queue is full (ask again later).
-    pub fn request(&mut self, token: u64, path: &str, pid: Option<u32>) -> bool {
+    /// path) for one process instance, identified by `token`.
+    ///
+    /// Pass `file` if the caller already opened and locked the program file
+    /// (see [`crate::identity::open_locked`]), ideally while the process was
+    /// still running; it is then checked instead of reopening `path`.
+    ///
+    /// Returns `true` if the request is queued or already waiting, `false`
+    /// if the queue is full (ask again later).
+    pub fn request(
+        &mut self,
+        token: u64,
+        path: &str,
+        file: Option<File>,
+        pid: Option<u32>,
+    ) -> bool {
         if self.pending.contains(&token) {
             return true;
         }
         let request = Request {
             token,
             path: path.to_owned(),
+            file,
             pid,
         };
         match self.requests.try_send(request) {
@@ -119,7 +134,11 @@ impl IdentityResolver {
 fn identify_cached(cache: &mut HashMap<String, Signature>, request: &Request) -> AppIdentity {
     let path = Path::new(&request.path);
     let package_family_name = request.pid.and_then(package_family_name);
-    let Ok(file) = open_locked(path) else {
+    let opened = match &request.file {
+        Some(file) => file.try_clone(),
+        None => open_locked(path),
+    };
+    let Ok(file) = opened else {
         return AppIdentity {
             path: request.path.clone(),
             signature: Signature::Unknown,
@@ -176,9 +195,9 @@ mod tests {
     #[test]
     fn resolves_each_process_in_the_background() {
         let mut resolver = IdentityResolver::start();
-        assert!(resolver.request(1, &curl(), None));
-        assert!(resolver.request(1, &curl(), None)); // already pending
-        assert!(resolver.request(2, &curl(), None)); // another process
+        assert!(resolver.request(1, &curl(), None, None));
+        assert!(resolver.request(1, &curl(), None, None)); // already pending
+        assert!(resolver.request(2, &curl(), None, None)); // another process
 
         let mut done = wait_for(&mut resolver, 2);
         done.sort_by_key(|(token, _)| *token);
@@ -200,7 +219,7 @@ mod tests {
         // First the genuine, signed program...
         std::fs::copy(curl(), &app).unwrap();
         let mut resolver = IdentityResolver::start();
-        resolver.request(1, &path, None);
+        resolver.request(1, &path, None, None);
         let first = wait_for(&mut resolver, 1);
         assert!(matches!(first[0].1.signature, Signature::Signed { .. }));
 
@@ -215,7 +234,7 @@ mod tests {
         file.set_modified(original.modified().unwrap()).unwrap();
         drop(file);
 
-        resolver.request(2, &path, None);
+        resolver.request(2, &path, None, None);
         let second = wait_for(&mut resolver, 1);
         assert!(
             !matches!(second[0].1.signature, Signature::Signed { .. }),

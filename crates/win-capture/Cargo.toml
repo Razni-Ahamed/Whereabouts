@@ -23,6 +23,7 @@ windows = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Diagnostics_Etw",
+    "Win32_System_ProcessStatus",
     "Win32_System_Services",
     "Win32_System_Threading",
 ] }
