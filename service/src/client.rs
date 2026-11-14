@@ -48,7 +48,7 @@ impl Client {
             })?;
         // Before sending anything, make sure no other program has taken the
         // pipe's name to pose as Whereabouts.
-        if !crate::server::is_whereabouts(connection.peer_pid()) {
+        if !crate::server::is_whereabouts(connection.peer_pid(), connection.connected_by()) {
             return Err(String::from(
                 "the program answering on the Whereabouts pipe is not this copy of \
                  Whereabouts, so it is not trusted",

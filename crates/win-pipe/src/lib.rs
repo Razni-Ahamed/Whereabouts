@@ -20,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+use std::time::SystemTime;
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
@@ -28,8 +29,8 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    TokenUser,
+    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+    TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_ANONYMOUS,
@@ -42,6 +43,18 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{HRESULT, HSTRING, PWSTR};
 
+/// Access the account running Whereabouts gets on the pipe, and all a
+/// client asks for: read (`FILE_GENERIC_READ`) and write data
+/// (`FILE_WRITE_DATA`), plus `FILE_WRITE_EA` and `FILE_WRITE_ATTRIBUTES`.
+///
+/// Deliberately *not* generic write: for a pipe, `FILE_APPEND_DATA` means
+/// `FILE_CREATE_PIPE_INSTANCE`, which would let any program running as
+/// that account add its own instances of our pipe and receive our clients.
+const USER_ACCESS: u32 = 0x0012_019B;
+
+/// What a client opens the pipe with: `FILE_GENERIC_READ | FILE_WRITE_DATA`.
+const CLIENT_ACCESS: u32 = 0x0012_008B;
+
 /// Win32 error: all pipe instances are busy.
 const ERROR_PIPE_BUSY: i32 = 231;
 
@@ -51,6 +64,28 @@ const BUFFER: u32 = 64 * 1024;
 /// Returns the security identifier (e.g. `S-1-5-21-…`) of the account this
 /// process runs as.
 pub fn current_user_sid() -> io::Result<String> {
+    token_sid(TokenUser, |buffer| {
+        // SAFETY: the buffer holds a TOKEN_USER (read unaligned, since a
+        // Vec<u8> has no alignment guarantee).
+        let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
+        user.User.Sid
+    })
+}
+
+/// Returns the security identifier that owns what this process creates:
+/// Administrators for an elevated administrator, SYSTEM for a service, and
+/// the user themself otherwise.
+fn current_owner_sid() -> io::Result<String> {
+    token_sid(TokenOwner, |buffer| {
+        // SAFETY: the buffer holds a TOKEN_OWNER (read unaligned).
+        let owner: TOKEN_OWNER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
+        owner.Owner
+    })
+}
+
+/// Reads one SID-valued property of this process's token as text.
+/// `sid_of` finds the SID in the returned buffer (it points into it).
+fn token_sid(class: TOKEN_INFORMATION_CLASS, sid_of: impl Fn(&[u8]) -> PSID) -> io::Result<String> {
     let mut token = HANDLE::default();
     // SAFETY: GetCurrentProcess returns a pseudo-handle; `token` is writable.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
@@ -58,26 +93,24 @@ pub fn current_user_sid() -> io::Result<String> {
     let result = (|| {
         let mut needed = 0u32;
         // SAFETY: first call only asks for the size.
-        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+        let _ = unsafe { GetTokenInformation(token, class, None, 0, &mut needed) };
         let mut buffer = vec![0u8; usize::try_from(needed).unwrap_or(0)];
         // SAFETY: `buffer` has room for `needed` bytes.
         unsafe {
             GetTokenInformation(
                 token,
-                TokenUser,
+                class,
                 Some(buffer.as_mut_ptr().cast()),
                 needed,
                 &mut needed,
             )
         }
         .map_err(|e| io::Error::other(format!("GetTokenInformation failed: {e}")))?;
-        // SAFETY: the buffer now holds a TOKEN_USER (read unaligned, since a
-        // Vec<u8> has no alignment guarantee).
-        let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
+        let sid = sid_of(&buffer);
         let mut text = PWSTR::null();
         // SAFETY: the SID points into `buffer`, which is alive; `text`
         // receives a LocalAlloc'd string freed below.
-        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) }
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }
             .map_err(|e| io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
         // SAFETY: `text` is a valid null-terminated string from the call.
         let sid = unsafe { text.to_string() }.map_err(io::Error::other);
@@ -90,23 +123,36 @@ pub fn current_user_sid() -> io::Result<String> {
     result
 }
 
-/// Pipe permissions: full access for SYSTEM and Administrators, read and
-/// write for `user_sid`, and network logons denied.
-fn pipe_sddl(user_sid: &str) -> io::Result<String> {
-    // A SID string only contains "S", digits and dashes; refuse anything else
-    // so it cannot change the meaning of the descriptor.
-    let valid = user_sid.starts_with("S-")
-        && user_sid[2..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'-');
-    if !valid {
-        return Err(io::Error::new(
+/// Refuses anything but a SID string ("S", digits and dashes), so it cannot
+/// change the meaning of a security descriptor.
+fn checked_sid(sid: &str) -> io::Result<&str> {
+    let valid = sid.starts_with("S-") && sid[2..].bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    if valid {
+        Ok(sid)
+    } else {
+        Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a valid account identifier",
-        ));
+        ))
     }
+}
+
+/// Pipe permissions: network logons denied; full access for SYSTEM,
+/// Administrators and `server_sid` (the owner of what the server creates,
+/// which needs to add the pipe's next instances); read and write, but not
+/// creating instances (see [`USER_ACCESS`]), for `user_sid`.
+///
+/// When Whereabouts runs elevated or as a service, `server_sid` is
+/// Administrators or SYSTEM, so other programs of the user cannot add
+/// instances. Only an unelevated server (development and tests) gives its
+/// own account that right, and there the server and the account's other
+/// programs cannot be told apart anyway.
+fn pipe_sddl(server_sid: &str, user_sid: &str) -> io::Result<String> {
+    let server_sid = checked_sid(server_sid)?;
+    let user_sid = checked_sid(user_sid)?;
     Ok(format!(
-        "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{user_sid})"
+        "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{server_sid})\
+         (A;;0x{USER_ACCESS:08x};;;{user_sid})"
     ))
 }
 
@@ -163,7 +209,11 @@ impl PipeListener {
     /// Administrators and `user_sid` may open. Fails if the name is already
     /// taken by another program.
     pub fn bind(name: &str, user_sid: &str) -> io::Result<Self> {
-        let descriptor = Descriptor::from_sddl(&pipe_sddl(user_sid)?)?;
+        Self::bind_as(name, &current_owner_sid()?, user_sid)
+    }
+
+    fn bind_as(name: &str, server_sid: &str, user_sid: &str) -> io::Result<Self> {
+        let descriptor = Descriptor::from_sddl(&pipe_sddl(server_sid, user_sid)?)?;
         let mut listener = Self {
             name: HSTRING::from(name),
             descriptor,
@@ -219,6 +269,8 @@ impl PipeListener {
             Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => {}
             Err(error) => return Err(io::Error::other(format!("ConnectNamedPipe: {error}"))),
         }
+        // The client connected at or before this moment.
+        let connected_by = SystemTime::now();
         let mut client_pid = 0u32;
         // SAFETY: `handle` is a connected pipe; `client_pid` is writable.
         unsafe { GetNamedPipeClientProcessId(handle, &mut client_pid) }
@@ -228,6 +280,7 @@ impl PipeListener {
         Ok(PipeConnection {
             file,
             peer_pid: client_pid,
+            connected_by,
         })
     }
 }
@@ -237,12 +290,22 @@ impl PipeListener {
 pub struct PipeConnection {
     file: File,
     peer_pid: u32,
+    connected_by: SystemTime,
 }
 
 impl PipeConnection {
     /// Process ID of the program on the other end.
+    ///
+    /// Windows may reuse a process ID once its process has exited, so check
+    /// the peer through a process handle, and reject a process that started
+    /// after [`Self::connected_by`]: it cannot be the one that connected.
     pub fn peer_pid(&self) -> u32 {
         self.peer_pid
+    }
+
+    /// A time at or after which the connection was made.
+    pub fn connected_by(&self) -> SystemTime {
+        self.connected_by
     }
 }
 
@@ -272,8 +335,7 @@ pub fn connect(name: &str) -> io::Result<PipeConnection> {
     let mut attempts = 0;
     let file = loop {
         match OpenOptions::new()
-            .read(true)
-            .write(true)
+            .access_mode(CLIENT_ACCESS)
             .security_qos_flags(SECURITY_ANONYMOUS.0)
             .open(name)
         {
@@ -286,6 +348,7 @@ pub fn connect(name: &str) -> io::Result<PipeConnection> {
             other => break other?,
         }
     };
+    let connected_by = SystemTime::now();
     let mut server_pid = 0u32;
     // SAFETY: `file` is an open pipe client handle; `server_pid` is writable.
     unsafe { GetNamedPipeServerProcessId(HANDLE(file.as_raw_handle()), &mut server_pid) }
@@ -293,6 +356,7 @@ pub fn connect(name: &str) -> io::Result<PipeConnection> {
     Ok(PipeConnection {
         file,
         peer_pid: server_pid,
+        connected_by,
     })
 }
 
@@ -375,11 +439,89 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Whether this process runs with administrator rights (which may add
+    /// pipe instances by design).
+    fn elevated() -> bool {
+        use windows::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
+        let mut token = HANDLE::default();
+        // SAFETY: pseudo-handle of this process; `token` is writable.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        // SAFETY: `elevation` is writable and its exact size is passed.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&raw mut elevation).cast()),
+                u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap(),
+                &mut len,
+            )
+        }
+        .is_ok();
+        // SAFETY: opened above, closed once.
+        let _ = unsafe { CloseHandle(token) };
+        ok && elevation.TokenIsElevated != 0
+    }
+
+    #[test]
+    fn the_user_cannot_add_instances_to_the_pipe() {
+        let name = unique_name();
+        let sid = current_user_sid().unwrap();
+        // A server running as SYSTEM, as the Whereabouts service does.
+        let _listener = PipeListener::bind_as(&name, "S-1-5-18", &sid).unwrap();
+        // Another program running as the same user tries to add its own
+        // instance of our pipe, to receive our clients.
+        let squatter = PipeListener {
+            name: HSTRING::from(name.as_str()),
+            descriptor: Descriptor::from_sddl("D:(A;;GA;;;WD)").unwrap(),
+            pending: None,
+        };
+        let result = squatter.create_instance(false);
+        if elevated() {
+            eprintln!("skipped: administrators may add instances by design");
+            return;
+        }
+        let error = result.expect_err("a normal user must not add pipe instances");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn connections_know_when_they_were_made() {
+        let name = unique_name();
+        let sid = current_user_sid().unwrap();
+        let before = SystemTime::now();
+        let mut listener = PipeListener::bind(&name, &sid).unwrap();
+        let server = std::thread::spawn(move || listener.accept().unwrap().connected_by());
+        let client = connect(&name).unwrap();
+        let server_side = server.join().unwrap();
+        assert!(client.connected_by() >= before);
+        assert!(server_side >= before);
+        assert!(server_side <= SystemTime::now());
+    }
+
     #[test]
     fn rejects_malformed_account_identifiers() {
-        assert!(pipe_sddl("S-1-5-21-1-2-3-1001").is_ok());
+        let sddl = pipe_sddl("S-1-5-32-544", "S-1-5-21-1-2-3-1001").unwrap();
+        assert!(
+            sddl.ends_with("(A;;GA;;;S-1-5-32-544)(A;;0x0012019b;;;S-1-5-21-1-2-3-1001)"),
+            "{sddl}"
+        );
         for bad in ["", "WD", "S-1-5)(A;;GA;;;WD", "S-1-5-21 x"] {
-            assert!(pipe_sddl(bad).is_err(), "{bad}");
+            assert!(pipe_sddl("S-1-5-18", bad).is_err(), "{bad}");
+            assert!(pipe_sddl(bad, "S-1-5-18").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn finds_the_owner_of_what_this_process_creates() {
+        let owner = current_owner_sid().unwrap();
+        if elevated() {
+            assert_eq!(owner, "S-1-5-32-544", "Administrators");
+        } else {
+            assert_eq!(owner, current_user_sid().unwrap());
         }
     }
 }
