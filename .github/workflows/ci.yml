@@ -10,6 +10,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # SQLCipher's OpenSSL is built from source and needs a native Windows
+  # Perl; GitHub's Windows runners have Strawberry Perl installed here.
+  OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
 
 jobs:
   check:

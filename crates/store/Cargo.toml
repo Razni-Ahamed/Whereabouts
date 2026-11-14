@@ -9,5 +9,9 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+whereabouts-core.workspace = true
+rusqlite.workspace = true
+
 [lints]
 workspace = true

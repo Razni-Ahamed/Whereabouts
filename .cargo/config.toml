@@ -1,0 +1,5 @@
+# OpenSSL (built from source for SQLCipher) ships without debug symbols, so
+# the MSVC linker warns once per object file (LNK4099). The warning is
+# harmless; silence it so real linker problems stay visible.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/ignore:4099"]

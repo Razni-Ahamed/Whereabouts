@@ -22,7 +22,8 @@ A pull request that breaks any of these will not be merged, however useful the f
 
 1. Install [Rust](https://rustup.rs) (stable, MSVC toolchain).
 2. Install Visual Studio Build Tools with the **Desktop development with C++** workload.
-3. Clone and build:
+3. Install [Strawberry Perl](https://strawberryperl.com) (`winget install StrawberryPerl.StrawberryPerl`). The encrypted database (SQLCipher) needs OpenSSL, which is built from source and needs a native Windows Perl. If you build from **Git Bash**, its own Perl comes first on `PATH` and cannot build OpenSSL; set `OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe`. Keep the project in a short path (e.g. `D:\Projects\Whereabouts`): OpenSSL's deepest source files can exceed Windows' 260-character path limit in long paths.
+4. Clone and build:
 
    ```powershell
    git clone https://github.com/Razni-Ahamed/Whereabouts.git

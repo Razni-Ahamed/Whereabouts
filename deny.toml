@@ -12,12 +12,16 @@ yanked = "deny"
 # Licences compatible with distributing Whereabouts under GPL-3.0-or-later.
 allow = [
     "Apache-2.0",
+    # SQLite's public-domain dedication, used by sqlcipher-src.
+    "blessing",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
+    # Permissive; used by sqlcipher-src for bundled LibTomCrypt.
+    "WTFPL",
     "Zlib",
 ]
 confidence-threshold = 0.9

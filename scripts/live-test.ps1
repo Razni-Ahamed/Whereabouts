@@ -31,6 +31,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 if (-not (Test-Path $Cargo)) { $Cargo = 'cargo' }
 $ServiceExe = Join-Path $RepoRoot 'target\debug\whereabouts-service.exe'
+# SQLCipher's OpenSSL build needs a native Windows Perl (Strawberry Perl).
+$StrawberryPerl = 'C:\Strawberry\perl\bin\perl.exe'
+if (Test-Path $StrawberryPerl) { $env:OPENSSL_SRC_PERL = $StrawberryPerl }
 $TestUrl = 'https://example.com'
 
 function Test-IsAdministrator {
@@ -71,7 +74,7 @@ function Get-LoggedOutput {
 }
 
 function Invoke-IntegrationTests {
-    Write-Log '--- 1/2  ETW integration tests ---'
+    Write-Log '--- 1/3  ETW integration tests ---'
     $process = Start-Logged -FilePath $Cargo -Name 'integration' -Arguments @(
         'test', '-p', 'whereabouts-win-capture', '--test', 'live_capture',
         '--', '--ignored', '--test-threads=1')
@@ -92,7 +95,9 @@ function Invoke-IntegrationTests {
 }
 
 function Invoke-ConsoleSmokeTest {
-    Write-Log '--- 2/2  Console smoke test ---'
+    Write-Log '--- 2/3  Console smoke test ---'
+    # Save into a temporary folder, never the real %ProgramData%\Whereabouts.
+    $env:WHEREABOUTS_HOME = Join-Path $WorkDir 'home'
     $console = Start-Logged -FilePath $ServiceExe -Name 'console' -Arguments @(
         '--console', '--seconds', '12')
     Start-Sleep -Seconds 4
@@ -164,10 +169,74 @@ function Invoke-ConsoleSmokeTest {
     return $passed
 }
 
+function Invoke-Service {
+    param([string]$Name, [string[]]$Arguments)
+    $process = Start-Logged -FilePath $ServiceExe -Name $Name -Arguments $Arguments
+    if (-not $process.WaitForExit(60000)) { $process.Kill() }
+    return Get-LoggedOutput -Name $Name
+}
+
+function Invoke-StorageTest {
+    Write-Log '--- 3/3  Encrypted storage ---'
+    $dataHome = $env:WHEREABOUTS_HOME
+    $passed = $true
+
+    $history = Invoke-Service -Name 'history' -Arguments @('--history')
+    $saved = @($history -split "`r?`n" | Where-Object { $_ -like 'Saved flows:*' })
+    if ($saved.Count -gt 0) { Write-Log "    $($saved[0])" }
+    if ($history -notmatch '(?m)^curl\.exe\s') {
+        Write-Log 'FAIL: curl.exe is not in the saved history'
+        $passed = $false
+    }
+
+    $database = Join-Path $dataHome 'whereabouts.db'
+    if (-not (Test-Path $database)) {
+        Write-Log 'FAIL: no database file'
+        return $false
+    }
+    $raw = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($database))
+    foreach ($needle in @('curl.exe', 'example.com', 'SQLite format 3')) {
+        if ($raw.Contains($needle)) {
+            Write-Log "FAIL: '$needle' is readable in the database file"
+            $passed = $false
+        }
+    }
+    if ($passed) { Write-Log '    database file: no readable app names, domains or SQLite header' }
+
+    $access = @((Get-Acl $dataHome).Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    Write-Log "    folder access: $($access -join ', ')"
+    if (@($access | Where-Object { $_ -notmatch '\\SYSTEM$|\\Administrators$' }).Count -gt 0) {
+        Write-Log 'FAIL: the data folder is open to more than SYSTEM and Administrators'
+        $passed = $false
+    }
+
+    $csv = Join-Path $WorkDir 'export.csv'
+    $null = Invoke-Service -Name 'export' -Arguments @('--export', $csv)
+    if (-not (Test-Path $csv) -or -not (Select-String -Path $csv -Pattern 'curl\.exe' -Quiet)) {
+        Write-Log 'FAIL: export does not contain curl.exe'
+        $passed = $false
+    } else {
+        Write-Log "    export: $((Get-Content $csv).Count - 1) flows"
+    }
+
+    $null = Invoke-Service -Name 'delete' -Arguments @('--delete-all', '--yes')
+    $after = Invoke-Service -Name 'history-after' -Arguments @('--history')
+    if ($after -notmatch 'Saved flows: 0') {
+        Write-Log 'FAIL: flows remain after --delete-all --yes'
+        $passed = $false
+    } else {
+        Write-Log '    delete-all: 0 flows left'
+    }
+
+    if ($passed) { Write-Log 'ok: encrypted storage' }
+    return $passed
+}
+
 function Invoke-LiveTests {
     $integration = Invoke-IntegrationTests
     $console = Invoke-ConsoleSmokeTest
-    return ($integration -and $console)
+    $storage = Invoke-StorageTest
+    return ($integration -and $console -and $storage)
 }
 
 # --- Elevated part -----------------------------------------------------------

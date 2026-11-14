@@ -8,7 +8,9 @@ use std::time::{Duration, Instant, SystemTime};
 use whereabouts_core::dns::{DnsMap, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
-use whereabouts_enrich::{ATTRIBUTION, Enricher, Scope};
+use whereabouts_core::privacy::is_web_browser;
+use whereabouts_enrich::{ATTRIBUTION, Enricher, Scope, registrable_domain};
+use whereabouts_store::{FlowRecord, Store};
 use whereabouts_win_capture::identity::{DevicePaths, lock_running_image};
 use whereabouts_win_capture::resolver::IdentityResolver;
 use whereabouts_win_capture::{Capture, CaptureCounts, process};
@@ -44,7 +46,36 @@ struct Row {
     token: Option<u64>,
     key: FlowKey,
     stats: FlowStats,
+    /// When the flow was closed; `None` for active flows.
+    closed_at: Option<Instant>,
+    /// Whether it has been saved to the store.
+    saved: bool,
 }
+
+/// Recently finished flows, for display and for saving.
+#[derive(Debug, Default)]
+struct Closed {
+    rows: VecDeque<Row>,
+    /// Rows pushed out of the display list before they were saved; they are
+    /// saved at the next opportunity rather than lost.
+    unsaved_evicted: Vec<Row>,
+}
+
+impl Closed {
+    fn push(&mut self, row: Row) {
+        if self.rows.len() >= MAX_CLOSED {
+            if let Some(old) = self.rows.pop_front() {
+                if !old.saved {
+                    self.unsaved_evicted.push(old);
+                }
+            }
+        }
+        self.rows.push_back(row);
+    }
+}
+
+/// How often retention runs while the console is open.
+const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// Runs the console view until `limit` passes, or forever if `None`.
 pub fn run(limit: Option<Duration>) -> ExitCode {
@@ -86,11 +117,27 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     );
     println!("Data credits: {ATTRIBUTION}");
 
+    let mut store = match crate::storage::open() {
+        Ok(mut store) => {
+            crate::storage::apply_retention(&mut store);
+            println!(
+                "Saving finished flows, encrypted, to {}",
+                crate::storage::home_dir().display()
+            );
+            Some(store)
+        }
+        Err(error) => {
+            eprintln!("warning: history will not be saved: {error}");
+            None
+        }
+    };
+    let mut last_retention = Instant::now();
+
     let started = Instant::now();
     let mut last_draw = Instant::now();
     let mut table = FlowTable::new();
     let mut names = ProcessNames::new();
-    let mut closed = VecDeque::new();
+    let mut closed = Closed::default();
     let mut exited = RecentlyExited::default();
     // Start time of each running process, so that a process is identified by
     // its ID *and* start time, not by its ID alone.
@@ -154,6 +201,13 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
                 &names,
                 table.take_idle(SystemTime::now(), IDLE_AFTER),
             );
+            if let Some(store) = store.as_mut() {
+                save_closed(store, &mut closed, &names, &enricher, false);
+                if last_retention.elapsed() >= RETENTION_EVERY {
+                    crate::storage::apply_retention(store);
+                    last_retention = Instant::now();
+                }
+            }
             draw(
                 &table,
                 &closed,
@@ -170,6 +224,29 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     }
 
     names.settle(Duration::from_secs(5));
+    if let Some(store) = store.as_mut() {
+        save_closed(store, &mut closed, &names, &enricher, true);
+        let active: Vec<FlowRecord> = table
+            .snapshot()
+            .into_iter()
+            .map(|(key, stats)| {
+                let row = Row {
+                    app: app_name(&key, &names),
+                    token: token_for(&key, &names),
+                    key,
+                    stats,
+                    closed_at: None,
+                    saved: false,
+                };
+                to_record(&row, &names, &enricher)
+            })
+            .collect();
+        let saved = active.len();
+        match store.insert_flows(&active) {
+            Ok(()) => println!("Saved {saved} active flows."),
+            Err(error) => eprintln!("warning: could not save active flows: {error}"),
+        }
+    }
     draw(
         &table,
         &closed,
@@ -294,6 +371,11 @@ impl ProcessNames {
         self.poll();
     }
 
+    /// The identity worked out for a process instance, if finished.
+    fn identity(&self, token: u64) -> Option<&AppIdentity> {
+        self.identities.get(&token)
+    }
+
     /// Collects identities the background worker has finished.
     fn poll(&mut self) {
         for (token, identity) in self.resolver.finished() {
@@ -404,7 +486,7 @@ impl RecentlyExited {
 
 /// Adds traffic that arrived after its process exited to the matching
 /// closed flow, or starts a new closed flow for it.
-fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, token: Option<u64>, event: &NetEvent) {
+fn add_late_traffic(closed: &mut Closed, app: &str, token: Option<u64>, event: &NetEvent) {
     if event.is_loopback() {
         return;
     }
@@ -413,35 +495,106 @@ fn add_late_traffic(closed: &mut VecDeque<Row>, app: &str, token: Option<u64>, e
         protocol: event.protocol,
         remote: event.remote,
     };
-    if let Some(row) = closed.iter_mut().rev().find(|row| row.key == key) {
+    if let Some(row) = closed.rows.iter_mut().rev().find(|row| row.key == key) {
         row.stats.record(event);
         return;
     }
     let mut stats = FlowStats::new(event.timestamp);
     stats.record(event);
-    if closed.len() >= MAX_CLOSED {
-        closed.pop_front();
-    }
-    closed.push_back(Row {
+    closed.push(Row {
         app: app.to_owned(),
         token,
         key,
         stats,
+        closed_at: Some(Instant::now()),
+        saved: false,
     });
 }
 
 /// Moves finished flows into the bounded `closed` list, keeping their names.
-fn close(closed: &mut VecDeque<Row>, names: &ProcessNames, flows: Vec<(FlowKey, FlowStats)>) {
+fn close(closed: &mut Closed, names: &ProcessNames, flows: Vec<(FlowKey, FlowStats)>) {
     for (key, stats) in flows {
-        if closed.len() >= MAX_CLOSED {
-            closed.pop_front();
-        }
-        closed.push_back(Row {
+        closed.push(Row {
             app: app_name(&key, names),
             token: token_for(&key, names),
             key,
             stats,
+            closed_at: Some(Instant::now()),
+            saved: false,
         });
+    }
+}
+
+/// Saves finished flows to the store. Normally only flows closed at least
+/// [`LATE_TRAFFIC_WINDOW`] ago are saved, because late traffic may still be
+/// added to them; with `everything`, all unsaved flows are saved.
+fn save_closed(
+    store: &mut Store,
+    closed: &mut Closed,
+    names: &ProcessNames,
+    enricher: &Enricher,
+    everything: bool,
+) {
+    let mut records: Vec<FlowRecord> = closed
+        .unsaved_evicted
+        .drain(..)
+        .map(|row| to_record(&row, names, enricher))
+        .collect();
+    for row in closed.rows.iter_mut().filter(|row| {
+        !row.saved
+            && (everything
+                || row
+                    .closed_at
+                    .is_some_and(|at| at.elapsed() >= LATE_TRAFFIC_WINDOW))
+    }) {
+        records.push(to_record(row, names, enricher));
+        row.saved = true;
+    }
+    if records.is_empty() {
+        return;
+    }
+    if let Err(error) = store.insert_flows(&records) {
+        eprintln!("warning: could not save {} flows: {error}", records.len());
+    }
+}
+
+/// Converts a row into what is stored.
+///
+/// For web browsers, only the registrable domain is stored (`example.com`,
+/// not `mail.example.com`): a browser's list of domains is the user's
+/// browsing history (design spec, decision D5).
+fn to_record(row: &Row, names: &ProcessNames, enricher: &Enricher) -> FlowRecord {
+    let identity = row.token.and_then(|token| names.identity(token));
+    let (owner, country) = if row.key.is_overflow() {
+        (String::from("(many destinations)"), String::from("--"))
+    } else {
+        owner_and_country(row, enricher)
+    };
+    let domain = row.stats.domain.as_ref().map(|label| {
+        if is_web_browser(&row.app) {
+            registrable_domain(&label.name).unwrap_or_else(|| label.name.to_string())
+        } else {
+            label.name.to_string()
+        }
+    });
+    FlowRecord {
+        app_name: row.app.clone(),
+        app_path: identity.map(|identity| identity.path.clone()),
+        app_sha256: identity.and_then(|identity| identity.sha256.clone()),
+        signature: identity.map(|identity| identity.signature.clone()),
+        signature_confirmed: identity.is_some_and(|identity| identity.confirmed_running),
+        protocol: row.key.protocol,
+        remote_ip: row.key.remote.ip(),
+        remote_port: row.key.remote.port(),
+        domain,
+        domain_source: row.stats.domain.as_ref().map(|label| label.source),
+        owner: (owner != "-").then_some(owner),
+        country: (country != "--").then_some(country),
+        first_seen: row.stats.first_seen,
+        last_seen: row.stats.last_seen,
+        bytes_sent: row.stats.bytes_sent,
+        bytes_received: row.stats.bytes_received,
+        connections: row.stats.connections,
     }
 }
 
@@ -463,7 +616,7 @@ fn app_name(key: &FlowKey, names: &ProcessNames) -> String {
 
 fn draw(
     table: &FlowTable,
-    closed: &VecDeque<Row>,
+    closed: &Closed,
     names: &ProcessNames,
     enricher: &Enricher,
     counts: CaptureCounts,
@@ -477,10 +630,12 @@ fn draw(
             token: token_for(&key, names),
             key,
             stats,
+            closed_at: None,
+            saved: false,
         })
         .collect();
     let active = rows.len();
-    rows.extend(closed.iter().cloned());
+    rows.extend(closed.rows.iter().cloned());
     rows.sort_by(|a, b| {
         b.stats
             .total_bytes()
@@ -492,7 +647,7 @@ fn draw(
     println!(
         "── {}s · {active} active flows · {} closed · {} events · {} dropped · {} unreadable · {} over limit ──",
         elapsed.as_secs(),
-        closed.len(),
+        closed.rows.len(),
         counts.events,
         counts.dropped,
         counts.malformed,
@@ -630,7 +785,7 @@ fn file_name(path: &str) -> &str {
 }
 
 /// Shortens `text` to at most `max` characters, marking the cut with `…`.
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_owned()
     } else {
@@ -640,7 +795,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// Formats a byte count for people, e.g. `1.5 MB`.
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -684,6 +839,8 @@ mod tests {
                 remote: remote.parse().unwrap(),
             },
             stats,
+            closed_at: None,
+            saved: false,
         }
     }
 
@@ -719,6 +876,23 @@ mod tests {
     }
 
     #[test]
+    fn browsers_store_only_the_registrable_domain() {
+        let names = ProcessNames::new();
+        let mut row = row_to(
+            "203.0.113.5:443",
+            Some(("mail.private.example.com", LabelSource::Verified)),
+        );
+        row.app = String::from("chrome.exe");
+        let record = to_record(&row, &names, &enricher());
+        assert_eq!(record.domain.as_deref(), Some("example.com"));
+
+        // Other apps keep the full name.
+        row.app = String::from("claude.exe");
+        let record = to_record(&row, &names, &enricher());
+        assert_eq!(record.domain.as_deref(), Some("mail.private.example.com"));
+    }
+
+    #[test]
     fn local_addresses_are_labelled_as_such() {
         let row = row_to("192.168.1.1:53", None);
         assert_eq!(owner_and_country(&row, &enricher()).0, "local network");
@@ -743,12 +917,12 @@ mod tests {
 
     #[test]
     fn late_traffic_merges_into_the_closed_flow() {
-        let mut closed = VecDeque::new();
+        let mut closed = Closed::default();
         add_late_traffic(&mut closed, "curl.exe", None, &late_send(7, 600));
         add_late_traffic(&mut closed, "curl.exe", None, &late_send(7, 24));
-        assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].app, "curl.exe");
-        assert_eq!(closed[0].stats.bytes_sent, 624);
+        assert_eq!(closed.rows.len(), 1);
+        assert_eq!(closed.rows[0].app, "curl.exe");
+        assert_eq!(closed.rows[0].stats.bytes_sent, 624);
     }
 
     #[test]

@@ -76,7 +76,14 @@ For company and country information, first download the offline databases (once;
 powershell -ExecutionPolicy Bypass -File scripts\update-data.ps1
 ```
 
-Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
+Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. Finished flows are saved, encrypted, in `%ProgramData%\Whereabouts`. Afterwards, also as administrator:
+
+```powershell
+cargo run -p whereabouts-service -- --history            # top apps of the last 24 hours
+cargo run -p whereabouts-service -- --export flows.csv   # everything saved, as CSV
+cargo run -p whereabouts-service -- --delete-all --yes   # delete all saved data
+```
+ It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received. Nothing is saved yet.
 
 ## Building from source
 
@@ -85,6 +92,7 @@ Requirements:
 - Windows 10 22H2 or Windows 11 (x64)
 - [Rust](https://rustup.rs) (stable, MSVC toolchain)
 - Visual Studio Build Tools with the **Desktop development with C++** workload
+- [Strawberry Perl](https://strawberryperl.com) (`winget install StrawberryPerl.StrawberryPerl`), needed once to build OpenSSL for the encrypted database. The first build takes a few extra minutes.
 
 ```powershell
 git clone https://github.com/Razni-Ahamed/Whereabouts.git
