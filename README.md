@@ -62,47 +62,41 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 | v1.0 | *Trust* | Signed installer, external security review |
 | Later | | Android app, PC + phone dashboard over your local network |
 
-## Trying the current build
+## Installing
 
-The desktop app is not ready yet, but you can already watch live connections per app in a terminal, or install the background service. Open **PowerShell as administrator** in the project folder and run:
+Whereabouts 0.1 is a **developer preview** for Windows 10 (22H2) and Windows 11, 64-bit.
+
+1. Download `Whereabouts_0.1.0_x64-setup.exe` and `SHA256SUMS.txt` from the [Releases](https://github.com/Razni-Ahamed/Whereabouts/releases) page.
+2. **Check the download.** The preview's installer is not code-signed yet, so Windows SmartScreen may warn about it. Compare its checksum with the published one before running it:
+
+   ```powershell
+   (Get-FileHash .\Whereabouts_0.1.0_x64-setup.exe -Algorithm SHA256).Hash
+   ```
+
+3. Run it and approve the administrator prompt. It installs to `C:\Program Files\Whereabouts` (the background service only trusts programs there), registers the **Whereabouts** service, which starts with Windows whoever is logged in, and adds **Whereabouts** to the Start menu.
+4. Open **Whereabouts** from the Start menu. The app runs as you, without administrator rights.
+
+To remove it, uninstall **Whereabouts** from Windows Settings → Apps. You are asked whether to delete your saved history too (it is kept by default, encrypted, in `C:\ProgramData\Whereabouts`).
+
+From a terminal, the installed service can also tell you how it is doing, and administrators can work with the saved history:
 
 ```powershell
-cargo run -p whereabouts-service -- --console
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --status             # status, top flows and apps
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --history            # top apps of the last 24 hours (as administrator)
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --export flows.csv   # everything saved, as CSV (as administrator)
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --delete-all --yes   # delete all saved data (as administrator)
 ```
 
-For company and country information, first download the offline databases (once; see [data/README.md](data/README.md)):
+### Without installing
+
+Developers can watch live connections in a terminal without installing anything. Open **PowerShell as administrator** in the project folder, download the offline data once (see [data/README.md](data/README.md)), then run the console view (stop it with **Ctrl+C**, or add `--seconds 30`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\update-data.ps1
+cargo run -p whereabouts-service -- --console
 ```
 
-Stop it with **Ctrl+C**, or add `--seconds 30` to stop automatically. Finished flows are saved, encrypted, in `%ProgramData%\Whereabouts`. Afterwards, also as administrator:
-
-```powershell
-cargo run -p whereabouts-service -- --status             # while --console runs: status, top flows and apps
-cargo run -p whereabouts-service -- --history            # top apps of the last 24 hours
-cargo run -p whereabouts-service -- --export flows.csv   # everything saved, as CSV
-cargo run -p whereabouts-service -- --delete-all --yes   # delete all saved data
-```
-
-To keep Whereabouts running in the background, starting with Windows whoever is logged in, install it as a service (as administrator):
-
-```powershell
-cargo run -p whereabouts-service -- --install
-```
-
-This copies the program and its offline data to `%ProgramFiles%\Whereabouts` (which only administrators can change) and starts the **Whereabouts** service, running as LocalSystem. Ask it how it is doing, as yourself, with the installed copy:
-
-```powershell
-& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --status
-```
-
-Remove it with `--uninstall` (your saved history is kept) or `--uninstall --delete-data` (everything is deleted). While the service runs, `--console` refuses to start, because two captures cannot run at once.
-
-### The desktop app
-
-The dashboard shows live connections per app, the companies and countries they reach, and what Whereabouts keeps (see [CONTRIBUTING.md](CONTRIBUTING.md#working-on-the-desktop-app) to build it). It runs as you, without administrator rights, and reads data only from the installed service over its local channel. When both are built in release mode next to each other, `--install` copies the app too; then open `%ProgramFiles%\Whereabouts\whereabouts.exe`.
- It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received.
+It shows each app's connections with the app's publisher (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), the company behind the destination (for known tracking and analytics services, otherwise the network owner), its country, the remote address and port, and the bytes sent and received. While the installed service runs, `--console` refuses to start, because two captures cannot run at once. To build the installer yourself, see [CONTRIBUTING.md](CONTRIBUTING.md#building-the-installer).
 
 ## Building from source
 

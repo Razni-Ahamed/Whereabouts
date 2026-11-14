@@ -35,4 +35,9 @@ These are documented in the [threat model](docs/design-spec.md#8-threat-model):
 
 ## Supported versions
 
-Whereabouts has not had a release yet. Once it does, security fixes will go into the latest release.
+| Version | Supported |
+|---|---|
+| 0.1.x (developer preview) | Yes: security fixes go into the latest 0.1 release |
+| Older commits | No |
+
+Version 0.1 is a developer preview. Until code signing is in place, its installer is not signed: check the SHA-256 checksum published with each release before running it.

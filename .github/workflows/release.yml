@@ -1,0 +1,123 @@
+name: Release
+
+# Builds the installer on a fresh Windows machine, installs it, checks the
+# service and app, and uninstalls it again. On a version tag (v*), it also
+# creates a DRAFT GitHub release with the installer and its checksums; a
+# maintainer reviews and publishes it by hand.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'ui/src-tauri/**'
+      - 'service/src/install.rs'
+      - 'service/src/main.rs'
+      - 'scripts/build-release.ps1'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+
+jobs:
+  installer:
+    name: Build and test the installer (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build the installer
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - name: Install it (silently) on this fresh machine
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem target/dist/*-setup.exe | Select-Object -First 1
+          $p = Start-Process $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the installer exited with $($p.ExitCode)" }
+          $dir = Join-Path $env:ProgramFiles 'Whereabouts'
+          foreach ($file in 'whereabouts.exe', 'whereabouts-service.exe', 'data\easyprivacy.txt', 'data\dbip-country-lite.mmdb') {
+            if (-not (Test-Path (Join-Path $dir $file))) { throw "missing after install: $file" }
+          }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='Whereabouts'"
+          if (-not $svc) { throw 'the service was not registered' }
+          "service: $($svc.State), start $($svc.StartMode), as $($svc.StartName)"
+          if ($svc.State -ne 'Running') { throw 'the service is not running' }
+          if ($svc.StartMode -ne 'Auto') { throw 'the service does not start automatically' }
+          if ($svc.StartName -ne 'LocalSystem') { throw 'the service does not run as LocalSystem' }
+
+      - name: Check the service sees traffic
+        shell: pwsh
+        run: |
+          curl.exe --silent --output NUL --max-time 15 https://example.com
+          Start-Sleep -Seconds 5
+          $status = & (Join-Path $env:ProgramFiles 'Whereabouts\whereabouts-service.exe') --status 2>&1 | Out-String
+          $status
+          if ($status -notmatch 'is running') { throw '--status got no answer from the service' }
+          if ($status -notmatch 'saving history: yes') { throw 'the service is not saving history' }
+          if ($status -notmatch 'curl\.exe') { throw 'curl.exe does not appear in the live flows' }
+
+      - name: Uninstall it (silently) and check it is gone
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:ProgramFiles 'Whereabouts'
+          # The NSIS uninstaller relaunches itself from a temporary copy, so
+          # wait for its effects rather than for the process.
+          Start-Process (Join-Path $dir 'uninstall.exe') -ArgumentList '/S' -Wait
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Get-Service Whereabouts -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $dir 'whereabouts-service.exe'))) {
+            if ((Get-Date) -gt $deadline) { throw 'the service or its program is still there after uninstalling' }
+            Start-Sleep -Seconds 1
+          }
+          'service and program removed'
+          # A silent uninstall keeps the saved history (the answer to "delete
+          # it?" defaults to No).
+          if (-not (Test-Path (Join-Path $env:ProgramData 'Whereabouts\whereabouts.db'))) { throw 'the saved history was not kept' }
+          'saved history kept'
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: whereabouts-installer
+          path: target/dist/
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: whereabouts-installer
+          path: dist
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="docs/releases/${TAG}.md"
+          if [ ! -f "$notes" ]; then echo "missing release notes: $notes"; exit 1; fi
+          gh release create "$TAG" dist/* --draft --verify-tag --title "Whereabouts $TAG" --notes-file "$notes"
