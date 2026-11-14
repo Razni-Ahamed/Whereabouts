@@ -55,7 +55,8 @@ use windows::Win32::Security::WinTrust::{
     WTHelperProvDataFromStateData, WinVerifyTrust,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_ID_INFO, FILE_SHARE_READ, FileIdInfo, GetFileInformationByHandleEx, QueryDosDeviceW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FileIdInfo,
+    GetFileInformationByHandleEx, QueryDosDeviceW,
 };
 use windows::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
@@ -125,6 +126,23 @@ pub fn is_same_file(file: &File, path: &Path) -> bool {
 pub fn same_file(a: &Path, b: &Path) -> bool {
     match (File::open(a), File::open(b)) {
         (Ok(a), Ok(b)) => matches!((file_id(&a), file_id(&b)), (Some(x), Some(y)) if x == y),
+        _ => false,
+    }
+}
+
+/// Whether folders `a` and `b` are the same folder, compared by file ID.
+/// (Folders need backup semantics to be opened at all; `false` if either
+/// cannot be opened.)
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    let open = |path: &Path| {
+        OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)
+            .ok()
+    };
+    match (open(a), open(b)) {
+        (Some(a), Some(b)) => matches!((file_id(&a), file_id(&b)), (Some(x), Some(y)) if x == y),
         _ => false,
     }
 }

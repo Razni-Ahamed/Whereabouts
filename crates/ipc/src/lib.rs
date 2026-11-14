@@ -130,7 +130,10 @@ pub struct Status {
     pub unattributed: u64,
     /// Flows currently open.
     pub active_flows: u64,
-    /// Whether kernel network and process events are protected from faking.
+    /// Whether the service itself is refused when it tries to register the
+    /// kernel network and process providers' IDs. As SYSTEM it may be
+    /// allowed; clients repeat the check from their own, ordinary account
+    /// (see `whereabouts_client::kernel_events_protected`).
     pub kernel_events_protected: bool,
     /// Whether finished flows are being saved.
     pub saving: bool,

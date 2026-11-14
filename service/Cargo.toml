@@ -10,6 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+whereabouts-client.workspace = true
 whereabouts-core.workspace = true
 whereabouts-enrich.workspace = true
 whereabouts-ipc.workspace = true

@@ -7,11 +7,27 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# Unmaintained (not vulnerable) crates inside Tauri, with no maintained
+# replacement available to us. Reviewed 2026-11-14; any new advisory still
+# fails the check.
+ignore = [
+    # Used by gtk-rs, Tauri's Linux backend (not built for Windows).
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time macro helper of gtk-rs (Linux only), unmaintained, no security issue" },
+    # unic-*: Unicode tables used by urlpattern in tauri-utils.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range: used by urlpattern in tauri-utils; unmaintained, no security issue" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common: used by urlpattern in tauri-utils; unmaintained, no security issue" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property: used by urlpattern in tauri-utils; unmaintained, no security issue" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: used by urlpattern in tauri-utils; unmaintained, no security issue" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: used by urlpattern in tauri-utils; unmaintained, no security issue" },
+]
 
 [licenses]
 # Licences compatible with distributing Whereabouts under GPL-3.0-or-later.
 allow = [
     "Apache-2.0",
+    # Apache-2.0 plus an exception that only adds permissions; used by
+    # target-lexicon (Tauri's Linux build tooling).
+    "Apache-2.0 WITH LLVM-exception",
     # SQLite's public-domain dedication, used by sqlcipher-src.
     "blessing",
     "BSD-2-Clause",

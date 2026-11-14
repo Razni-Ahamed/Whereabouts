@@ -28,6 +28,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      # The desktop app embeds the built web UI when it is compiled, so the
+      # UI is checked and built before any Rust compilation.
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+      - name: Check the UI (Svelte and TypeScript)
+        working-directory: ui
+        run: npm run check
+      - name: Build the UI
+        working-directory: ui
+        run: npm run build
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy

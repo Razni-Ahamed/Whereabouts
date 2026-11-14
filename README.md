@@ -98,6 +98,10 @@ This copies the program and its offline data to `%ProgramFiles%\Whereabouts` (wh
 ```
 
 Remove it with `--uninstall` (your saved history is kept) or `--uninstall --delete-data` (everything is deleted). While the service runs, `--console` refuses to start, because two captures cannot run at once.
+
+### The desktop app
+
+The dashboard shows live connections per app, the companies and countries they reach, and what Whereabouts keeps (see [CONTRIBUTING.md](CONTRIBUTING.md#working-on-the-desktop-app) to build it). It runs as you, without administrator rights, and reads data only from the installed service over its local channel. When both are built in release mode next to each other, `--install` copies the app too; then open `%ProgramFiles%\Whereabouts\whereabouts.exe`.
  It shows each app's connections with the app's publisher, the company behind the destination (for known tracking and analytics services, otherwise the network owner) and its country (from its code signature, so a renamed program can't pretend to be something else), the domain name (when the app's DNS lookup was seen), remote address and port, and the bytes sent and received.
 
 ## Building from source
@@ -129,7 +133,8 @@ cargo test --workspace
 | `crates/win-secrets` | Database key protection (DPAPI) and the restricted data folder |
 | `crates/win-firewall` | Windows Filtering Platform block rules |
 | `service` | The background Windows service |
-| `ui` | The desktop app (Tauri), coming in v0.1 |
+| `ui` | The desktop app: Svelte web UI (`ui/src`) and Tauri (`ui/src-tauri`) |
+| `crates/client` | Connecting to the service and checking who is on the other end |
 | `lab` | Test harness for detection quality, not shipped |
 | `docs` | Design spec and other documentation |
 
