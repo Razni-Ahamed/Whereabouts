@@ -232,7 +232,7 @@ Implementation notes (M4, 2026-11-14):
 | SQLCipher 4 via `rusqlite` with bundled SQLCipher and OpenSSL built from source | Standard, audited whole-file encryption. Needs Strawberry Perl to build on Windows (checked with a spike; Git's Perl cannot build OpenSSL). `sqlcipher-src` also ships LibTomCrypt, which could replace OpenSSL once the bindings support it. |
 | Raw 256-bit key (`PRAGMA key = "x'…'"`) from the system RNG | No password, so no slow key derivation is needed. |
 | Key protected with DPAPI for the **current account** (not machine scope) | Only the account running Whereabouts (later: SYSTEM) can decrypt it. |
-| Data in `%ProgramData%\Whereabouts`, DACL `SYSTEM + Administrators`, inheritance removed | Set before any key or data is written. |
+| Data in `%ProgramData%\Whereabouts`, owner Administrators, DACL `SYSTEM + Administrators`, inheritance removed | Created atomically with that descriptor. Ordinary users can create folders in `%ProgramData%`, so an existing folder or key/database file is used only if it is **not a link or junction** and is **owned by SYSTEM or Administrators**; permissions are applied through a handle opened without following links. Otherwise Whereabouts refuses to start saving. |
 | `PRAGMA secure_delete = ON`; delete-all ends with `VACUUM` | Deleted data does not linger in free pages. |
 | v1 stores flows denormalised (app name, path, hash, signature with each flow) | Simple; an `apps` table can be split out when the UI needs it. |
 | Browsers store the registrable domain only (D5) | A browser's domain list is browsing history. |

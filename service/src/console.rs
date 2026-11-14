@@ -57,16 +57,28 @@ struct Row {
 struct Closed {
     rows: VecDeque<Row>,
     /// Rows pushed out of the display list before they were saved; they are
-    /// saved at the next opportunity rather than lost.
-    unsaved_evicted: Vec<Row>,
+    /// saved at the next opportunity rather than lost. Only kept while a
+    /// store is open, and bounded.
+    unsaved_evicted: VecDeque<Row>,
+    /// Whether evicted rows are kept for saving (only if a store is open).
+    keep_evicted: bool,
+    /// Rows that could not be kept for saving because the bound was hit.
+    lost: u64,
 }
+
+/// Most evicted rows waiting to be saved.
+const MAX_UNSAVED_EVICTED: usize = 10_000;
 
 impl Closed {
     fn push(&mut self, row: Row) {
         if self.rows.len() >= MAX_CLOSED {
             if let Some(old) = self.rows.pop_front() {
-                if !old.saved {
-                    self.unsaved_evicted.push(old);
+                if !old.saved && self.keep_evicted {
+                    if self.unsaved_evicted.len() >= MAX_UNSAVED_EVICTED {
+                        self.unsaved_evicted.pop_front();
+                        self.lost += 1;
+                    }
+                    self.unsaved_evicted.push_back(old);
                 }
             }
         }
@@ -137,7 +149,10 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     let mut last_draw = Instant::now();
     let mut table = FlowTable::new();
     let mut names = ProcessNames::new();
-    let mut closed = Closed::default();
+    let mut closed = Closed {
+        keep_evicted: store.is_some(),
+        ..Closed::default()
+    };
     let mut exited = RecentlyExited::default();
     // Start time of each running process, so that a process is identified by
     // its ID *and* start time, not by its ID alone.
@@ -550,6 +565,13 @@ fn save_closed(
         records.push(to_record(row, names, enricher));
         row.saved = true;
     }
+    if closed.lost > 0 {
+        eprintln!(
+            "warning: {} finished flows could not be kept for saving (too many at once)",
+            closed.lost
+        );
+        closed.lost = 0;
+    }
     if records.is_empty() {
         return;
     }
@@ -913,6 +935,29 @@ mod tests {
             bytes,
             timestamp: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn evicted_rows_are_only_kept_when_saving_and_are_bounded() {
+        let row = || row_to("203.0.113.5:443", None);
+        // Not saving: evicted rows are simply dropped.
+        let mut closed = Closed::default();
+        for _ in 0..MAX_CLOSED + 10 {
+            closed.push(row());
+        }
+        assert_eq!(closed.rows.len(), MAX_CLOSED);
+        assert!(closed.unsaved_evicted.is_empty());
+
+        // Saving: they are kept, up to the bound.
+        let mut closed = Closed {
+            keep_evicted: true,
+            ..Closed::default()
+        };
+        for _ in 0..MAX_CLOSED + MAX_UNSAVED_EVICTED + 5 {
+            closed.push(row());
+        }
+        assert_eq!(closed.unsaved_evicted.len(), MAX_UNSAVED_EVICTED);
+        assert_eq!(closed.lost, 5);
     }
 
     #[test]

@@ -500,8 +500,9 @@ fn to_u64(value: Option<i64>) -> u64 {
 }
 
 /// Formats one CSV field, quoting it if needed. Text that a spreadsheet
-/// could run as a formula (starting with `=`, `+`, `-` or `@`) is prefixed
-/// with `'` so opening the export cannot run anything.
+/// could run as a formula is prefixed with `'` so opening the export cannot
+/// run anything: text starting with `=`, `+`, `-`, `@`, a tab or a carriage
+/// return, including after leading spaces or line breaks.
 fn csv_field(value: &rusqlite::types::Value) -> String {
     use rusqlite::types::Value;
     match value {
@@ -509,7 +510,10 @@ fn csv_field(value: &rusqlite::types::Value) -> String {
         Value::Integer(n) => n.to_string(),
         Value::Real(x) => x.to_string(),
         Value::Text(text) => {
-            let text = if text.starts_with(['=', '+', '-', '@']) {
+            let after_space = text.trim_start_matches([' ', '\t', '\r', '\n']);
+            let risky =
+                text.starts_with(['\t', '\r']) || after_space.starts_with(['=', '+', '-', '@']);
+            let text = if risky {
                 format!("'{text}")
             } else {
                 text.clone()
@@ -683,6 +687,19 @@ mod tests {
         let row = lines.next().unwrap();
         assert!(row.contains(r#""C:\Program Files, Inc\a.exe""#), "{row}");
         assert!(row.contains(r#""'=HYPERLINK(""http://evil"")""#), "{row}");
+    }
+
+    #[test]
+    fn hidden_formula_starts_are_defused_too() {
+        use rusqlite::types::Value;
+        for risky in ["\t=1+1", "\r@SUM(A1)", "  =cmd()", "\n-2+3"] {
+            let field = csv_field(&Value::Text(String::from(risky)));
+            assert!(
+                field.starts_with('\'') || field.starts_with("\"'"),
+                "{risky:?} became {field:?}"
+            );
+        }
+        assert_eq!(csv_field(&Value::Text(String::from("plain"))), "plain");
     }
 
     #[test]

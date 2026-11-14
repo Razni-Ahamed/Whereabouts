@@ -219,6 +219,22 @@ function Invoke-StorageTest {
         Write-Log "    export: $((Get-Content $csv).Count - 1) flows"
     }
 
+    # A data folder created beforehand by a normal (non-admin) account, as an
+    # attacker could do in %ProgramData%, must be refused.
+    $planted = Join-Path $WorkDir 'planted-home'
+    if (Test-Path $planted) {
+        $real = $env:WHEREABOUTS_HOME
+        $env:WHEREABOUTS_HOME = $planted
+        $refused = Invoke-Service -Name 'planted' -Arguments @('--history')
+        $env:WHEREABOUTS_HOME = $real
+        if ($refused -notmatch 'owned by an account') {
+            Write-Log 'FAIL: a data folder created by a normal account was not refused'
+            $passed = $false
+        } else {
+            Write-Log '    planted folder (created by a normal account): refused'
+        }
+    }
+
     $null = Invoke-Service -Name 'delete' -Arguments @('--delete-all', '--yes')
     $after = Invoke-Service -Name 'history-after' -Arguments @('--history')
     if ($after -notmatch 'Saved flows: 0') {
@@ -262,6 +278,8 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: test build failed'; exit 1 }
 if (Test-IsAdministrator) {
     $passed = Invoke-LiveTests
 } else {
+    # Created as the normal user, so it is owned by that account.
+    New-Item -ItemType Directory -Path (Join-Path $WorkDir 'planted-home') | Out-Null
     Write-Host 'Running live tests as administrator. Please approve the UAC prompt...'
     try {
         $child = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `

@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use whereabouts_store::{Key, Retention, Store};
-use whereabouts_win_secrets::{load_or_create_key, secure_directory};
+use whereabouts_win_secrets::{ensure_private_file, load_or_create_key, secure_directory};
 
 /// Database file name.
 const DATABASE_FILE: &str = "whereabouts.db";
@@ -41,6 +41,11 @@ pub fn open() -> Result<Store, String> {
             home.display()
         )
     })?;
+    // Existing files must not be links and must belong to SYSTEM or
+    // Administrators, or someone could have planted them.
+    for file in [KEY_FILE, DATABASE_FILE] {
+        ensure_private_file(&home.join(file)).map_err(|e| e.to_string())?;
+    }
     let key = load_or_create_key(&home.join(KEY_FILE))
         .map_err(|e| format!("could not load the database key ({e})"))?;
     Store::open(&home.join(DATABASE_FILE), &Key::from_bytes(key))

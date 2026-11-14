@@ -7,7 +7,13 @@
 //!   account** (for the background service, that is SYSTEM). Only the same
 //!   account on the same computer can decrypt it, so copying the key file
 //!   and database elsewhere gives nothing readable.
-//! - The data folder is restricted to SYSTEM and Administrators.
+//! - The data folder is restricted to SYSTEM and Administrators and owned
+//!   by Administrators. Ordinary users can create folders in
+//!   `%ProgramData%`, so an existing folder (or file) is only trusted if it
+//!   is not a link or junction and is owned by SYSTEM or Administrators;
+//!   otherwise Whereabouts refuses to use it. Permissions are applied
+//!   through a handle that was opened without following links, never by
+//!   name, so the folder cannot be swapped for a link in between.
 //!
 //! `unsafe` is used only for these Windows API calls; every block has a
 //! `// SAFETY:` comment.
@@ -18,20 +24,28 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SetNamedSecurityInfoW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom, CRYPT_INTEGER_BLOB,
     CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid,
+    WinLocalSystemSid,
 };
-use windows::core::{BOOL, HSTRING, PCWSTR, w};
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+};
+use windows::core::{BOOL, HRESULT, HSTRING, w};
 
 /// Length of the database key in bytes (256 bits).
 pub const KEY_LEN: usize = 32;
@@ -40,9 +54,10 @@ pub const KEY_LEN: usize = 32;
 /// program for another purpose cannot be passed off as Whereabouts' key.
 const ENTROPY: &[u8] = b"Whereabouts database key v1";
 
-/// Folder permissions: full control for SYSTEM and Administrators only,
-/// inherited by files and subfolders, nothing inherited from the parent.
-const FOLDER_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// Folder security: owned by Administrators; full control for SYSTEM and
+/// Administrators only, inherited by files and subfolders, nothing
+/// inherited from the parent.
+const FOLDER_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
 /// Fills a new buffer of `len` bytes from the system's secure random number
 /// generator.
@@ -153,54 +168,219 @@ pub fn load_or_create_key(path: &Path) -> io::Result<[u8; KEY_LEN]> {
     }
 }
 
-/// Creates `path` if needed and restricts it to SYSTEM and Administrators,
-/// replacing any inherited permissions. Requires administrator rights.
-pub fn secure_directory(path: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL string is a valid constant; `descriptor` receives a
-    // LocalAlloc'd security descriptor freed below.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            &HSTRING::from(FOLDER_SDDL),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            None,
-        )
-    }
-    .map_err(|e| io::Error::other(format!("invalid security descriptor: {e}")))?;
+/// A security descriptor made from [`FOLDER_SDDL`], freed when dropped.
+struct FolderDescriptor(PSECURITY_DESCRIPTOR);
 
-    let result = (|| {
+impl FolderDescriptor {
+    fn new() -> io::Result<Self> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the SDDL string is a valid constant; `descriptor`
+        // receives a LocalAlloc'd security descriptor freed in Drop.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(FOLDER_SDDL),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .map_err(|e| io::Error::other(format!("invalid security descriptor: {e}")))?;
+        Ok(Self(descriptor))
+    }
+
+    fn owner(&self) -> io::Result<PSID> {
+        let mut owner = PSID::default();
+        let mut defaulted = BOOL::default();
+        // SAFETY: `self.0` is a valid descriptor; out-pointers are writable.
+        unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) }
+            .map_err(|e| io::Error::other(format!("reading owner failed: {e}")))?;
+        Ok(owner)
+    }
+
+    fn dacl(&self) -> io::Result<*mut ACL> {
         let mut present = BOOL::default();
         let mut defaulted = BOOL::default();
         let mut dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: `descriptor` is valid; the out-pointers are writable.
-        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        // SAFETY: `self.0` is a valid descriptor; out-pointers are writable.
+        unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted) }
             .map_err(|e| io::Error::other(format!("reading permissions failed: {e}")))?;
-        let path_w = HSTRING::from(path.as_os_str());
-        // SAFETY: `path_w` is a valid string; `dacl` points into
-        // `descriptor`, which is still alive.
-        let status = unsafe {
-            SetNamedSecurityInfoW(
-                PCWSTR(path_w.as_ptr()),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(dacl.cast_const()),
-                None,
-            )
-        };
-        if status.is_err() {
+        Ok(dacl)
+    }
+}
+
+impl Drop for FolderDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: allocated by the conversion in `new`; freed exactly once.
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0))) };
+    }
+}
+
+/// A file or folder handle, closed when dropped.
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateFileW and is closed once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Opens `path` (file or folder) **without following** links or junctions.
+fn open_no_follow(path: &Path, access: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: the path string lives for the call; no security attributes or
+    // template handle are passed.
+    let handle = unsafe {
+        CreateFileW(
+            &HSTRING::from(path.as_os_str()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|e| io::Error::other(format!("could not open {}: {e}", path.display())))?;
+    Ok(OwnedHandle(handle))
+}
+
+/// Returns `true` if the owner of the open object is SYSTEM or the
+/// Administrators group.
+fn owned_by_system_or_administrators(handle: &OwnedHandle) -> io::Result<bool> {
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `handle` is open with READ_CONTROL; `descriptor` receives a
+    // LocalAlloc'd buffer that `owner` points into, freed below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "reading the owner failed: {status:?}"
+        )));
+    }
+    // SAFETY: `owner` points into `descriptor`, which is still alive.
+    let trusted = unsafe {
+        IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
+    };
+    // SAFETY: allocated by GetSecurityInfo above; freed exactly once.
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    Ok(trusted)
+}
+
+/// Refuses an object that is a link/junction, of the wrong kind, or not
+/// owned by SYSTEM or Administrators.
+fn check_trusted(handle: &OwnedHandle, path: &Path, directory: bool) -> io::Result<()> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open; `info` is writable.
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
+        .map_err(|e| io::Error::other(format!("could not inspect {}: {e}", path.display())))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is a link or junction; refusing to use it",
+                path.display()
+            ),
+        ));
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0) != directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a {}",
+                path.display(),
+                if directory { "folder" } else { "file" }
+            ),
+        ));
+    }
+    if !owned_by_system_or_administrators(handle)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by an account other than SYSTEM or Administrators; refusing to \
+                 use it (if you did not create it, delete it and try again)",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Makes sure `path` is a private Whereabouts folder: creates it already
+/// secured if it does not exist; otherwise refuses it unless it is a real
+/// folder (not a link or junction) owned by SYSTEM or Administrators. Then
+/// (re)applies the owner and permissions through a handle opened without
+/// following links. Requires administrator rights.
+pub fn secure_directory(path: &Path) -> io::Result<()> {
+    let descriptor = FolderDescriptor::new()?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+        lpSecurityDescriptor: descriptor.0.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: the path string and `attributes` (pointing at `descriptor`)
+    // live for the call.
+    match unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attributes)) } {
+        Ok(()) => {}
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
+        Err(error) => {
             return Err(io::Error::other(format!(
-                "setting folder permissions failed: {status:?}"
+                "could not create {}: {error}",
+                path.display()
             )));
         }
-        Ok(())
-    })();
-    // SAFETY: `descriptor` was allocated by the conversion above; freed once.
-    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
-    result
+    }
+
+    let handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
+    check_trusted(&handle, path, true)?;
+    let owner = descriptor.owner()?;
+    let dacl = descriptor.dacl()?;
+    // SAFETY: `handle` is open with WRITE_DAC and WRITE_OWNER; `owner` and
+    // `dacl` point into `descriptor`, which is still alive.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            Some(owner),
+            None,
+            Some(dacl.cast_const()),
+            None,
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "setting folder permissions failed: {status:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Before using an existing file in the data folder (the key or the
+/// database), makes sure it is a real file, not a link or junction, and is
+/// owned by SYSTEM or Administrators. A file that does not exist yet is
+/// fine: it will be created inside the secured folder.
+pub fn ensure_private_file(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let handle = open_no_follow(path, READ_CONTROL.0)?;
+    check_trusted(&handle, path, false)
 }
 
 #[cfg(test)]
@@ -230,6 +410,80 @@ mod tests {
         let last = protected.len() - 1;
         protected[last] ^= 0xff;
         assert!(unprotect(&protected).is_err());
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("whereabouts-sec-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn junctions_are_refused() {
+        let dir = temp("junction");
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::create_dir(&target).unwrap();
+        // Creating a junction needs no administrator rights.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed");
+
+        let error = secure_directory(&link).unwrap_err();
+        assert!(error.to_string().contains("link or junction"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_where_the_folder_should_be_is_refused() {
+        let dir = temp("file");
+        let path = dir.join("not-a-folder");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(secure_directory(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_owned_by_a_normal_account_is_refused() {
+        let dir = temp("owner");
+        let planted = dir.join("planted");
+        std::fs::create_dir(&planted).unwrap();
+        let handle = open_no_follow(&planted, READ_CONTROL.0).unwrap();
+        if owned_by_system_or_administrators(&handle).unwrap() {
+            eprintln!("skipped: running elevated, so new folders are owned by Administrators");
+            return;
+        }
+        drop(handle);
+        let error = secure_directory(&planted).unwrap_err();
+        assert!(error.to_string().contains("owned by an account"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_files_are_fine_and_planted_files_are_refused() {
+        let dir = temp("files");
+        assert!(ensure_private_file(&dir.join("missing.key")).is_ok());
+
+        let planted = dir.join("planted.key");
+        std::fs::write(&planted, b"not a real key").unwrap();
+        let handle = open_no_follow(&planted, READ_CONTROL.0).unwrap();
+        if owned_by_system_or_administrators(&handle).unwrap() {
+            eprintln!("skipped: running elevated, so new files are owned by Administrators");
+            return;
+        }
+        drop(handle);
+        let error = ensure_private_file(&planted).unwrap_err();
+        assert!(error.to_string().contains("owned by an account"), "{error}");
+
+        // A folder where a file is expected is refused too.
+        assert!(ensure_private_file(&dir).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
