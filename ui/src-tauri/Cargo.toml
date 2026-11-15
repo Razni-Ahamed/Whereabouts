@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 serde.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 whereabouts-client.workspace = true
 whereabouts-ipc.workspace = true
 

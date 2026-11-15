@@ -35,6 +35,20 @@ pub const MAX_ROWS: u32 = 500;
 /// Longest history window a client may ask for, in hours (30 days).
 pub const MAX_HOURS: u32 = 30 * 24;
 
+/// Most flows in one page of the CSV export.
+pub const EXPORT_PAGE_ROWS: u32 = 2000;
+
+/// Most CSV text in one export page, in bytes; well under [`MAX_MESSAGE`],
+/// leaving room for one more (long) line and the JSON around it.
+pub const EXPORT_PAGE_BYTES: usize = 512 * 1024;
+
+/// What a client must send with [`Request::DeleteAll`], so that deleting
+/// everything cannot happen by accident.
+pub const DELETE_ALL_CONFIRMATION: &str = "delete all saved data";
+
+// An export page, plus one more long line and its JSON, must fit in a message.
+const _: () = assert!(EXPORT_PAGE_BYTES * 2 <= MAX_MESSAGE);
+
 /// What a client can ask the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -60,6 +74,20 @@ pub enum Request {
         /// Most rows to return; clamped to [`MAX_ROWS`].
         limit: u32,
     },
+    /// One page of all saved flows as CSV. Start with `after: 0`, then pass
+    /// the `last` of each answer until it is `None`.
+    ExportPage {
+        /// Continue after this flow (0 for the first page).
+        after: i64,
+        /// Most flows in the page; clamped to [`EXPORT_PAGE_ROWS`].
+        limit: u32,
+    },
+    /// Deletes all saved flows and totals. Flows that are still open are
+    /// saved as usual when they finish.
+    DeleteAll {
+        /// Must be [`DELETE_ALL_CONFIRMATION`].
+        confirm: String,
+    },
 }
 
 impl Request {
@@ -73,6 +101,10 @@ impl Request {
             Self::History { hours, limit } => Self::History {
                 hours: hours.min(MAX_HOURS),
                 limit: limit.min(MAX_ROWS),
+            },
+            Self::ExportPage { after, limit } => Self::ExportPage {
+                after: after.max(0),
+                limit: limit.clamp(1, EXPORT_PAGE_ROWS),
             },
             other => other,
         }
@@ -102,6 +134,19 @@ pub enum Response {
         /// Per-app totals, largest first.
         apps: Vec<AppTotals>,
     },
+    /// Answer to [`Request::ExportPage`].
+    ExportPage {
+        /// The CSV header line, on the first page only.
+        header: Option<String>,
+        /// CSV lines, each ending in a line break.
+        csv: String,
+        /// How many flows the page holds.
+        rows: u64,
+        /// Where to continue; `None` when the export is complete.
+        last: Option<i64>,
+    },
+    /// Answer to [`Request::DeleteAll`]: everything saved is deleted.
+    Deleted {},
     /// The request could not be answered.
     Error {
         /// What went wrong, for people.
@@ -335,6 +380,39 @@ mod tests {
                 limit: 5
             }
         );
+    }
+
+    #[test]
+    fn export_and_delete_requests_are_bounded() {
+        assert_eq!(
+            Request::ExportPage {
+                after: -5,
+                limit: 0
+            }
+            .clamped(),
+            Request::ExportPage { after: 0, limit: 1 }
+        );
+        assert_eq!(
+            Request::ExportPage {
+                after: 9,
+                limit: u32::MAX
+            }
+            .clamped(),
+            Request::ExportPage {
+                after: 9,
+                limit: EXPORT_PAGE_ROWS
+            }
+        );
+        round_trip(Request::DeleteAll {
+            confirm: String::from(DELETE_ALL_CONFIRMATION),
+        });
+        round_trip(Response::ExportPage {
+            header: Some(String::from("a,b")),
+            csv: String::from("1,2\n"),
+            rows: 1,
+            last: Some(7),
+        });
+        round_trip(Response::Deleted {});
     }
 
     #[test]

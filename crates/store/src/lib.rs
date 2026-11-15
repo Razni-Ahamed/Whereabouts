@@ -362,49 +362,60 @@ impl Store {
         })
     }
 
-    /// Writes all stored flows as CSV (with a header row) to `out`.
+    /// Writes every stored flow as CSV (a header line, then one line per
+    /// flow, oldest stored first) and returns how many flows were written.
     pub fn export_csv(&self, out: &mut impl Write) -> Result<u64, StoreError> {
-        const COLUMNS: [&str; 18] = [
-            "app_name",
-            "app_path",
-            "app_sha256",
-            "signature",
-            "publisher",
-            "signature_confirmed",
-            "protocol",
-            "remote_ip",
-            "remote_port",
-            "domain",
-            "domain_source",
-            "owner",
-            "country",
-            "first_seen_unix_ms",
-            "last_seen_unix_ms",
-            "bytes_sent",
-            "bytes_received",
-            "connections",
-        ];
-        writeln!(out, "{}", COLUMNS.join(","))?;
-        let mut query = self.conn.prepare(&format!(
-            "SELECT {} FROM flows ORDER BY first_seen",
-            COLUMNS
+        writeln!(out, "{}", csv_header())?;
+        let mut after = 0;
+        let mut written = 0;
+        loop {
+            let page = self.export_page(after, 1000, usize::MAX)?;
+            out.write_all(page.csv.as_bytes())?;
+            written += page.rows;
+            match page.last_id {
+                Some(last) => after = last,
+                None => return Ok(written),
+            }
+        }
+    }
+
+    /// One page of the CSV export: flows stored after the flow with ID
+    /// `after` (0 for the start), at most `max_rows` of them, and no more
+    /// once the text reaches `max_bytes` (at least one flow is always
+    /// included). Lines only; the header comes from [`csv_header`].
+    pub fn export_page(
+        &self,
+        after: i64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<ExportPage, StoreError> {
+        let mut query = self.conn.prepare_cached(&format!(
+            "SELECT id, {} FROM flows WHERE id > ?1 ORDER BY id LIMIT ?2",
+            EXPORT_COLUMNS
                 .iter()
                 .map(|column| column.trim_end_matches("_unix_ms"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))?;
-        let mut rows = query.query([])?;
-        let mut written = 0u64;
+        let limit = i64::try_from(max_rows.max(1)).unwrap_or(i64::MAX);
+        let mut rows = query.query(params![after, limit])?;
+        let mut page = ExportPage::default();
         while let Some(row) = rows.next()? {
-            let mut fields = Vec::with_capacity(COLUMNS.len());
-            for index in 0..COLUMNS.len() {
-                let value: rusqlite::types::Value = row.get(index)?;
+            let id: i64 = row.get(0)?;
+            let mut fields = Vec::with_capacity(EXPORT_COLUMNS.len());
+            for index in 0..EXPORT_COLUMNS.len() {
+                let value: rusqlite::types::Value = row.get(index + 1)?;
                 fields.push(csv_field(&value));
             }
-            writeln!(out, "{}", fields.join(","))?;
-            written += 1;
+            page.csv.push_str(&fields.join(","));
+            page.csv.push('\n');
+            page.rows += 1;
+            page.last_id = Some(id);
+            if page.csv.len() >= max_bytes {
+                break;
+            }
         }
-        Ok(written)
+        Ok(page)
     }
 
     /// Deletes every stored flow and hourly total and compacts the file, so
@@ -500,6 +511,44 @@ fn clamp(value: u64) -> i64 {
 
 fn to_u64(value: Option<i64>) -> u64 {
     value.and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
+}
+
+/// Columns of the CSV export, in order.
+const EXPORT_COLUMNS: [&str; 18] = [
+    "app_name",
+    "app_path",
+    "app_sha256",
+    "signature",
+    "publisher",
+    "signature_confirmed",
+    "protocol",
+    "remote_ip",
+    "remote_port",
+    "domain",
+    "domain_source",
+    "owner",
+    "country",
+    "first_seen_unix_ms",
+    "last_seen_unix_ms",
+    "bytes_sent",
+    "bytes_received",
+    "connections",
+];
+
+/// The CSV export's header line (without a line break).
+pub fn csv_header() -> String {
+    EXPORT_COLUMNS.join(",")
+}
+
+/// One page of the CSV export (see [`Store::export_page`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportPage {
+    /// CSV lines, each ending in a line break.
+    pub csv: String,
+    /// How many flows the page holds.
+    pub rows: u64,
+    /// ID of the last flow in the page; `None` when there were no more.
+    pub last_id: Option<i64>,
 }
 
 /// Formats one CSV field, quoting it if needed. Text that a spreadsheet
@@ -671,6 +720,66 @@ mod tests {
         assert_eq!(report.flows_summarized, 1);
         assert_eq!(report.hourly_deleted, 2);
         assert_eq!(store.flow_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn export_pages_cover_every_flow_once() {
+        let path = temp_db("pages");
+        let mut store = Store::open(&path, &key(5)).unwrap();
+        let records: Vec<FlowRecord> = (0..25)
+            .map(|i| record(&format!("app{i}.exe"), "example.com", 1000 + i, i))
+            .collect();
+        store.insert_flows(&records).unwrap();
+
+        let mut lines = Vec::new();
+        let mut after = 0;
+        let mut pages = 0;
+        loop {
+            let page = store.export_page(after, 7, usize::MAX).unwrap();
+            let Some(last) = page.last_id else { break };
+            assert!(page.rows <= 7);
+            lines.extend(page.csv.lines().map(str::to_owned));
+            after = last;
+            pages += 1;
+        }
+        assert_eq!(pages, 4, "25 flows in pages of 7");
+        assert_eq!(lines.len(), 25);
+        for i in 0..25 {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with(&format!("app{i}.exe,")))
+                    .count(),
+                1,
+                "app{i}.exe exactly once"
+            );
+        }
+
+        // The whole export is the header plus the same lines.
+        let mut out = Vec::new();
+        assert_eq!(store.export_csv(&mut out).unwrap(), 25);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().next().unwrap(), csv_header());
+        assert_eq!(text.lines().skip(1).collect::<Vec<_>>(), lines);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn export_pages_stop_at_the_size_limit_but_never_empty() {
+        let path = temp_db("page-size");
+        let mut store = Store::open(&path, &key(6)).unwrap();
+        let records: Vec<FlowRecord> = (0..5)
+            .map(|i| record("big.exe", "example.com", 1000 + i, i))
+            .collect();
+        store.insert_flows(&records).unwrap();
+        // A limit smaller than one line still returns that one line.
+        let page = store.export_page(0, 100, 1).unwrap();
+        assert_eq!(page.rows, 1);
+        let line = page.csv.len();
+        // Room for about two lines: stops once the limit is reached.
+        let page = store.export_page(0, 100, line + 1).unwrap();
+        assert_eq!(page.rows, 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
