@@ -1,7 +1,53 @@
 <script lang="ts">
-  import { CircleCheck, Clock, Download, FolderLock, ShieldCheck, Trash2, WifiOff } from '@lucide/svelte';
+  import {
+    CircleCheck,
+    Clock,
+    Download,
+    FolderLock,
+    LoaderCircle,
+    ShieldCheck,
+    Trash2,
+    TriangleAlert,
+    WifiOff,
+  } from '@lucide/svelte';
+  import { deleteHistory, exportHistory } from '../lib/api';
   import { count } from '../lib/format';
   import { store } from '../lib/state.svelte';
+
+  // What the controls are doing, and the last result to show.
+  let busy = $state<'export' | 'delete' | null>(null);
+  let outcome = $state<{ tone: 'good' | 'bad'; text: string } | null>(null);
+
+  async function runExport() {
+    busy = 'export';
+    outcome = null;
+    const result = await exportHistory();
+    busy = null;
+    if (!result.ok) {
+      outcome = { tone: 'bad', text: result.problem.message };
+    } else if (result.value) {
+      outcome = {
+        tone: 'good',
+        text: `Exported ${count(result.value.rows)} connections to ${result.value.path}. It is a plain CSV file: keep it private.`,
+      };
+    }
+  }
+
+  async function runDelete() {
+    busy = 'delete';
+    outcome = null;
+    const result = await deleteHistory();
+    busy = null;
+    if (!result.ok) {
+      outcome = { tone: 'bad', text: result.problem.message };
+    } else if (result.value) {
+      outcome = {
+        tone: 'good',
+        text: 'Everything saved so far is deleted. Whereabouts keeps recording new connections.',
+      };
+      void store.refreshHistory();
+    }
+  }
 
   // Whereabouts watches itself like any other app: its own connections to
   // the internet are counted from the live data, not assumed.
@@ -75,9 +121,23 @@
 
     <section class="glass card">
       <h2><ShieldCheck size={18} strokeWidth={1.6} /> Your controls</h2>
-      <p class="muted">Export and delete come to this screen next. Until then, run as administrator:</p>
-      <div class="cmd"><Download size={14} /> <code>whereabouts-service --export flows.csv</code></div>
-      <div class="cmd"><Trash2 size={14} /> <code>whereabouts-service --delete-all --yes</code></div>
+      <p class="muted">Take your history with you, or delete it. Windows asks you to confirm each step.</p>
+      <div class="controls">
+        <button class="btn btn-ghost" type="button" disabled={busy !== null || !!store.problem} onclick={runExport}>
+          {#if busy === 'export'}<LoaderCircle size={16} class="spin" />{:else}<Download size={16} />{/if}
+          Export to CSV…
+        </button>
+        <button class="btn btn-danger" type="button" disabled={busy !== null || !!store.problem} onclick={runDelete}>
+          {#if busy === 'delete'}<LoaderCircle size={16} class="spin" />{:else}<Trash2 size={16} />{/if}
+          Delete everything…
+        </button>
+      </div>
+      {#if outcome}
+        <p class="outcome {outcome.tone}" role="status">
+          {#if outcome.tone === 'good'}<CircleCheck size={16} />{:else}<TriangleAlert size={16} />{/if}
+          <span>{outcome.text}</span>
+        </p>
+      {/if}
     </section>
   </div>
 </div>
@@ -175,20 +235,57 @@
     font-family: var(--font-mono);
     color: var(--mint);
   }
-  .cmd {
+  .controls {
     display: flex;
-    align-items: center;
+    flex-wrap: wrap;
     gap: 10px;
-    margin-top: 8px;
-    padding: 9px 14px;
-    border-radius: var(--radius-sm);
-    background: rgb(3 10 18 / 0.4);
-    border: 1px solid var(--glass-border);
-    color: var(--text-muted);
+    margin-top: 12px;
   }
-  code {
-    font-family: var(--font-mono);
-    font-size: 12.5px;
+  .controls .btn {
+    height: 38px;
+    padding: 0 16px;
+    font-size: 13px;
+  }
+  .controls .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+    transform: none;
+  }
+  .btn-danger {
+    background: var(--danger-bg);
+    border-color: rgb(255 138 122 / 0.35);
+    color: var(--danger);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: rgb(255 138 122 / 0.2);
+  }
+  .outcome {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin: 12px 0 0;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .outcome :global(svg) {
+    flex: none;
+    margin-top: 2px;
+  }
+  .outcome.good {
+    color: var(--accent);
+  }
+  .outcome.bad {
+    color: var(--warn);
+  }
+  .outcome span {
     color: var(--text-soft);
+  }
+  :global(.spin) {
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

@@ -188,8 +188,13 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     };
     let mut last_retention = Instant::now();
 
-    let live: crate::server::SharedState =
-        Arc::new(Mutex::new(crate::server::LiveState::default()));
+    // Clients ask the engine for work only it can do (deleting everything)
+    // through this channel.
+    let (command_sender, commands) = mpsc::channel::<crate::server::EngineCommand>();
+    let live: crate::server::SharedState = Arc::new(Mutex::new(crate::server::LiveState {
+        commands: Some(command_sender),
+        ..crate::server::LiveState::default()
+    }));
     let serving = match crate::server::start(
         PIPE_NAME,
         options.client_sid.as_deref(),
@@ -270,6 +275,13 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             Err(RecvTimeoutError::Disconnected) => break,
         }
         names.poll();
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                crate::server::EngineCommand::DeleteAll { reply } => {
+                    let _ = reply.send(delete_everything(&mut store, &mut closed));
+                }
+            }
+        }
         if last_draw.elapsed() >= REFRESH {
             exited.expire();
             dns.expire(SystemTime::now());
@@ -674,6 +686,28 @@ fn save_closed(
     if let Err(error) = store.insert_flows(&records) {
         report!("warning: could not save {} flows: {error}", records.len());
     }
+}
+
+/// Deletes all saved data, and forgets finished flows that were waiting to
+/// be saved, so nothing from before reappears. Flows still open are saved
+/// as usual when they finish.
+fn delete_everything(store: &mut Option<Store>, closed: &mut Closed) -> Result<(), String> {
+    closed.unsaved_evicted.clear();
+    for row in &mut closed.rows {
+        row.saved = true;
+    }
+    let result = match store.as_mut() {
+        Some(store) => store.wipe().map_err(|e| e.to_string()),
+        // Not saving now, but older data may exist.
+        None => {
+            crate::storage::open().and_then(|mut store| store.wipe().map_err(|e| e.to_string()))
+        }
+    };
+    match &result {
+        Ok(()) => report!("All saved data was deleted at the user's request"),
+        Err(error) => report!("warning: deleting all saved data failed: {error}"),
+    }
+    result
 }
 
 /// Converts a row into what is stored.
@@ -1138,6 +1172,23 @@ mod tests {
             bytes,
             timestamp: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn deleting_everything_forgets_flows_waiting_to_be_saved() {
+        let mut closed = Closed {
+            keep_evicted: true,
+            ..Closed::default()
+        };
+        for _ in 0..MAX_CLOSED + 3 {
+            closed.push(row_to("203.0.113.5:443", None));
+        }
+        assert!(!closed.unsaved_evicted.is_empty());
+        // With no store, the deletion itself may fail in a test, but the
+        // waiting flows must be forgotten either way.
+        let _ = delete_everything(&mut None, &mut closed);
+        assert!(closed.unsaved_evicted.is_empty());
+        assert!(closed.rows.iter().all(|row| row.saved));
     }
 
     #[test]

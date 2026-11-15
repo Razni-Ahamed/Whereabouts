@@ -14,18 +14,34 @@
 //! request's limits are clamped before it is answered.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use whereabouts_client::peer;
 use whereabouts_ipc::{
-    AppTotals, FlowView, PROTOCOL_VERSION, Request, Response, Status, read_message, write_message,
+    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_BYTES, FlowView, PROTOCOL_VERSION, Request,
+    Response, Status, read_message, write_message,
 };
-use whereabouts_store::Store;
+use whereabouts_store::{Store, csv_header};
 use whereabouts_win_pipe::{PipeConnection, PipeListener, current_user_sid};
 
 /// Most clients served at the same time.
 const MAX_CLIENTS: usize = 4;
+
+/// How long a client waits for the engine to delete everything.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Work only the engine can do, asked for by a client.
+#[derive(Debug)]
+pub enum EngineCommand {
+    /// Delete all saved data, including finished flows not saved yet, and
+    /// send back the result.
+    DeleteAll {
+        /// Where to send the result.
+        reply: Sender<Result<(), String>>,
+    },
+}
 
 /// What the engine publishes for clients after each refresh.
 #[derive(Debug, Default)]
@@ -34,6 +50,8 @@ pub struct LiveState {
     pub status: Status,
     /// Current flows, largest first, at most [`whereabouts_ipc::MAX_ROWS`].
     pub flows: Vec<FlowView>,
+    /// Where to send [`EngineCommand`]s; `None` until the engine runs.
+    pub commands: Option<Sender<EngineCommand>>,
 }
 
 /// The live state shared between the engine and the pipe threads.
@@ -146,7 +164,7 @@ fn lock(state: &Mutex<LiveState>) -> MutexGuard<'_, LiveState> {
 }
 
 /// Answers one (already clamped) request. The store is opened the first
-/// time history is asked for, and kept for the rest of the connection.
+/// time saved data is asked for, and kept for the rest of the connection.
 fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>) -> Response {
     match request {
         Request::Hello { .. } => hello(),
@@ -159,26 +177,76 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
                 .cloned()
                 .collect(),
         },
-        Request::History { hours, limit } => history(store, hours, limit),
+        Request::History { hours, limit } => match open_store(store) {
+            Ok(store) => history(store, hours, limit),
+            Err(response) => response,
+        },
+        Request::ExportPage { after, limit } => match open_store(store) {
+            Ok(store) => export_page(store, after, limit),
+            Err(response) => response,
+        },
+        Request::DeleteAll { confirm } => delete_all(state, &confirm),
     }
 }
 
-fn history(store: &mut Option<Store>, hours: u32, limit: u32) -> Response {
+/// The connection's store, opened on first use.
+fn open_store(store: &mut Option<Store>) -> Result<&Store, Response> {
     if store.is_none() {
-        match crate::storage::open() {
-            Ok(opened) => *store = Some(opened),
-            Err(error) => {
-                return Response::Error {
-                    message: format!("history is not available: {error}"),
-                };
-            }
-        }
+        let opened = crate::storage::open().map_err(|error| Response::Error {
+            message: format!("history is not available: {error}"),
+        })?;
+        *store = Some(opened);
     }
-    let Some(store) = store.as_ref() else {
+    store.as_ref().ok_or_else(|| Response::Error {
+        message: String::from("history is not available"),
+    })
+}
+
+fn export_page(store: &Store, after: i64, limit: u32) -> Response {
+    let rows = usize::try_from(limit).unwrap_or(usize::MAX);
+    match store.export_page(after, rows, EXPORT_PAGE_BYTES) {
+        Ok(page) => Response::ExportPage {
+            header: (after == 0).then(csv_header),
+            csv: page.csv,
+            rows: page.rows,
+            last: page.last_id,
+        },
+        Err(error) => Response::Error {
+            message: format!("could not export: {error}"),
+        },
+    }
+}
+
+/// Asks the engine to delete everything saved, and waits for the result.
+fn delete_all(state: &Mutex<LiveState>, confirm: &str) -> Response {
+    if confirm != DELETE_ALL_CONFIRMATION {
         return Response::Error {
-            message: String::from("history is not available"),
+            message: String::from("not deleted: the confirmation did not match"),
+        };
+    }
+    let Some(commands) = lock(state).commands.clone() else {
+        return Response::Error {
+            message: String::from("not deleted: Whereabouts is still starting"),
         };
     };
+    let (reply, result) = mpsc::channel();
+    if commands.send(EngineCommand::DeleteAll { reply }).is_err() {
+        return Response::Error {
+            message: String::from("not deleted: Whereabouts is stopping"),
+        };
+    }
+    match result.recv_timeout(DELETE_TIMEOUT) {
+        Ok(Ok(())) => Response::Deleted {},
+        Ok(Err(error)) => Response::Error {
+            message: format!("could not delete: {error}"),
+        },
+        Err(_) => Response::Error {
+            message: String::from("could not delete: Whereabouts did not answer in time"),
+        },
+    }
+}
+
+fn history(store: &Store, hours: u32, limit: u32) -> Response {
     let since = SystemTime::now()
         .checked_sub(Duration::from_secs(u64::from(hours) * 60 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -243,7 +311,65 @@ mod tests {
             flows: (0..flows)
                 .map(|i| flow(u32::try_from(i).unwrap()))
                 .collect(),
+            commands: None,
         }))
+    }
+
+    #[test]
+    fn deleting_needs_the_exact_confirmation() {
+        let state = shared(1);
+        let mut store = None;
+        let wrong = answer(
+            Request::DeleteAll {
+                confirm: String::from("yes"),
+            },
+            &state,
+            &mut store,
+        );
+        assert!(matches!(wrong, Response::Error { .. }), "{wrong:?}");
+    }
+
+    #[test]
+    fn deleting_is_done_by_the_engine() {
+        let state = shared(1);
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        // A stand-in for the engine that answers one command.
+        let engine = std::thread::spawn(move || match commands.recv().unwrap() {
+            EngineCommand::DeleteAll { reply } => reply.send(Ok(())).unwrap(),
+        });
+        let mut store = None;
+        let done = answer(
+            Request::DeleteAll {
+                confirm: String::from(DELETE_ALL_CONFIRMATION),
+            },
+            &state,
+            &mut store,
+        );
+        engine.join().unwrap();
+        assert_eq!(done, Response::Deleted {});
+    }
+
+    #[test]
+    fn deleting_reports_when_the_engine_is_not_there() {
+        let state = shared(1);
+        let mut store = None;
+        let request = || Request::DeleteAll {
+            confirm: String::from(DELETE_ALL_CONFIRMATION),
+        };
+        // Not started yet.
+        assert!(matches!(
+            answer(request(), &state, &mut store),
+            Response::Error { .. }
+        ));
+        // Stopped: the receiving end is gone.
+        let (sender, commands) = mpsc::channel();
+        drop(commands);
+        lock(&state).commands = Some(sender);
+        assert!(matches!(
+            answer(request(), &state, &mut store),
+            Response::Error { .. }
+        ));
     }
 
     #[test]

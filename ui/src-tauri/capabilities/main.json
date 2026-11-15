@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "The main window may read live and saved data, and nothing else.",
+  "description": "The main window may read live and saved data, and export or delete it after the user confirms in a native dialog. No dialog, file system, shell or network permissions of its own.",
   "windows": ["main"],
-  "permissions": ["allow-live", "allow-history"]
+  "permissions": ["allow-live", "allow-history", "allow-export-history", "allow-delete-history"]
 }

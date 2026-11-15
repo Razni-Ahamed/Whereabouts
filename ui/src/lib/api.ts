@@ -31,6 +31,35 @@ export async function live(limit = 500): Promise<Result<Live>> {
   return call<Live>('live', { limit });
 }
 
+export interface Exported {
+  path: string;
+  rows: number;
+}
+
+/**
+ * Asks where to save (a native Windows dialog) and exports all saved flows
+ * there as CSV. `null` if the user cancelled.
+ */
+export async function exportHistory(): Promise<Result<Exported | null>> {
+  if (isDemo) {
+    await new Promise((r) => setTimeout(r, 600));
+    return { ok: true, value: { path: 'C:\\Users\\you\\Documents\\whereabouts-history.csv', rows: 4812 } };
+  }
+  return call<Exported | null>('export_history');
+}
+
+/**
+ * Asks for confirmation (a native Windows dialog) and deletes everything
+ * saved. `false` if the user said no.
+ */
+export async function deleteHistory(): Promise<Result<boolean>> {
+  if (isDemo) {
+    await new Promise((r) => setTimeout(r, 600));
+    return { ok: true, value: window.confirm('Demo: delete everything Whereabouts saved?') };
+  }
+  return call<boolean>('delete_history');
+}
+
 /** Saved per-app totals of the last `hours`. */
 export async function history(hours = 24, limit = 50): Promise<Result<AppTotals[]>> {
   if (isDemo) return { ok: true, value: demoHistory() };
