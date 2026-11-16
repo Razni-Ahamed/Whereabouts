@@ -10,6 +10,7 @@ First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
 
 ### Changed
 
+- `serde_with` (used inside Tauri) updated from 3.17 to 3.24, fixing a crash on empty sequences in its `KeyValueMap` (GHSA-7gcf-g7xr-8hxj).
 - PRIVACY.md now describes exactly what version 0.1 does: it makes no internet requests at all (the installer may fetch Microsoft's WebView2 if Windows lacks it), and features that are designed but not built yet (on-device learning, retention and browser settings, foreground tracking, signed update downloads) are listed separately as planned. SECURITY.md lists 0.1.x as supported.
 - Minimum Rust version raised from 1.85 to 1.88, to take security fixes for `time` (RUSTSEC-2026-0009) and `quick-xml` (RUSTSEC-2026-0194, RUSTSEC-2026-0195), both reached through Tauri. Six unmaintained (not vulnerable) crates inside Tauri are recorded in `deny.toml` with reasons; any new advisory still fails CI.
 
