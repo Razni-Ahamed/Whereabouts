@@ -4,6 +4,10 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-16
+
+First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
+
 ### Changed
 
 - PRIVACY.md now describes exactly what version 0.1 does: it makes no internet requests at all (the installer may fetch Microsoft's WebView2 if Windows lacks it), and features that are designed but not built yet (on-device learning, retention and browser settings, foreground tracking, signed update downloads) are listed separately as planned. SECURITY.md lists 0.1.x as supported.
@@ -40,3 +44,6 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - Cargo workspace with `core`, `enrich`, `ipc`, `store`, `win-capture`, `win-firewall` and `service` crates.
 - `core`: connection metadata model, robust statistics (median, MAD, robust z-score) and domain entropy.
 - CI on Windows: formatting, Clippy, tests, and licence/advisory checks with `cargo-deny`.
+
+[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Razni-Ahamed/Whereabouts/releases/tag/v0.1.0
