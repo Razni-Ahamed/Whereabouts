@@ -50,14 +50,13 @@
   }
 
   // Whereabouts watches itself like any other app: its own connections to
-  // the internet are counted from the live data, not assumed.
-  const OWN = ['whereabouts.exe', 'whereabouts-service.exe'];
+  // the internet are counted from the live data, not assumed. "Own" means
+  // the processes the app reports as Whereabouts: the app, the WebView2
+  // helper processes that draw its window, and the service.
+  const ownPids = $derived(new Set(store.live?.own_pids ?? []));
   const own = $derived(
     (store.live?.flows ?? []).filter(
-      (f) =>
-        OWN.includes(f.app.toLowerCase()) &&
-        f.owner !== 'local network' &&
-        f.owner !== 'multicast',
+      (f) => ownPids.has(f.pid) && f.owner !== 'local network' && f.owner !== 'multicast',
     ),
   );
 
@@ -95,8 +94,9 @@
       <div>
         <b class="display">{store.live ? own.length : '—'}</b>
         <span>
-          internet connections by Whereabouts itself right now. It watches itself like any other
-          app; company and country data are offline lists.
+          internet connections by Whereabouts itself right now: the service, this app and the
+          WebView2 helpers that draw its window. It watches itself like any other app; company and
+          country data are offline lists.
         </span>
       </div>
     </section>

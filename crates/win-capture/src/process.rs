@@ -7,7 +7,12 @@
 
 use std::time::SystemTime;
 
+use std::collections::{HashMap, HashSet};
+
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
@@ -104,9 +109,109 @@ impl Drop for ProcessHandle {
     }
 }
 
+/// Every running process's ID and its parent's ID.
+fn parents() -> Vec<(u32, u32)> {
+    // SAFETY: no pointers are passed; the snapshot handle is closed below.
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return Vec::new();
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap_or(0),
+        ..PROCESSENTRY32W::default()
+    };
+    let mut pairs = Vec::new();
+    // SAFETY: `entry` is a writable PROCESSENTRY32W with `dwSize` set, as
+    // the snapshot functions require; the snapshot handle is valid.
+    let mut found = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while found {
+        pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: as above.
+        found = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    // SAFETY: the snapshot handle is closed exactly once.
+    let _ = unsafe { CloseHandle(snapshot) };
+    pairs
+}
+
+/// The processes that process `root` started, directly or indirectly (for
+/// example an app's WebView2 helper processes).
+///
+/// Windows reuses process IDs, so a process whose recorded parent ID is in
+/// the tree but which started *before* that parent is someone else's child
+/// and is left out. When a start time cannot be read, the process is kept:
+/// for counting Whereabouts' own connections, counting a stranger is safer
+/// than missing one of ours.
+pub fn descendants(root: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, parent) in parents() {
+        if pid != parent {
+            children.entry(parent).or_default().push(pid);
+        }
+    }
+    let started = |pid: u32| ProcessHandle::open(pid).and_then(|p| p.start_time());
+    let mut found = Vec::new();
+    let mut seen = HashSet::from([root]);
+    let mut queue = vec![(root, started(root))];
+    while let Some((parent, parent_start)) = queue.pop() {
+        for &child in children.get(&parent).into_iter().flatten() {
+            if !seen.insert(child) {
+                continue;
+            }
+            let child_start = started(child);
+            if let (Some(parent_start), Some(child_start)) = (parent_start, child_start)
+                && child_start < parent_start
+            {
+                continue;
+            }
+            found.push(child);
+            queue.push((child, child_start));
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_children_and_grandchildren() {
+        // cmd starts another cmd, which waits a few seconds.
+        let mut child = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/c",
+                r"C:\Windows\System32\cmd.exe /c ping -n 4 127.0.0.1 > nul",
+            ])
+            .spawn()
+            .unwrap();
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = descendants(std::process::id());
+            if found.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let child_id = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            found.contains(&child_id),
+            "{found:?} should contain {child_id}"
+        );
+        assert!(
+            found.len() >= 2,
+            "the grandchild should be found too: {found:?}"
+        );
+        assert!(!found.contains(&std::process::id()));
+    }
+
+    #[test]
+    fn a_process_with_no_children_has_no_descendants() {
+        // The System process's children are kernel-started; an exited or
+        // made-up ID has none.
+        assert!(descendants(u32::MAX - 3).is_empty());
+    }
 
     #[test]
     fn idle_and_system_processes_are_special_cased() {

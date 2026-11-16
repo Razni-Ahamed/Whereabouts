@@ -53,4 +53,6 @@ export interface Live {
   version: string;
   status: Status;
   flows: FlowView[];
+  /** Process IDs that are Whereabouts: the app, its WebView2 helpers, the service. */
+  own_pids: number[];
 }

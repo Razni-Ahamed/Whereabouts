@@ -52,6 +52,22 @@ pub fn kernel_events_protected(service_says: bool) -> bool {
         || *HERE.get_or_init(whereabouts_win_capture::protection::kernel_providers_protected)
 }
 
+/// The process IDs that are Whereabouts, seen from this program: this
+/// process, every process it started (such as the desktop app's WebView2
+/// helper processes, which draw its window), and the installed service.
+/// Used to count Whereabouts' own connections, so none are missed.
+pub fn own_process_ids() -> Vec<u32> {
+    let me = std::process::id();
+    let mut ids = vec![me];
+    ids.extend(whereabouts_win_capture::process::descendants(me));
+    if let Some(service) = peer::service_process_id() {
+        ids.push(service);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Why the service could not be asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +237,20 @@ mod tests {
         // them itself gets a reassuring answer.
         assert!(kernel_events_protected(false));
         assert!(kernel_events_protected(true));
+    }
+
+    #[test]
+    fn own_processes_include_this_one_and_its_children() {
+        let mut child = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/c", "ping -n 3 127.0.0.1 > nul"])
+            .spawn()
+            .unwrap();
+        let ids = own_process_ids();
+        let child_id = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(ids.contains(&std::process::id()));
+        assert!(ids.contains(&child_id), "{ids:?} should contain {child_id}");
     }
 
     #[test]
