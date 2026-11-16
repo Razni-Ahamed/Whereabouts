@@ -81,6 +81,7 @@ export function demoLive(): Live {
       tracker_domains: 47_359,
     },
     flows,
+    own_pids: [],
   };
 }
 

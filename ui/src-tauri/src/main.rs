@@ -27,6 +27,9 @@ struct Live {
     version: String,
     status: Status,
     flows: Vec<FlowView>,
+    /// Process IDs that are Whereabouts (this app, its WebView2 helpers and
+    /// the service), so the Privacy screen counts all of their connections.
+    own_pids: Vec<u32>,
 }
 
 /// One connection to the service, reused between requests and opened again
@@ -86,6 +89,7 @@ async fn live(limit: u32, connection: tauri::State<'_, Arc<Connection>>) -> Resu
                 version: client.version().to_owned(),
                 status,
                 flows,
+                own_pids: whereabouts_client::own_process_ids(),
             })
         })
     })

@@ -4,6 +4,10 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- The Privacy screen's count of Whereabouts' own internet connections now includes the Microsoft WebView2 helper processes that draw the app's window (they run as separate programs, so matching by name missed them), and identifies the app and service by process ID rather than by file name. Checked on 0.1.0: these helpers made no internet connections.
+
 ## [0.1.0] - 2026-11-16
 
 First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
