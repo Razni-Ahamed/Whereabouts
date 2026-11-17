@@ -45,7 +45,7 @@ We recommend turning on **BitLocker** so that someone who steals your computer's
 ## Blocking (from version 0.2)
 
 - The **rules you make** (which programs, domains and addresses to block) are saved in the same encrypted database, and applied as rules in the Windows firewall (the Windows Filtering Platform), under Whereabouts' own name so they can be listed and removed. Deleting your history keeps your rules; deleting all data when uninstalling deletes them too.
-- **Domain blocks** use the DNS answers Whereabouts already sees; blocking needs no extra data and makes no requests. The addresses learned for a blocked domain are stored in the firewall rules themselves and removed a day after they were last seen.
+- **Domain blocks** use the DNS answers Whereabouts already sees; blocking needs no extra data and makes no requests. The addresses learned for a blocked domain are stored in the firewall rules themselves and removed a day after they were last seen. A block for every app skips addresses that other, unblocked sites also use, so it cannot cut you off from them.
 - Whereabouts never blocks what Windows needs to stay online (core Windows programs, DNS servers, your local network). **Pause** lifts every block at once and keeps your rules; `whereabouts-service --unblock-all` (as administrator) does the same even if the service is not running. **Uninstalling removes every block.**
 
 ## Requests Whereabouts makes itself

@@ -145,15 +145,32 @@ impl Block {
 }
 
 /// A full path in one canonical spelling (so the same program always gives
-/// the same rule), without the `\\?\` prefix. The file must exist.
+/// the same rule), without the `\\?\` prefix. The file must exist, on a
+/// local drive (see [`wfp::is_local_drive_path`]).
 pub fn normalize_path(path: &Path) -> io::Result<PathBuf> {
     normalize(path)
 }
 
 fn normalize(path: &Path) -> io::Result<PathBuf> {
+    let not_local = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only programs on this computer's own drives can be blocked",
+        )
+    };
+    // Checked before touching the file system: the service must never
+    // open a path on another computer.
+    if !wfp::is_local_drive_path(path) {
+        return Err(not_local());
+    }
     let full = std::fs::canonicalize(path)?;
     let text = full.to_string_lossy();
-    Ok(PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)))
+    let normal = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
+    // A link on a local drive could lead elsewhere.
+    if !wfp::is_local_drive_path(&normal) {
+        return Err(not_local());
+    }
+    Ok(normal)
 }
 
 /// The filter key for `block` in `layer`: the same rule always gets the
@@ -527,6 +544,26 @@ mod tests {
             !direct_json.contains("via") && !direct_json.contains("learned"),
             "{direct_json}"
         );
+    }
+
+    #[test]
+    fn only_programs_on_local_drives_are_accepted() {
+        for remote in [
+            r"\\server\share\x.exe",
+            r"\\?\UNC\server\share\x.exe",
+            r"\\.\pipe\x",
+            r"\\?\C:\Windows\System32\curl.exe",
+            r"C:Windows\x.exe",
+            "C:/Windows/System32/curl.exe",
+            "curl.exe",
+            "",
+        ] {
+            assert!(!wfp::is_local_drive_path(Path::new(remote)), "{remote}");
+            assert!(normalize_path(Path::new(remote)).is_err(), "{remote}");
+        }
+        let curl = PathBuf::from(std::env::var("SystemRoot").unwrap()).join(r"System32\curl.exe");
+        assert!(wfp::is_local_drive_path(&curl));
+        assert!(normalize_path(&curl).is_ok());
     }
 
     #[test]

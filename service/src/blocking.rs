@@ -16,6 +16,7 @@
 //! - **Pause** removes every filter but keeps the rules; resuming re-applies
 //!   them. The paused state is saved.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,9 @@ const MAX_LEARNED_PER_RULE: usize = 256;
 
 /// Longest domain name accepted (DNS limit).
 const MAX_DOMAIN: usize = 253;
+
+/// Most addresses remembered as used by unblocked domains.
+const MAX_SHARED: usize = 4096;
 
 /// Checks a rule from a client and puts it in its one saved spelling:
 /// program paths must exist and are normalised, domains are cleaned, and
@@ -323,6 +327,11 @@ pub struct Blocker<F: Firewalls> {
     rules: Vec<StoredRule>,
     paused: bool,
     learned: Vec<Learned>,
+    /// Addresses the DNS service confirmed for domains no "every app"
+    /// domain rule covers, and when. "Every app" domain rules never block
+    /// these: the address is shared (a CDN), or the blocked domain's owner
+    /// pointed it at someone else's server.
+    shared: HashMap<IpAddr, SystemTime>,
 }
 
 impl<F: Firewalls> std::fmt::Debug for Blocker<F> {
@@ -387,6 +396,7 @@ impl<F: Firewalls> Blocker<F> {
             rules,
             paused,
             learned: Vec::new(),
+            shared: HashMap::new(),
         };
         let warnings = blocker.reconcile(now);
         Ok((blocker, warnings))
@@ -492,6 +502,14 @@ impl<F: Firewalls> Blocker<F> {
             return;
         }
         let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let every_app_rule_covers = self.rules.iter().any(|rule| {
+            matches!(&rule.target, RuleTarget::Domain { name: domain, app: None } if covers(domain, &name))
+        });
+        if !every_app_rule_covers {
+            for ip in addresses {
+                self.note_shared(ip.to_canonical(), now);
+            }
+        }
         let matching: Vec<(i64, Option<String>)> = self
             .rules
             .iter()
@@ -513,6 +531,49 @@ impl<F: Firewalls> Blocker<F> {
         }
     }
 
+    /// Remembers that an unblocked domain uses `ip`, and lifts "every app"
+    /// blocks learned for it.
+    fn note_shared(&mut self, ip: IpAddr, now: SystemTime) {
+        if self.shared.len() >= MAX_SHARED
+            && !self.shared.contains_key(&ip)
+            && let Some(oldest) = self
+                .shared
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(ip, _)| *ip)
+        {
+            self.shared.remove(&oldest);
+        }
+        self.shared.insert(ip, now);
+        let (lifted, kept): (Vec<Learned>, Vec<Learned>) = std::mem::take(&mut self.learned)
+            .into_iter()
+            .partition(|l| l.ip == ip && l.app.is_none());
+        self.learned = kept;
+        for old in &lifted {
+            self.release(old);
+        }
+    }
+
+    /// Whether an unblocked domain was seen using `ip` recently.
+    fn is_shared(&self, ip: IpAddr, now: SystemTime) -> bool {
+        self.shared.get(&ip).is_some_and(|seen| {
+            now.duration_since(*seen)
+                .map_or(true, |age| age < LEARNED_FOR)
+        })
+    }
+
+    /// Whether an address rule blocks `ip` for `app` itself (its filter is
+    /// the same as a learned one's would be).
+    fn address_rule_covers(&self, ip: IpAddr, app: Option<&Path>) -> bool {
+        self.rules.iter().any(|rule| match &rule.target {
+            RuleTarget::Address {
+                ip: rule_ip,
+                app: rule_app,
+            } => *rule_ip == ip && same_app_path(rule_app.as_deref().map(Path::new), app),
+            _ => false,
+        })
+    }
+
     fn learn(
         &mut self,
         rule: i64,
@@ -522,6 +583,13 @@ impl<F: Firewalls> Blocker<F> {
         now: SystemTime,
     ) {
         let ip = ip.to_canonical();
+        // An address rule already blocks it; never touch that filter.
+        if self.address_rule_covers(ip, app.as_deref()) {
+            return;
+        }
+        if app.is_none() && self.is_shared(ip, now) {
+            return;
+        }
         let now_secs = unix_secs(now);
         if let Some(index) = self
             .learned
@@ -575,7 +643,8 @@ impl<F: Firewalls> Blocker<F> {
         let still_wanted = self
             .learned
             .iter()
-            .any(|l| l.ip == old.ip && l.app == old.app);
+            .any(|l| l.ip == old.ip && l.app == old.app)
+            || self.address_rule_covers(old.ip, old.app.as_deref());
         if !still_wanted {
             let _ = self.firewall.unblock(&old.block());
         }
@@ -1005,6 +1074,69 @@ mod tests {
         // Removing the rule unblocks what it learned.
         assert!(blocker.remove(&mut store, id, at(T0 + 30 * 3600)).unwrap());
         assert!(blocker.firewall.blocks.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_app_domain_rules_skip_addresses_other_domains_use() {
+        let (mut store, dir) = store("shared");
+        let (mut blocker, _) = Blocker::start(Fake::default(), &store, at(T0)).unwrap();
+        blocker
+            .add(
+                &mut store,
+                RuleTarget::Domain {
+                    name: String::from("tracker.example.com"),
+                    app: None,
+                },
+                at(T0),
+            )
+            .unwrap();
+        let bank: IpAddr = "198.51.100.7".parse().unwrap();
+        let cdn: IpAddr = "203.0.113.9".parse().unwrap();
+        // The blocked domain points at the bank's address: blocked at first...
+        blocker.on_confirmed_answer("tracker.example.com", &[bank], at(T0 + 1));
+        assert_eq!(blocker.firewall.blocks.len(), 1);
+        // ...until the bank's own name is seen using it: lifted, and not
+        // blocked again while it is in use.
+        blocker.on_confirmed_answer("www.bank.example", &[bank], at(T0 + 2));
+        assert!(blocker.firewall.blocks.is_empty());
+        blocker.on_confirmed_answer("tracker.example.com", &[bank], at(T0 + 3));
+        assert!(blocker.firewall.blocks.is_empty());
+        // A CDN address an unblocked site used first is never blocked.
+        blocker.on_confirmed_answer("site.example.org", &[cdn], at(T0 + 4));
+        blocker.on_confirmed_answer("tracker.example.com", &[cdn], at(T0 + 5));
+        assert!(blocker.firewall.blocks.is_empty());
+        // After a day without being seen elsewhere, it can be blocked again.
+        blocker.on_confirmed_answer("tracker.example.com", &[cdn], at(T0 + 5 + 86_400));
+        assert_eq!(blocker.firewall.blocks.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_learned_address_never_lifts_an_address_rule() {
+        let (mut store, dir) = store("collide");
+        let (mut blocker, _) = Blocker::start(Fake::default(), &store, at(T0)).unwrap();
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        blocker
+            .add(&mut store, RuleTarget::Address { ip, app: None }, at(T0))
+            .unwrap();
+        blocker
+            .add(
+                &mut store,
+                RuleTarget::Domain {
+                    name: String::from("tracker.example.com"),
+                    app: None,
+                },
+                at(T0),
+            )
+            .unwrap();
+        blocker.on_confirmed_answer("tracker.example.com", &[ip], at(T0 + 1));
+        blocker.expire(at(T0 + 3 * 86_400));
+        assert_eq!(
+            blocker.firewall.blocks.len(),
+            1,
+            "the address rule's block stays"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

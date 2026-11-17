@@ -29,6 +29,7 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 
@@ -411,6 +412,29 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Whether `path` is on a local drive: `X:\...` where drive X is a fixed,
+/// removable, optical or RAM drive. Everything else (`\\server\share`,
+/// `\\?\` and `\\.\` paths, network drives) is refused **before any file
+/// system call**, so the service never connects to another computer, and
+/// never offers it this computer's credentials.
+pub fn is_local_drive_path(path: &Path) -> bool {
+    // Values of GetDriveTypeW (WindowsProgramming's DRIVE_* constants).
+    const REMOVABLE: u32 = 2;
+    const FIXED: u32 = 3;
+    const CDROM: u32 = 5;
+    const RAMDISK: u32 = 6;
+    let text = path.as_os_str().to_string_lossy();
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    let root = HSTRING::from(format!("{}:\\", char::from(bytes[0])));
+    // SAFETY: `root` is a valid, NUL-terminated wide string that outlives
+    // the call; GetDriveTypeW only reads it.
+    let kind = unsafe { GetDriveTypeW(&root) };
+    matches!(kind, REMOVABLE | FIXED | CDROM | RAMDISK)
 }
 
 /// The DNS servers this computer is configured to use, on any adapter.
