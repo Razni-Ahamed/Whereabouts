@@ -339,6 +339,7 @@ mod tests {
         let mut flow = FlowView {
             pid: 1,
             app: String::from("curl.exe"),
+            path: None,
             publisher: String::from("Microsoft 3rd Party Application Component"),
             publisher_confirmed: false,
             protocol: String::from("TCP"),

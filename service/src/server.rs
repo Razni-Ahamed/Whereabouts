@@ -328,6 +328,7 @@ mod tests {
         FlowView {
             pid,
             app: String::from("curl.exe"),
+            path: None,
             publisher: String::from("Microsoft Windows"),
             publisher_confirmed: true,
             protocol: String::from("TCP"),

@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { Download, Globe, MapPin, Radar, Search, Upload } from '@lucide/svelte';
+  import { Ban, Download, Globe, MapPin, Radar, Search, ShieldOff, Upload } from '@lucide/svelte';
   import AppAvatar from '../lib/components/AppAvatar.svelte';
   import FlowTable from '../lib/components/FlowTable.svelte';
   import Trust from '../lib/components/Trust.svelte';
   import { appLabel, bytes, countryName } from '../lib/format';
-  import { store } from '../lib/state.svelte';
+  import { appRule, store } from '../lib/state.svelte';
 
   let { selected = $bindable() }: { selected: string | null } = $props();
   let query = $state('');
@@ -16,6 +16,22 @@
     store.apps.find((a) => a.app === selected) ?? store.apps[0] ?? null,
   );
   const saved = $derived(current ? store.history.find((h) => h.app === current.app) : undefined);
+  const rule = $derived(appRule(store.rules, current?.path ?? null));
+  let busy = $state(false);
+
+  async function blockApp() {
+    if (!current?.path) return;
+    busy = true;
+    await store.block({ kind: 'app', path: current.path }, appLabel(current.app));
+    busy = false;
+  }
+
+  async function unblockApp() {
+    if (!rule) return;
+    busy = true;
+    await store.unblock(rule.id);
+    busy = false;
+  }
 </script>
 
 <div class="layout">
@@ -56,7 +72,25 @@
             {current.publisher === '-' ? 'No program file' : current.publisher}
             <Trust kind="publisher" publisher={current.publisher} confirmed={current.publisherConfirmed} />
           </p>
-          <p class="file muted">{current.app} · process {[...new Set(current.flows.map((f) => f.pid))].join(', ')}</p>
+          <p class="file muted" title={current.path ?? undefined}>
+            {current.path ?? current.app} · process {[...new Set(current.flows.map((f) => f.pid))].join(', ')}
+          </p>
+        </div>
+        <div class="actions">
+          {#if rule}
+            <span class="chip chip-danger"><ShieldOff size={13} /> Blocked{store.rules?.paused ? ' (paused)' : ''}</span>
+            <button class="btn btn-ghost" type="button" disabled={busy} onclick={unblockApp}>Unblock</button>
+          {:else}
+            <button
+              class="btn btn-ghost block-app"
+              type="button"
+              disabled={busy || !current.path}
+              title={current.path ? 'Block every connection of this app' : "Whereabouts doesn't know this app's program file"}
+              onclick={blockApp}
+            >
+              <Ban size={16} /> Block app
+            </button>
+          {/if}
         </div>
       </div>
 
@@ -95,7 +129,7 @@
 <style>
   .layout {
     display: grid;
-    grid-template-columns: 320px 1fr;
+    grid-template-columns: 320px minmax(0, 1fr);
     gap: 18px;
     align-items: start;
   }
@@ -179,6 +213,7 @@
   }
   .detail {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 18px;
     min-width: 0;
   }
@@ -194,6 +229,31 @@
     font-size: 36px;
     line-height: 1.1;
   }
+  .title {
+    flex: 1;
+    min-width: 0;
+  }
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: none;
+  }
+  .actions .btn {
+    height: 38px;
+    padding: 0 16px;
+    font-size: 13px;
+  }
+  .actions .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+    transform: none;
+  }
+  .block-app:hover:not(:disabled) {
+    color: var(--danger);
+    border-color: rgb(255 138 122 / 0.35);
+    background: var(--danger-bg);
+  }
   .title .pub {
     margin: 4px 0 2px;
     display: flex;
@@ -205,6 +265,9 @@
   .file {
     margin: 0;
     font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .care {
     display: grid;

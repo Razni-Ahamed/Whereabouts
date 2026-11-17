@@ -7,6 +7,10 @@ fn main() {
             "history",
             "export_history",
             "delete_history",
+            "rules",
+            "add_rule",
+            "remove_rule",
+            "set_blocking_paused",
         ]),
     ))
     .expect("failed to run the Tauri build script");
