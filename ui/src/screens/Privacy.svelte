@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    BellRing,
     CircleCheck,
     Clock,
     Download,
@@ -11,12 +12,29 @@
     WifiOff,
   } from '@lucide/svelte';
   import { deleteHistory, exportHistory } from '../lib/api';
+  import Toggle from '../lib/components/Toggle.svelte';
+  import type { AppSettings } from '../lib/types';
   import { count } from '../lib/format';
   import { store } from '../lib/state.svelte';
 
   // What the controls are doing, and the last result to show.
   let busy = $state<'export' | 'delete' | null>(null);
   let outcome = $state<{ tone: 'good' | 'bad'; text: string } | null>(null);
+
+  let saving = $state(false);
+
+  async function change(patch: Partial<Pick<AppSettings, 'start_at_sign_in' | 'notifications' | 'show_names'>>) {
+    const current = store.settings;
+    if (!current) return;
+    saving = true;
+    await store.saveSettings({
+      start_at_sign_in: current.start_at_sign_in,
+      notifications: current.notifications,
+      show_names: current.show_names,
+      ...patch,
+    });
+    saving = false;
+  }
 
   async function runExport() {
     busy = 'export';
@@ -118,6 +136,36 @@
         {/if}
       </p>
     </section>
+
+    {#if store.settings}
+      {@const s = store.settings}
+      <section class="glass card">
+        <h2><BellRing size={18} strokeWidth={1.6} /> Notifications and startup</h2>
+        <Toggle
+          checked={s.start_at_sign_in}
+          disabled={saving || !s.can_start_at_sign_in}
+          label="Start in the tray when I sign in"
+          detail={s.can_start_at_sign_in
+            ? 'Needed for notifications. Closing the window then keeps Whereabouts in the tray.'
+            : 'Only the installed app can start at sign-in.'}
+          onchange={(v) => change({ start_at_sign_in: v })}
+        />
+        <Toggle
+          checked={s.notifications}
+          disabled={saving}
+          label="Show notifications"
+          detail="When an app uses the internet for the first time, when Whereabouts stops watching, and when blocking stays paused."
+          onchange={(v) => change({ notifications: v })}
+        />
+        <Toggle
+          checked={s.show_names}
+          disabled={saving || !s.notifications}
+          label="Name apps in notifications"
+          detail="Off by default: Windows keeps a history of notifications and can show them on the lock screen."
+          onchange={(v) => change({ show_names: v })}
+        />
+      </section>
+    {/if}
 
     <section class="glass card">
       <h2><ShieldCheck size={18} strokeWidth={1.6} /> Your controls</h2>

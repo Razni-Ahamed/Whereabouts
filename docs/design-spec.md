@@ -321,6 +321,19 @@ Implementation notes (M6, 2026-11-14):
 | The Privacy screen counts Whereabouts' own internet connections from the live data, by process ID: the app, every process it started (its WebView2 helpers, which a name match would miss), and the service (its ID from the Service Control Manager). A child counts only if it started after its parent, so a reused process ID cannot pull in a stranger. | "Whereabouts makes no requests" is shown as a measurement, not a claim. Checked 2026-11-16: the app's 6 WebView2 helpers made no internet connections. |
 | Export and delete-all on the Privacy screen | The CSV is streamed over the pipe in pages and written **by the app**, as the user, to a place chosen in a native Save dialog: the SYSTEM service never writes to a path it is given, and the web view never supplies a path (both commands take no arguments). Before deleting, the app's Rust side asks in a native Windows dialog, so even a compromised web view cannot delete without the user. The dialog plugin's own commands are not available to the web view. |
 
+Implementation notes (v0.2, N4 tray and notifications, 2026-11-17):
+
+| Decision | Reason |
+|---|---|
+| The **app** shows notifications and lives in the **tray**; the service only reports | The service runs as SYSTEM in session 0 and cannot reach the user's desktop. |
+| **Start at sign-in** is one value under the user's `HKCU\...\CurrentVersion\Run` (`"...\whereabouts.exe" --background`), set only when the user says yes: asked once on first run, suggested on (decision D13), changeable on the Privacy screen. A program turned off in Windows' "Startup apps" counts as off. Only the installed app can turn it on. Uninstalling removes the value | Windows' own list is the source of truth, so the app never claims something Windows will not do. A developer build must never register itself. The registry code lives in a small crate, `win-startup` (`unsafe` only for the registry calls). |
+| Started at sign-in, the app shows **only the tray icon**; the window (and its web view) exists only while open, and closing it keeps the app in the tray only while start-at-sign-in is on (otherwise closing quits). A second start brings the running app forward (single instance) | Little memory in the background; no surprise background app for people who said no. |
+| Tray menu: Open, Pause/Resume blocking, Close the app (Whereabouts keeps watching). Left click opens the window | The common actions without opening the window. |
+| A background checker in the app asks the service every 5 s and notifies: **stopped watching** (service unreachable for 20 s) and **watching again**; **blocking still paused** after an hour; **new apps** | Health a security tool must surface; the rest are alerts (N5), which will use the same path. |
+| **New apps:** the service remembers every program that used the network (`known_apps`, schema v3, filled from the saved history when upgrading) and reports the first use of a new one as a notice (`Request::Notices`, at most 100 kept). Programs seen in the **first 24 hours** (and again after the history is deleted) are learned quietly. The app shows at most one new-app notification a minute, grouping the rest, and only notices that arrive while it runs | "Notify after" (§5.6) without a flood of notifications on day one. |
+| Notifications **name no apps or sites unless the user allows it** (off by default) | Windows keeps notification history on disk and can show notifications on the lock screen. |
+| The app's settings are a small JSON file of on/off choices in `%APPDATA%\org.whereabouts.app` | Per user, never captured data. |
+
 ---
 
 ## 6. Detection and learning

@@ -74,6 +74,18 @@ export interface Rules {
   paused: boolean;
 }
 
+/** The app's own settings (per Windows user). */
+export interface AppSettings {
+  /** Whether Windows starts the app in the tray at sign-in. */
+  start_at_sign_in: boolean;
+  /** False for a developer build: only the installed app can start at sign-in. */
+  can_start_at_sign_in: boolean;
+  notifications: boolean;
+  /** Whether notifications may name apps and sites. */
+  show_names: boolean;
+  first_run_done: boolean;
+}
+
 export interface Live {
   version: string;
   status: Status;

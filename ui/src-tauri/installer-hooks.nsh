@@ -6,7 +6,8 @@
 ; - an older version's service is stopped and removed before its files are
 ;   replaced (saved history is kept);
 ; - after copying, the service is registered and started in place;
-; - before uninstalling, the service is stopped and removed, its blocks are
+; - before uninstalling, the service is stopped and removed, the app stops
+;   starting at sign-in, its blocks are
 ;   removed from the firewall, and the user chooses whether to delete the
 ;   saved history (default: keep it). When updating, blocks stay in place
 ;   (the new version applies the saved rules again when it starts).
@@ -43,4 +44,10 @@
   DetailPrint "Stopping and removing the Whereabouts service..."
   nsExec::ExecToLog '"$INSTDIR\whereabouts-service.exe" --unregister $1'
   Pop $0
+  ${If} $UpdateMode <> 1
+    ; Stop starting the app at sign-in (for the user running the uninstaller;
+    ; for anyone else the entry points to a removed program and does nothing).
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Whereabouts"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "Whereabouts"
+  ${EndIf}
 !macroend

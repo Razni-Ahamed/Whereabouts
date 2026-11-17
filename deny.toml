@@ -19,6 +19,11 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property: used by urlpattern in tauri-utils; unmaintained, no security issue" },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: used by urlpattern in tauri-utils; unmaintained, no security issue" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: used by urlpattern in tauri-utils; unmaintained, no security issue" },
+    # zbus (D-Bus): used on Linux only by notify-rust (tauri-plugin-notification)
+    # and tauri-plugin-single-instance; not built for Windows. Reviewed 2026-11-17.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: D-Bus types for zbus, Linux only (not built for Windows), unmaintained, no security issue" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: D-Bus names for zbus, Linux only (not built for Windows), unmaintained, no security issue" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: D-Bus derive macros for zbus, Linux only (not built for Windows), unmaintained, no security issue" },
 ]
 
 [licenses]

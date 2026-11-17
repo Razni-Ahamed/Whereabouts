@@ -4,7 +4,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { demoAddRule, demoHistory, demoLive, demoRemoveRule, demoRules, demoSetPaused } from './demo';
-import type { AppTotals, Live, Problem, Rules, RuleSpec } from './types';
+import type { AppSettings, AppTotals, Live, Problem, Rules, RuleSpec } from './types';
 
 export const isDemo = !('__TAURI_INTERNALS__' in window);
 
@@ -85,6 +85,36 @@ export async function removeRule(id: number): Promise<Result<Rules>> {
 export async function setBlockingPaused(paused: boolean): Promise<Result<Rules>> {
   if (isDemo) return { ok: true, value: demoSetPaused(paused) };
   return call<Rules>('set_blocking_paused', { paused });
+}
+
+// Demo settings, kept while the page is open.
+let demoSettings: AppSettings = {
+  start_at_sign_in: false,
+  can_start_at_sign_in: true,
+  notifications: true,
+  show_names: false,
+  first_run_done: false,
+};
+
+/** The app's own settings. */
+export async function getSettings(): Promise<Result<AppSettings>> {
+  if (isDemo) return { ok: true, value: { ...demoSettings } };
+  return call<AppSettings>('get_settings');
+}
+
+/** Saves the app's settings (and marks the first-run question answered). */
+export async function setSettings(
+  choice: Pick<AppSettings, 'start_at_sign_in' | 'notifications' | 'show_names'>,
+): Promise<Result<AppSettings>> {
+  if (isDemo) {
+    demoSettings = { ...demoSettings, ...choice, first_run_done: true };
+    return { ok: true, value: { ...demoSettings } };
+  }
+  return call<AppSettings>('set_settings', {
+    startAtSignIn: choice.start_at_sign_in,
+    notifications: choice.notifications,
+    showNames: choice.show_names,
+  });
 }
 
 /** Saved per-app totals of the last `hours`. */

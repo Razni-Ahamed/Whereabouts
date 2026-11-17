@@ -11,6 +11,8 @@ fn main() {
             "add_rule",
             "remove_rule",
             "set_blocking_paused",
+            "get_settings",
+            "set_settings",
         ]),
     ))
     .expect("failed to run the Tauri build script");

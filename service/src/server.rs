@@ -13,6 +13,7 @@
 //! Clients can only send the typed requests of `whereabouts-ipc`, and every
 //! request's limits are clamped before it is answered.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -20,8 +21,8 @@ use std::time::{Duration, SystemTime};
 
 use whereabouts_client::peer;
 use whereabouts_ipc::{
-    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_BYTES, FlowView, PROTOCOL_VERSION, Request,
-    Response, Status, read_message, write_message,
+    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_BYTES, FlowView, MAX_NOTICES, Notice,
+    NoticeKind, PROTOCOL_VERSION, Request, Response, Status, read_message, write_message,
 };
 use whereabouts_store::{Store, csv_header};
 use whereabouts_win_pipe::{PipeConnection, PipeListener, current_user_sid};
@@ -62,6 +63,27 @@ pub struct LiveState {
     pub flows: Vec<FlowView>,
     /// Where to send [`EngineCommand`]s; `None` until the engine runs.
     pub commands: Option<Sender<EngineCommand>>,
+    /// The newest notices, oldest first, at most [`MAX_NOTICES`].
+    pub notices: VecDeque<Notice>,
+    /// The ID of the newest notice (0 before the first).
+    pub last_notice: u64,
+}
+
+impl LiveState {
+    /// Adds a notice for clients, dropping the oldest beyond the limit.
+    pub fn push_notice(&mut self, kind: NoticeKind, at: SystemTime) {
+        self.last_notice += 1;
+        if self.notices.len() >= MAX_NOTICES {
+            self.notices.pop_front();
+        }
+        self.notices.push_back(Notice {
+            id: self.last_notice,
+            at_secs: at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            kind,
+        });
+    }
 }
 
 /// The live state shared between the engine and the pipe threads.
@@ -201,6 +223,18 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
         Request::RemoveRule { id } => rules(state, crate::blocking::RuleCommand::Remove(id)),
         Request::SetBlockingPaused { paused } => {
             rules(state, crate::blocking::RuleCommand::SetPaused(paused))
+        }
+        Request::Notices { after } => {
+            let state = lock(state);
+            Response::Notices {
+                notices: state
+                    .notices
+                    .iter()
+                    .filter(|notice| notice.id > after)
+                    .cloned()
+                    .collect(),
+                last: state.last_notice,
+            }
         }
     }
 }
@@ -353,6 +387,8 @@ mod tests {
                 .map(|i| flow(u32::try_from(i).unwrap()))
                 .collect(),
             commands: None,
+            notices: VecDeque::new(),
+            last_notice: 0,
         }))
     }
 
@@ -441,6 +477,33 @@ mod tests {
                 paused: false
             }
         );
+    }
+
+    #[test]
+    fn notices_are_kept_bounded_and_listed_after_an_id() {
+        let state = shared(0);
+        for i in 0..(MAX_NOTICES + 5) {
+            lock(&state).push_notice(
+                NoticeKind::NewApp {
+                    app: format!("app{i}.exe"),
+                    path: format!(r"C:\Apps\app{i}.exe"),
+                },
+                SystemTime::UNIX_EPOCH,
+            );
+        }
+        let mut store = None;
+        match answer(Request::Notices { after: 0 }, &state, &mut store) {
+            Response::Notices { notices, last } => {
+                assert_eq!(notices.len(), MAX_NOTICES);
+                assert_eq!(last, (MAX_NOTICES + 5) as u64);
+                assert_eq!(notices[0].id, 6, "the oldest were dropped");
+            }
+            other => panic!("{other:?}"),
+        }
+        match answer(Request::Notices { after: 104 }, &state, &mut store) {
+            Response::Notices { notices, .. } => assert_eq!(notices.len(), 1),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -187,6 +187,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         }
     };
     let mut last_retention = Instant::now();
+    let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
     let mut blocking = crate::blocking::Blocking::start(
         whereabouts_win_firewall::Firewall::open,
         store.as_ref(),
@@ -240,6 +241,19 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 } else {
                     // Look the process up while it is still running.
                     names.note_traffic(event.pid);
+                    if let Some((app, path)) = names.first_traffic(event.pid)
+                        && new_apps.seen(store.as_mut(), &path, SystemTime::now())
+                    {
+                        live.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push_notice(
+                                whereabouts_ipc::NoticeKind::NewApp {
+                                    app: truncate(&app, CLIENT_TEXT),
+                                    path: truncate(&path, CLIENT_TEXT * 2),
+                                },
+                                SystemTime::now(),
+                            );
+                    }
                     let label = dns.lookup(event.pid, event.remote.ip(), event.timestamp);
                     table.record_labeled(&event, label);
                 }
@@ -284,7 +298,11 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         while let Ok(command) = commands.try_recv() {
             match command {
                 crate::server::EngineCommand::DeleteAll { reply } => {
-                    let _ = reply.send(delete_everything(&mut store, &mut closed));
+                    let result = delete_everything(&mut store, &mut closed);
+                    if result.is_ok() {
+                        new_apps.reset(store.as_mut(), SystemTime::now());
+                    }
+                    let _ = reply.send(result);
                 }
                 crate::server::EngineCommand::Rules { command, reply } => {
                     // A new domain rule (or resuming) also applies to names
@@ -423,6 +441,8 @@ struct ProcessInfo {
     /// Whether its identity has been asked for. Only processes that use
     /// the network are checked.
     requested: bool,
+    /// Whether its first use of the network has been handled.
+    noted: bool,
 }
 
 /// What the console knows about each process, plus each process's program
@@ -466,6 +486,7 @@ impl ProcessNames {
                 path: self.devices.to_dos(&path),
                 token,
                 requested: false,
+                noted: false,
             });
             self.processes.insert(pid, info);
         }
@@ -495,6 +516,18 @@ impl ProcessNames {
         };
     }
 
+    /// The program path of `pid` the first time this process instance uses
+    /// the network (call after [`ProcessNames::note_traffic`]); `None`
+    /// afterwards, or if the path is not known.
+    fn first_traffic(&mut self, pid: u32) -> Option<(String, String)> {
+        let info = self.processes.get_mut(&pid)?.as_mut()?;
+        if info.noted {
+            return None;
+        }
+        info.noted = true;
+        Some((info.name.clone(), info.path.clone()?))
+    }
+
     /// Records a process from its start event. `image` may be a
     /// `\Device\HarddiskVolumeN\...` path. Its identity is only checked
     /// once it uses the network.
@@ -504,6 +537,7 @@ impl ProcessNames {
             path: self.devices.to_dos(image),
             token: self.new_token(),
             requested: false,
+            noted: false,
         };
         self.processes.insert(pid, Some(info));
     }

@@ -10,6 +10,7 @@ members = [
     "crates/win-firewall",
     "crates/win-pipe",
     "crates/win-secrets",
+    "crates/win-startup",
     "service",
     "ui/src-tauri",
 ]
@@ -33,6 +34,7 @@ whereabouts-win-capture = { path = "crates/win-capture" }
 whereabouts-win-firewall = { path = "crates/win-firewall" }
 whereabouts-win-pipe = { path = "crates/win-pipe" }
 whereabouts-win-secrets = { path = "crates/win-secrets" }
+whereabouts-win-startup = { path = "crates/win-startup" }
 
 # Third-party
 ferrisetw = "1.2"
@@ -47,6 +49,8 @@ sha2 = "0.11"
 tauri = "2.11.6"
 tauri-build = "2.6.3"
 tauri-plugin-dialog = "2.7.3"
+tauri-plugin-notification = "2.4.0"
+tauri-plugin-single-instance = "2.4.5"
 windows = "0.62"
 windows-service = "0.8.1"
 

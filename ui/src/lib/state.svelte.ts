@@ -1,7 +1,17 @@
 // App-wide state, refreshed from the service.
 
-import { addRule, history, isDemo, live, removeRule, rules, setBlockingPaused } from './api';
-import type { AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
+import {
+  addRule,
+  getSettings,
+  history,
+  isDemo,
+  live,
+  removeRule,
+  rules,
+  setBlockingPaused,
+  setSettings,
+} from './api';
+import type { AppSettings, AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
 
 const LIVE_EVERY_MS = 2000;
 const HISTORY_EVERY_MS = 30_000;
@@ -24,6 +34,7 @@ class Store {
   problem = $state<Problem | null>(null);
   updated = $state<Date | null>(null);
   rules = $state<Rules | null>(null);
+  settings = $state<AppSettings | null>(null);
   note = $state<Note | null>(null);
   #noteTimer: ReturnType<typeof setTimeout> | undefined;
   /** Bytes per second between refreshes, oldest first. */
@@ -56,6 +67,24 @@ class Store {
       this.activity = [...this.activity, rate].slice(-ACTIVITY_SAMPLES);
     }
     this.#lastTotal = { bytes, at };
+  }
+
+  async loadSettings(): Promise<void> {
+    const result = await getSettings();
+    if (result.ok) this.settings = result.value;
+  }
+
+  /** Saves the app's settings; `false` (with a note) if that failed. */
+  async saveSettings(
+    choice: Pick<AppSettings, 'start_at_sign_in' | 'notifications' | 'show_names'>,
+  ): Promise<boolean> {
+    const result = await setSettings(choice);
+    if (result.ok) {
+      this.settings = result.value;
+      return true;
+    }
+    this.showNote({ text: result.problem.message, tone: 'bad' });
+    return false;
   }
 
   async refreshRules(): Promise<void> {
@@ -115,6 +144,7 @@ class Store {
     void this.refreshLive();
     void this.refreshHistory();
     void this.refreshRules();
+    void this.loadSettings();
     const a = setInterval(() => void this.refreshLive(), LIVE_EVERY_MS);
     const b = setInterval(() => void this.refreshHistory(), HISTORY_EVERY_MS);
     const c = setInterval(() => void this.refreshRules(), RULES_EVERY_MS);
