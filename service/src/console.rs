@@ -287,7 +287,23 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     let _ = reply.send(delete_everything(&mut store, &mut closed));
                 }
                 crate::server::EngineCommand::Rules { command, reply } => {
-                    let _ = reply.send(blocking.answer(store.as_mut(), command, SystemTime::now()));
+                    // A new domain rule (or resuming) also applies to names
+                    // still in Windows' DNS cache: their answers are not
+                    // confirmed again until the cache entry expires, so the
+                    // confirmed answers already seen are replayed.
+                    let replay = matches!(
+                        command,
+                        crate::blocking::RuleCommand::Add(_)
+                            | crate::blocking::RuleCommand::SetPaused(false)
+                    );
+                    let now = SystemTime::now();
+                    let answer = blocking.answer(store.as_mut(), command, now);
+                    if replay && !matches!(answer, whereabouts_ipc::Response::Error { .. }) {
+                        for (name, addresses) in dns.confirmed_answers(now) {
+                            blocking.on_confirmed_answer(&name, &addresses, now);
+                        }
+                    }
+                    let _ = reply.send(answer);
                 }
             }
         }

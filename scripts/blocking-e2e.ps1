@@ -88,12 +88,15 @@ try {
     Check (-not (Test-Reach $curl)) 'blocked: the copy of curl cannot connect'
     Check (Test-Reach (Join-Path $env:SystemRoot 'System32\curl.exe')) 'the real curl still connects'
     Check ((Invoke-Wa @('--rules')).Text -match 'curl-e2e\.exe') '--rules lists the rule'
-    Check ((Invoke-Wa @('--status')).Text -match 'Blocking rules: 1') '--status counts the rule'
+    # The status is refreshed every two seconds.
+    Check (Wait-Until { (Invoke-Wa @('--status')).Text -match 'Blocking rules: 1' } 10) '--status counts the rule'
     Check ((Invoke-Wa @('--pause-blocking')).Code -eq 0 -and (Test-Reach $curl)) 'paused: it connects'
     Check ((Invoke-Wa @('--resume-blocking')).Code -eq 0 -and -not (Test-Reach $curl)) 'resumed: blocked again'
     Check ((Invoke-Wa @('--unblock', "$id")).Code -eq 0 -and (Test-Reach $curl)) 'rule removed: it connects'
 
     Write-Host 'Domain rule (blocked once the DNS service confirms an address)'
+    # example.com is in Windows' DNS cache by now, so this also checks that
+    # answers confirmed before the rule existed are used.
     $id = Add-Rule @('--block-domain', 'example.com', '--for', $curl)
     Check (Wait-Until { -not (Test-Reach $curl) } 30) 'example.com is blocked for the copy of curl'
     Check (Test-Reach $curl -Url 'https://api.github.com/') 'other domains still connect'

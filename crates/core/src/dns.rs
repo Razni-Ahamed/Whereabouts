@@ -358,6 +358,25 @@ impl DnsMap {
         }
     }
 
+    /// Every name the DNS service resolved within the lifetime, with the
+    /// addresses still confirmed for it at `now`. Answers served from
+    /// Windows' DNS cache are not confirmed again, so this is what is known
+    /// for names that are still cached.
+    pub fn confirmed_answers(&self, now: SystemTime) -> Vec<(String, Vec<IpAddr>)> {
+        self.by_name
+            .map
+            .iter()
+            .filter_map(|(name, (addresses, _))| {
+                let fresh: Vec<IpAddr> = addresses
+                    .iter()
+                    .filter(|(_, seen)| self.is_fresh(*seen, now))
+                    .map(|(address, _)| *address)
+                    .collect();
+                (!fresh.is_empty()).then(|| (name.to_string(), fresh))
+            })
+            .collect()
+    }
+
     /// Forgets the app answers of process `pid`. Call this when it exits:
     /// Windows reuses process IDs, and a new process must not inherit them.
     pub fn forget_process(&mut self, pid: u32) {
@@ -468,6 +487,26 @@ mod tests {
 
     fn some(name: &str, source: LabelSource) -> Option<(String, LabelSource)> {
         Some((String::from(name), source))
+    }
+
+    #[test]
+    fn confirmed_answers_are_listed_while_fresh() {
+        let mut map = DnsMap::new();
+        map.record_confirmed(
+            "example.com",
+            &[ip("104.20.23.154"), ip("172.66.147.243")],
+            at(0),
+        );
+        map.record_confirmed("old.example", &[ip("203.0.113.1")], at(0));
+        map.record_confirmed("example.com", &[ip("104.20.23.154")], at(20 * 60));
+        // An app's own answer is never listed.
+        map.record_app_answer(7, "fake.example", &[ip("198.51.100.1")], at(20 * 60));
+        let mut listed = map.confirmed_answers(at(35 * 60));
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![(String::from("example.com"), vec![ip("104.20.23.154")])]
+        );
     }
 
     #[test]
