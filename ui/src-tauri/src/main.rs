@@ -287,9 +287,11 @@ fn describe(rule: &RuleSpec) -> (String, String) {
         } => (
             format!("Block {} for {}?", display_safe(name), program_name(app)),
             format!(
-                "{} will not be able to connect to {} or its subdomains.\n\n{DOMAIN_NOTE}\n\n{undo}",
+                "{} will not be able to connect to {} or its subdomains.\n\n{}\n\n{DOMAIN_NOTE}\n\n\
+                 {undo}",
                 program_name(app),
-                display_safe(name)
+                display_safe(name),
+                display_safe(app)
             ),
         ),
         RuleSpec::Domain { name, app: None } => (
@@ -303,9 +305,10 @@ fn describe(rule: &RuleSpec) -> (String, String) {
         RuleSpec::Address { ip, app: Some(app) } => (
             format!("Block {ip} for {}?", program_name(app)),
             format!(
-                "{} will not be able to connect to {ip}.\n\nOther sites can share this address, \
-                 so this may block more than one site for this app.\n\n{undo}",
-                program_name(app)
+                "{} will not be able to connect to {ip}.\n\n{}\n\nOther sites can share this \
+                 address, so this may block more than one site for this app.\n\n{undo}",
+                program_name(app),
+                display_safe(app)
             ),
         ),
         RuleSpec::Address { ip, app: None } => (
@@ -411,11 +414,19 @@ mod tests {
         assert_eq!(title, "Block ads.example.com for every app?");
         assert!(text.contains("every app on this computer"));
 
-        let (title, _) = describe(&RuleSpec::Address {
+        // Rules for one app always show that app's full path, so two
+        // programs with the same name cannot be confused.
+        let (title, text) = describe(&RuleSpec::Address {
             ip: "203.0.113.5".parse().unwrap(),
-            app: Some(app),
+            app: Some(app.clone()),
         });
         assert_eq!(title, "Block 203.0.113.5 for chat.exe?");
+        assert!(text.contains(&app));
+        let (_, text) = describe(&RuleSpec::Domain {
+            name: String::from("ads.example.com"),
+            app: Some(app.clone()),
+        });
+        assert!(text.contains(&app));
     }
 
     #[test]

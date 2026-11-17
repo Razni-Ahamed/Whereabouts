@@ -163,6 +163,7 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
     if !wfp::is_local_drive_path(path) {
         return Err(not_local());
     }
+    refuse_links(path)?;
     let full = std::fs::canonicalize(path)?;
     let text = full.to_string_lossy();
     let normal = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
@@ -171,6 +172,45 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
         return Err(not_local());
     }
     Ok(normal)
+}
+
+/// Refuses a path with `.` or `..` parts, or with a link or other reparse
+/// point anywhere along it, **without following any of them**: a symbolic
+/// link (which any user can make when Windows' Developer Mode is on) could
+/// lead to another computer, and following it as SYSTEM would offer that
+/// computer this computer's credentials. Paths of running programs, as
+/// Windows reports them, never contain links.
+fn refuse_links(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use std::path::Component;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let mut partial = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => partial.push(component),
+            Component::Normal(_) => {
+                partial.push(component);
+                // Reads the entry itself; a link is not followed.
+                let metadata = std::fs::symlink_metadata(&partial)?;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} is a link; give the program's real location",
+                            partial.display()
+                        ),
+                    ));
+                }
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "give the program's full path, without . or .. parts",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The filter key for `block` in `layer`: the same rule always gets the
@@ -567,6 +607,32 @@ mod tests {
     }
 
     #[test]
+    fn links_and_dot_dot_are_refused_without_following_them() {
+        let system = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+        assert!(normalize_path(&system.join(r"..\System32\curl.exe")).is_err());
+        // A directory junction (no special rights needed to make one).
+        let base = std::env::temp_dir().join(format!("wa-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let junction = base.join("j");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&system)
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if made {
+            let through = junction.join("curl.exe");
+            assert!(through.is_file());
+            let error = normalize_path(&through).unwrap_err();
+            assert!(error.to_string().contains("link"), "{error}");
+            let _ = std::fs::remove_dir(&junction);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(made, "could not make a junction to test with");
+    }
+
+    #[test]
     fn exemption_keys_never_collide_with_block_keys() {
         let svchost = app(r"C:\Windows\System32\svchost.exe");
         let layer = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
@@ -610,12 +676,16 @@ mod tests {
     #[test]
     fn normalizing_gives_one_spelling() {
         let exe = std::env::current_exe().unwrap();
-        let dir = exe.parent().unwrap();
-        let roundabout = dir
-            .join("..")
-            .join(dir.file_name().unwrap())
-            .join(exe.file_name().unwrap());
-        assert_eq!(normalize(&exe).unwrap(), normalize(&roundabout).unwrap());
+        // The same file in other letter case.
+        let shouted = PathBuf::from(exe.to_string_lossy().to_uppercase());
+        assert_eq!(
+            normalize(&exe).unwrap().to_string_lossy().to_lowercase(),
+            normalize(&shouted)
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase()
+        );
+        assert_eq!(normalize(&shouted).unwrap(), normalize(&exe).unwrap());
         assert!(
             !normalize(&exe)
                 .unwrap()
