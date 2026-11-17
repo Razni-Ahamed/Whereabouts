@@ -502,10 +502,12 @@ impl<F: Firewalls> Blocker<F> {
             return;
         }
         let name = name.trim_end_matches('.').to_ascii_lowercase();
-        let every_app_rule_covers = self.rules.iter().any(|rule| {
-            matches!(&rule.target, RuleTarget::Domain { name: domain, app: None } if covers(domain, &name))
+        // Only names no domain rule covers (for any app) show that an
+        // address is used elsewhere.
+        let blocked_name = self.rules.iter().any(|rule| {
+            matches!(&rule.target, RuleTarget::Domain { name: domain, .. } if covers(domain, &name))
         });
-        if !every_app_rule_covers {
+        if !blocked_name {
             for ip in addresses {
                 self.note_shared(ip.to_canonical(), now);
             }
@@ -1106,6 +1108,34 @@ mod tests {
         blocker.on_confirmed_answer("site.example.org", &[cdn], at(T0 + 4));
         blocker.on_confirmed_answer("tracker.example.com", &[cdn], at(T0 + 5));
         assert!(blocker.firewall.blocks.is_empty());
+        // A name covered by a per-app rule does not count as elsewhere.
+        blocker
+            .add(
+                &mut store,
+                RuleTarget::Domain {
+                    name: String::from("ads.example.net"),
+                    app: Some(this_exe()),
+                },
+                at(T0 + 4),
+            )
+            .unwrap();
+        let other: IpAddr = "203.0.113.10".parse().unwrap();
+        blocker.on_confirmed_answer("ads.example.net", &[other], at(T0 + 4));
+        blocker.on_confirmed_answer("tracker.example.com", &[other], at(T0 + 4));
+        assert!(
+            blocker
+                .firewall
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Address { ip, app: None, .. } if *ip == other)),
+            "{:?}",
+            blocker.firewall.blocks
+        );
+        blocker
+            .firewall
+            .blocks
+            .retain(|b| !matches!(b, Block::Address { ip, .. } if *ip == other));
+        blocker.learned.retain(|l| l.ip != other);
         // After a day without being seen elsewhere, it can be blocked again.
         blocker.on_confirmed_answer("tracker.example.com", &[cdn], at(T0 + 5 + 86_400));
         assert_eq!(blocker.firewall.blocks.len(), 1);
