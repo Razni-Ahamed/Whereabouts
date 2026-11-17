@@ -70,7 +70,7 @@ Some tests read real network and process events from Windows (ETW). They need ad
 powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1
 ```
 
-The script builds everything as you, asks for administrator rights once (UAC), runs the live tests and a short check of `whereabouts-service --console`, and prints **PASS** or **FAIL**. It makes a few HTTPS requests to example.com. Its logs contain your computer's connection metadata, so they go to a temporary folder and must never be committed.
+The script builds everything as you, asks for administrator rights once (UAC), runs the live tests (including blocking tests, which only touch a separate test scope of the Windows Filtering Platform and a temporary copy of curl) and a short check of `whereabouts-service --console`, and prints **PASS** or **FAIL**. If the Whereabouts service is installed and running, the console and storage checks are skipped, because two captures cannot run at once. It makes a few HTTPS requests to example.com. Its logs contain your computer's connection metadata, so they go to a temporary folder and must never be committed.
 
 To also test the Windows service, add `-Service`. This **installs the Whereabouts service on your computer**, checks it (running as LocalSystem, starting automatically, `--status` from the installed copy as administrator and as a normal user, another copy refused, `--console` refused while it runs, history readable after it stops, a clean log), then uninstalls it. The saved-data folder `%ProgramData%\Whereabouts` is deleted afterwards only if it did not exist before the test. The service uses your real data folder, so flows captured during the test are saved there while it runs.
 

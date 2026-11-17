@@ -217,6 +217,17 @@ All of these ship inside the app and update through signed downloads (§7).
 - All our filters live under **our own WFP provider and sublayer**, so they can be listed and removed cleanly, and an uninstall removes all of them.
 - **No interactive “allow?” prompt before a connection** in v0.x. Holding a connection while asking the user requires a kernel callout driver. Instead we use *notify after*: the user sees the new connection and can block it from then on.
 
+Implementation notes (v0.2, N1 blocking core, 2026-11-17):
+
+| Decision | Reason |
+|---|---|
+| A block is either **a whole program** (filters at ALE connect v4 + v6 with the app-ID condition) or **one remote address**, for one program or for **every program** (decision D14) | Domain blocks become address blocks fed by verified DNS answers (N2). "Every program" exists because the user chose it; the guard-list below limits the damage of shared addresses. |
+| **Persistent** provider, sublayer and filters (decision D10) | Blocks stay in force across restarts and while the service is stopped. Safety nets: the guard-list, `--unblock-all`, and uninstalling removes every filter, the sublayer and the provider. |
+| **Guard-list**, checked before Windows is asked | Never blocked: core Windows programs in System32 (`svchost`, `lsass`, `services`, `wininit`, `winlogon`, `csrss`, `smss`, `dwm`, `spoolsv`), Microsoft Defender, Whereabouts itself; and addresses the network needs (loopback, local network incl. 100.64/10 and IPv6 ULA/link-local, multicast, broadcast, the configured DNS servers). |
+| Filter keys are **derived from the rule** (SHA-256 of scope, rule and layer) | Blocking twice is harmless; unblocking needs no stored IDs. Paths are canonicalised and compared without case, as Windows does. |
+| Each filter carries its rule as JSON in its provider data | The list of blocks can be read from WFP itself, even without the database. |
+| Tests use a **separate WFP provider and sublayer** and a copy of curl | A failing test can never block real programs or delete real rules. Live-tested 2026-11-17: block/unblock a program, per-program address blocks, guard refusals. |
+
 ### 5.7 Storage
 
 - **SQLite + SQLCipher** via `rusqlite` (feature `bundled-sqlcipher`).

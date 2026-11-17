@@ -4,6 +4,10 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- Blocking engine for v0.2 (`win-firewall`, not yet available in the app): block a program, or one address for one program or for every program, with persistent Windows Filtering Platform rules under Whereabouts' own provider; a guard-list refuses core Windows programs, Microsoft Defender, Whereabouts itself, and loopback, local-network, multicast and DNS-server addresses; rules can be listed from WFP and all removed at once. Live tests (separate test scope, a copy of curl) run in `scripts/live-test.ps1` and CI.
+
 ## [0.1.1] - 2026-11-17
 
 ### Fixed
