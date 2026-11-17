@@ -187,6 +187,11 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         }
     };
     let mut last_retention = Instant::now();
+    let mut blocking = crate::blocking::Blocking::start(
+        whereabouts_win_firewall::Firewall::open,
+        store.as_ref(),
+        SystemTime::now(),
+    );
 
     // Clients ask the engine for work only it can do (deleting everything)
     // through this channel.
@@ -270,6 +275,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 timestamp,
             }) => {
                 dns.record_confirmed(&name, &addresses, timestamp);
+                blocking.on_confirmed_answer(&name, &addresses, SystemTime::now());
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -280,11 +286,15 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 crate::server::EngineCommand::DeleteAll { reply } => {
                     let _ = reply.send(delete_everything(&mut store, &mut closed));
                 }
+                crate::server::EngineCommand::Rules { command, reply } => {
+                    let _ = reply.send(blocking.answer(store.as_mut(), command, SystemTime::now()));
+                }
             }
         }
         if last_draw.elapsed() >= REFRESH {
             exited.expire();
             dns.expire(SystemTime::now());
+            blocking.expire(SystemTime::now());
             close(
                 &mut closed,
                 &names,
@@ -300,6 +310,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             let view = View::collect(&table, &closed, &names);
             if serving {
                 let counts = capture.counts();
+                let (block_rules, blocking_paused) = blocking.summary();
                 let status = Status {
                     uptime_secs: started.elapsed().as_secs(),
                     events: counts.events,
@@ -312,6 +323,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     kernel_events_protected: capture.kernel_events_protected(),
                     saving: store.is_some(),
                     tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
+                    block_rules,
+                    blocking_paused,
                 };
                 publish(&live, &view, &names, &enricher, status);
             }

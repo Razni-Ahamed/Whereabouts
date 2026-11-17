@@ -6,8 +6,10 @@
 ; - an older version's service is stopped and removed before its files are
 ;   replaced (saved history is kept);
 ; - after copying, the service is registered and started in place;
-; - before uninstalling, the service is stopped and removed, and the user
-;   chooses whether to delete the saved history (default: keep it).
+; - before uninstalling, the service is stopped and removed, its blocks are
+;   removed from the firewall, and the user chooses whether to delete the
+;   saved history (default: keep it). When updating, blocks stay in place
+;   (the new version applies the saved rules again when it starts).
 
 !macro NSIS_HOOK_PREINSTALL
   ${If} $INSTDIR != "$PROGRAMFILES64\Whereabouts"
@@ -32,10 +34,11 @@
 
 !macro NSIS_HOOK_PREUNINSTALL
   StrCpy $1 ""
-  ; Keep the history when updating to a newer version.
+  ; Keep the history and the blocks when updating to a newer version.
   ${If} $UpdateMode <> 1
+    StrCpy $1 "--remove-blocks"
     MessageBox MB_YESNO|MB_ICONQUESTION "Also delete your saved connection history?$\r$\n$\r$\nIt is kept encrypted in $COMMONPROGRAMDATA\Whereabouts. Choose No to keep it for a later reinstall." /SD IDNO IDNO +2
-    StrCpy $1 "--delete-data"
+    StrCpy $1 "--remove-blocks --delete-data"
   ${EndIf}
   DetailPrint "Stopping and removing the Whereabouts service..."
   nsExec::ExecToLog '"$INSTDIR\whereabouts-service.exe" --unregister $1'

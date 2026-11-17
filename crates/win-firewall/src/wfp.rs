@@ -17,11 +17,11 @@ use windows::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
 };
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWP_ACTION_BLOCK, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE,
-    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_FILTER_ENUM_OVERLAPPING,
-    FWP_MATCH_EQUAL, FWP_UINT32, FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
-    FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
+    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB,
+    FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_OVERLAPPING,
+    FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0,
+    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
     FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0,
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
     FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
@@ -29,6 +29,7 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 
@@ -59,7 +60,15 @@ pub struct FilterSpec<'a> {
     pub data: &'a [u8],
     pub app: Option<&'a Path>,
     pub remote: Option<IpAddr>,
+    /// Allow instead of block. Allows outrank our blocks (they have a
+    /// higher weight in our sublayer); they never affect other sublayers.
+    pub permit: bool,
 }
+
+/// Weights of our blocks and of our allows (exemptions) in our sublayer:
+/// the higher weight wins when both match.
+const BLOCK_WEIGHT: u8 = 1;
+const PERMIT_WEIGHT: u8 = 15;
 
 /// A filter of ours, as read back from WFP.
 #[derive(Debug, Clone)]
@@ -218,9 +227,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Adds one persistent blocking filter. Adding a filter that already
-    /// exists (same key) is not an error.
-    pub fn add_block(&self, scope: &Scope, spec: &FilterSpec<'_>) -> io::Result<()> {
+    /// Adds one persistent filter: a block, or an allow that exempts a
+    /// program from our blocks. Adding a filter that already exists (same
+    /// key) is not an error.
+    pub fn add_filter(&self, scope: &Scope, spec: &FilterSpec<'_>) -> io::Result<()> {
         let app_id = spec.app.map(AppId::for_path).transpose()?;
         let mut v6 = FWP_BYTE_ARRAY16::default();
         let mut conditions = Vec::new();
@@ -285,14 +295,24 @@ impl Engine {
             },
             layerKey: spec.layer,
             subLayerKey: scope.sublayer,
-            weight: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0 {
-                r#type: FWP_EMPTY,
-                ..Default::default()
+            weight: FWP_VALUE0 {
+                r#type: FWP_UINT8,
+                Anonymous: FWP_VALUE0_0 {
+                    uint8: if spec.permit {
+                        PERMIT_WEIGHT
+                    } else {
+                        BLOCK_WEIGHT
+                    },
+                },
             },
             numFilterConditions: u32::try_from(conditions.len()).map_err(io::Error::other)?,
             filterCondition: conditions.as_mut_ptr(),
             action: FWPM_ACTION0 {
-                r#type: FWP_ACTION_BLOCK,
+                r#type: if spec.permit {
+                    FWP_ACTION_PERMIT
+                } else {
+                    FWP_ACTION_BLOCK
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -304,7 +324,7 @@ impl Engine {
         if code == FWP_E_ALREADY_EXISTS {
             return Ok(());
         }
-        check(code, "adding a blocking rule")
+        check(code, "adding a firewall rule")
     }
 
     /// Deletes one filter; `false` if it did not exist.
@@ -392,6 +412,29 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Whether `path` is on a local drive: `X:\...` where drive X is a fixed,
+/// removable, optical or RAM drive. Everything else (`\\server\share`,
+/// `\\?\` and `\\.\` paths, network drives) is refused **before any file
+/// system call**, so the service never connects to another computer, and
+/// never offers it this computer's credentials.
+pub fn is_local_drive_path(path: &Path) -> bool {
+    // Values of GetDriveTypeW (WindowsProgramming's DRIVE_* constants).
+    const REMOVABLE: u32 = 2;
+    const FIXED: u32 = 3;
+    const CDROM: u32 = 5;
+    const RAMDISK: u32 = 6;
+    let text = path.as_os_str().to_string_lossy();
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    let root = HSTRING::from(format!("{}:\\", char::from(bytes[0])));
+    // SAFETY: `root` is a valid, NUL-terminated wide string that outlives
+    // the call; GetDriveTypeW only reads it.
+    let kind = unsafe { GetDriveTypeW(&root) };
+    matches!(kind, REMOVABLE | FIXED | CDROM | RAMDISK)
 }
 
 /// The DNS servers this computer is configured to use, on any adapter.

@@ -4394,6 +4394,7 @@ dependencies = [
  "whereabouts-ipc",
  "whereabouts-store",
  "whereabouts-win-capture",
+ "whereabouts-win-firewall",
  "whereabouts-win-pipe",
  "whereabouts-win-secrets",
  "windows-service",

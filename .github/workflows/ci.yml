@@ -77,6 +77,10 @@ jobs:
         run: cargo test -p whereabouts-win-capture --test live_capture -- --ignored --test-threads=1
       - name: Live blocking tests (test scope and a copy of curl only)
         run: cargo test -p whereabouts-win-firewall --test live_block -- --ignored --test-threads=1
+      - name: Blocking end to end (engine, command line and a copy of curl)
+        run: |
+          cargo build -p whereabouts-service
+          ./scripts/blocking-e2e.ps1
       - name: Download offline data
         shell: pwsh
         run: ./scripts/update-data.ps1

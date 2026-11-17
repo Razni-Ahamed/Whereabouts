@@ -12,6 +12,9 @@ export interface Status {
   kernel_events_protected: boolean;
   saving: boolean;
   tracker_domains: number;
+  /** Saved blocking rules (0 from a 0.1 service). */
+  block_rules: number;
+  blocking_paused: boolean;
 }
 
 export type DomainTrust = 'verified' | 'app_reported' | 'guessed';
