@@ -4420,6 +4420,12 @@ dependencies = [
 [[package]]
 name = "whereabouts-win-firewall"
 version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "windows 0.62.2",
+]
 
 [[package]]
 name = "whereabouts-win-pipe"

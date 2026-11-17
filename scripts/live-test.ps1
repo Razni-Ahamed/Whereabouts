@@ -124,6 +124,25 @@ function Invoke-IntegrationTests {
         return $false
     }
     Write-Log 'ok: integration tests'
+
+    # Blocking: only a separate test scope and a copy of curl are touched.
+    Write-Log '--- 1b     Blocking (Windows Filtering Platform) ---'
+    $process = Start-Logged -FilePath $Cargo -Name 'blocking' -Arguments @(
+        'test', '-p', 'whereabouts-win-firewall', '--test', 'live_block',
+        '--', '--ignored', '--test-threads=1')
+    if (-not $process.WaitForExit(300000)) {
+        $process.Kill()
+        Write-Log 'FAIL: blocking tests timed out after 5 minutes'
+        return $false
+    }
+    $output = Get-LoggedOutput -Name 'blocking'
+    $output -split "`r?`n" | Where-Object { $_ -match '^test |test result|panicked|assert' } |
+        ForEach-Object { Write-Log "    $_" }
+    if ($process.ExitCode -ne 0 -or $output -notmatch 'test result: ok\. 3 passed') {
+        Write-Log "FAIL: blocking tests (exit code $($process.ExitCode))"
+        return $false
+    }
+    Write-Log 'ok: blocking tests'
     return $true
 }
 
@@ -406,8 +425,18 @@ function Invoke-ServiceTest {
 
 function Invoke-LiveTests {
     $integration = Invoke-IntegrationTests
-    $console = Invoke-ConsoleSmokeTest
-    $storage = Invoke-StorageTest
+    $console = $true
+    $storage = $true
+    # --console refuses to run next to the installed service (two captures
+    # cannot run at once), and the storage stage needs what it saved.
+    if ((Get-Service -Name 'Whereabouts' -ErrorAction SilentlyContinue).Status -eq 'Running') {
+        Write-Log '--- 2/3 and 3/3 skipped: the installed Whereabouts service is running, and the'
+        Write-Log '    console cannot run next to it. Stop it to run them (as administrator:'
+        Write-Log '    sc stop Whereabouts), and start it again afterwards (sc start Whereabouts).'
+    } else {
+        $console = Invoke-ConsoleSmokeTest
+        $storage = Invoke-StorageTest
+    }
     # (PowerShell names ignore case: a variable called $service would
     # overwrite the -Service switch.)
     $serviceOk = $true
@@ -433,6 +462,8 @@ Write-Host 'Building (as the current user)...'
 & $Cargo build -p whereabouts-service
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: build failed'; exit 1 }
 & $Cargo test -p whereabouts-win-capture --test live_capture --no-run
+if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: test build failed'; exit 1 }
+& $Cargo test -p whereabouts-win-firewall --test live_block --no-run
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: test build failed'; exit 1 }
 
 if (Test-IsAdministrator) {
