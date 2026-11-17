@@ -66,11 +66,11 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 
 Whereabouts 0.1 is a **developer preview** for Windows 10 (22H2) and Windows 11, 64-bit.
 
-1. Download `Whereabouts_0.1.0_x64-setup.exe` and `SHA256SUMS.txt` from the [Releases](https://github.com/Razni-Ahamed/Whereabouts/releases) page.
+1. Download the latest `Whereabouts_<version>_x64-setup.exe` and its `SHA256SUMS.txt` from the [Releases](https://github.com/Razni-Ahamed/Whereabouts/releases) page.
 2. **Check the download.** The preview's installer is not code-signed yet, so Windows SmartScreen may warn about it. Compare its checksum with the published one before running it:
 
    ```powershell
-   (Get-FileHash .\Whereabouts_0.1.0_x64-setup.exe -Algorithm SHA256).Hash
+   (Get-FileHash .\Whereabouts_<version>_x64-setup.exe -Algorithm SHA256).Hash
    ```
 
 3. Run it and approve the administrator prompt. It installs to `C:\Program Files\Whereabouts` (the background service only trusts programs there), registers the **Whereabouts** service, which starts with Windows whoever is logged in, and adds **Whereabouts** to the Start menu.
