@@ -81,6 +81,10 @@ try {
     if (-not (Wait-Until { (Invoke-Wa @('--status')).Code -eq 0 } 60)) {
         throw "the engine did not start: $(Get-Content $log, "$log.err" -Raw)"
     }
+    # Answers Windows cached before the engine started are never confirmed
+    # (an earlier test step looked up example.com), so start from an empty
+    # cache: this test checks names looked up while Whereabouts runs.
+    Clear-DnsClientCache
     Check (Test-Reach $curl) 'the copy of curl reaches example.com before any rule'
 
     Write-Host 'App rule'
