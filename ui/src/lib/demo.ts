@@ -79,6 +79,8 @@ export function demoLive(): Live {
       kernel_events_protected: true,
       saving: true,
       tracker_domains: 47_359,
+      block_rules: 0,
+      blocking_paused: false,
     },
     flows,
     own_pids: [],

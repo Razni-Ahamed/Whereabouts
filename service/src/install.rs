@@ -68,8 +68,16 @@ pub fn register() -> ExitCode {
 
 /// `--unregister`: stops and removes the service, leaving the program files
 /// (the installer removes those), optionally deleting all saved data too.
-pub fn unregister(delete_data: bool) -> ExitCode {
-    let result = remove_service().and_then(|()| finish_data(delete_data));
+pub fn unregister(delete_data: bool, remove_blocks: bool) -> ExitCode {
+    let result = remove_service()
+        .and_then(|()| {
+            if remove_blocks {
+                remove_all_blocks()
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| finish_data(delete_data));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -320,6 +328,7 @@ fn wait_for(service: &Service, state: ServiceState, limit: Duration) -> Result<(
 
 fn try_uninstall(delete_data: bool) -> Result<(), String> {
     remove_service()?;
+    remove_all_blocks()?;
     remove_program_folder(&install_dir()?);
     finish_data(delete_data)
 }
@@ -369,6 +378,23 @@ fn remove_service() -> Result<(), String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// Removes every Whereabouts block and Whereabouts' own entries from the
+/// Windows Filtering Platform (after the service has stopped). The saved
+/// rules stay with the saved data, so a reinstall applies them again.
+fn remove_all_blocks() -> Result<(), String> {
+    let firewall = whereabouts_win_firewall::Firewall::open().map_err(|e| {
+        format!(
+            "could not open the firewall to remove Whereabouts' blocks ({e}); run as \
+             administrator"
+        )
+    })?;
+    let removed = firewall
+        .uninstall()
+        .map_err(|e| format!("could not remove Whereabouts' blocks from the firewall ({e})"))?;
+    println!("Removed Whereabouts from the Windows firewall ({removed} filters).");
     Ok(())
 }
 

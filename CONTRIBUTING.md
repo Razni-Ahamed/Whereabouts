@@ -78,7 +78,7 @@ To also test the Windows service, add `-Service`. This **installs the Whereabout
 powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -Service
 ```
 
-CI runs the same live tests on GitHub's Windows runners (job "Live ETW tests").
+CI runs the same live tests on GitHub's Windows runners (job "Live ETW tests"), plus `scripts/blocking-e2e.ps1`, which runs the engine in console mode and checks blocking rules end to end with a copy of curl. It needs administrator rights and no Whereabouts service running, and it removes every rule and Whereabouts' firewall entries when it finishes.
 
 ## Code guidelines
 

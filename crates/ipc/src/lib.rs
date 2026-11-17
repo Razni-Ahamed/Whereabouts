@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::{self, Read, Write};
+use std::net::IpAddr;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,16 @@ pub const EXPORT_PAGE_BYTES: usize = 512 * 1024;
 /// What a client must send with [`Request::DeleteAll`], so that deleting
 /// everything cannot happen by accident.
 pub const DELETE_ALL_CONFIRMATION: &str = "delete all saved data";
+
+/// Most blocking rules the service keeps.
+pub const MAX_RULES: usize = 256;
+
+/// Longest program path in a rule, in characters.
+pub const MAX_RULE_PATH: usize = 512;
+
+// The rule list (each path at most MAX_RULE_PATH characters, up to 3 bytes
+// each, doubled by JSON escaping in the worst case) must fit in a message.
+const _: () = assert!(MAX_RULES * (MAX_RULE_PATH * 6 + 1024) <= MAX_MESSAGE);
 
 // An export page, plus one more long line and its JSON, must fit in a message.
 const _: () = assert!(EXPORT_PAGE_BYTES * 2 <= MAX_MESSAGE);
@@ -88,6 +99,64 @@ pub enum Request {
         /// Must be [`DELETE_ALL_CONFIRMATION`].
         confirm: String,
     },
+    /// The blocking rules.
+    ListRules {},
+    /// Saves a blocking rule and applies it. Answered with
+    /// [`Response::RuleAdded`].
+    AddRule {
+        /// What to block.
+        rule: RuleSpec,
+    },
+    /// Deletes a blocking rule and unblocks what it blocked.
+    RemoveRule {
+        /// The rule's ID.
+        id: i64,
+    },
+    /// Pauses blocking (every block is lifted, the rules are kept) or
+    /// resumes it.
+    SetBlockingPaused {
+        /// `true` to pause, `false` to resume.
+        paused: bool,
+    },
+}
+
+/// What a blocking rule blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuleSpec {
+    /// Every connection of a program.
+    App {
+        /// The program's full path.
+        path: String,
+    },
+    /// A domain and its subdomains. Blocked by address: each address the
+    /// Windows DNS service confirms for the domain is blocked.
+    Domain {
+        /// The domain, e.g. `tracker.example.com`.
+        name: String,
+        /// The program's full path, or `None` for every program.
+        app: Option<String>,
+    },
+    /// One remote address.
+    Address {
+        /// The remote address.
+        ip: IpAddr,
+        /// The program's full path, or `None` for every program.
+        app: Option<String>,
+    },
+}
+
+/// A saved blocking rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleView {
+    /// The rule's ID.
+    pub id: i64,
+    /// What it blocks.
+    pub rule: RuleSpec,
+    /// When it was created, in seconds since 1970.
+    pub created_secs: u64,
+    /// For a domain rule: how many of its addresses are blocked now.
+    pub blocked_addresses: u64,
 }
 
 impl Request {
@@ -147,6 +216,20 @@ pub enum Response {
     },
     /// Answer to [`Request::DeleteAll`]: everything saved is deleted.
     Deleted {},
+    /// Answer to [`Request::ListRules`], [`Request::RemoveRule`] and
+    /// [`Request::SetBlockingPaused`].
+    Rules {
+        /// The rules, oldest first.
+        rules: Vec<RuleView>,
+        /// Whether blocking is paused.
+        paused: bool,
+    },
+    /// Answer to [`Request::AddRule`].
+    RuleAdded {
+        /// The new rule's ID (or the existing one's, if it was already
+        /// saved).
+        id: i64,
+    },
     /// The request could not be answered.
     Error {
         /// What went wrong, for people.
@@ -184,6 +267,12 @@ pub struct Status {
     pub saving: bool,
     /// Tracker domains loaded from the offline data.
     pub tracker_domains: u64,
+    /// Saved blocking rules.
+    #[serde(default)]
+    pub block_rules: u64,
+    /// Whether blocking is paused.
+    #[serde(default)]
+    pub blocking_paused: bool,
 }
 
 /// How far a flow's domain name can be trusted.
@@ -413,6 +502,55 @@ mod tests {
             last: Some(7),
         });
         round_trip(Response::Deleted {});
+    }
+
+    #[test]
+    fn rule_requests_round_trip_and_refuse_unknown_kinds() {
+        round_trip(Request::AddRule {
+            rule: RuleSpec::Domain {
+                name: String::from("tracker.example.com"),
+                app: None,
+            },
+        });
+        round_trip(Request::AddRule {
+            rule: RuleSpec::Address {
+                ip: "2001:db8::1".parse().unwrap(),
+                app: Some(String::from(r"C:\Apps\x.exe")),
+            },
+        });
+        round_trip(Response::Rules {
+            rules: vec![RuleView {
+                id: 3,
+                rule: RuleSpec::App {
+                    path: String::from(r"C:\Apps\x.exe"),
+                },
+                created_secs: 1_800_000_000,
+                blocked_addresses: 0,
+            }],
+            paused: true,
+        });
+        for json in [
+            r#"{"type":"add_rule","rule":{"kind":"port","port":80}}"#,
+            r#"{"type":"add_rule","rule":{"kind":"app","path":"x","extra":1}}"#,
+            r#"{"type":"add_rule","rule":{"kind":"address","ip":"not an ip","app":null}}"#,
+        ] {
+            let mut buffer = (json.len() as u32).to_le_bytes().to_vec();
+            buffer.extend_from_slice(json.as_bytes());
+            assert!(
+                read_message::<Request>(&mut Cursor::new(buffer)).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_from_an_older_service_still_reads() {
+        let old = r#"{"uptime_secs":1,"events":2,"dropped":0,"unreadable":0,"rejected":0,
+            "over_limit":0,"unattributed":0,"active_flows":0,"kernel_events_protected":true,
+            "saving":true,"tracker_domains":5}"#;
+        let status: Status = serde_json::from_str(old).unwrap();
+        assert_eq!(status.block_rules, 0);
+        assert!(!status.blocking_paused);
     }
 
     #[test]

@@ -213,7 +213,7 @@ All of these ship inside the app and update through signed downloads (§7).
 
 - Blocking uses **user-mode WFP filters**. No custom kernel driver is needed, which avoids the cost and risk of a signed driver.
 - **Block app:** filter at the ALE connect layers (IPv4 + IPv6) with the app-ID condition from `FwpmGetAppIdFromFileName0`.
-- **Block domain for an app:** WFP filters on IPs, not names. When the DNS map sees the blocked domain resolve, we add an IP filter for that app and remove it after the DNS TTL. Limitation: a connection racing the filter may slip through once. This is documented.
+- **Block domain for an app (or every app):** WFP filters on IPs, not names. When the Windows DNS service confirms that the blocked domain (or a subdomain) resolved, we add an IP filter for that app and remove it a day after the address was last seen (see the N2 notes below). Limitation: a connection racing the filter may slip through once. This is documented.
 - All our filters live under **our own WFP provider and sublayer**, so they can be listed and removed cleanly, and an uninstall removes all of them.
 - **No interactive “allow?” prompt before a connection** in v0.x. Holding a connection while asking the user requires a kernel callout driver. Instead we use *notify after*: the user sees the new connection and can block it from then on.
 
@@ -227,6 +227,21 @@ Implementation notes (v0.2, N1 blocking core, 2026-11-17):
 | Filter keys are **derived from the rule** (SHA-256 of scope, rule and layer) | Blocking twice is harmless; unblocking needs no stored IDs. Paths are canonicalised and compared without case, as Windows does. |
 | Each filter carries its rule as JSON in its provider data | The list of blocks can be read from WFP itself, even without the database. |
 | Tests use a **separate WFP provider and sublayer** and a copy of curl | A failing test can never block real programs or delete real rules. Live-tested 2026-11-17: block/unblock a program, per-program address blocks, guard refusals. |
+
+Implementation notes (v0.2, N2 saved rules and block commands, 2026-11-17):
+
+| Decision | Reason |
+|---|---|
+| Rules are saved in the encrypted database (schema v2: `rules`, `settings`); WFP holds the filters | The database is the source of truth. At start the service makes WFP match it: it adds what is missing and removes what no rule asks for, so rules survive restarts and upgrades. Deleting the history keeps the rules. A 0.1 database is upgraded in place, keeping its history. |
+| The firewall is **not touched until the first rule** | A user who never blocks anything gets no WFP entries at all. |
+| A domain rule covers the domain and its subdomains, and is blocked by address, **only from answers the Windows DNS service confirmed** | An app cannot fake a lookup to get an innocent address blocked (worst for "every app" rules). |
+| Learned addresses are kept a **day after they were last seen** (refreshed after 12 h), **at most 256 per rule** | Cloud and CDN addresses are shared and reused; a short life limits blocking of unrelated sites. The time is stored in the filter itself, so learned blocks also survive a restart. |
+| **Exemption filters** (allow, higher weight, our sublayer only) for `svchost`, `lsass`, `services`, `wininit`, `winlogon` and `spoolsv` | An "every app" address block can never cut off Windows' own networking. These allows only outrank our own blocks; they never weaken anyone else's firewall rules. |
+| Rules are checked before anything is saved: the program must exist (its path is canonicalised), the guard-list is applied, domains must be plain lowercase names with a dot (at most 253 characters), at most 256 rules and 512-character paths | Nothing refused is ever saved, and the rule list always fits in one pipe message. |
+| Block commands go over the pipe to the engine (`ListRules`, `AddRule`, `RemoveRule`, `SetBlockingPaused`); the command line (`--rules`, `--block-app`, `--block-domain`, `--block-ip`, `--for`, `--unblock`, `--pause-blocking`, `--resume-blocking`) uses them | One owner of the rules (the engine), the same checks for the app and the command line. Who may connect is unchanged (§5.8): administrators, SYSTEM and the user Whereabouts was installed for, through Whereabouts' own programs. |
+| **Pause** lifts every block and keeps the rules; the choice is saved. `--unblock-all` is the emergency switch: it removes every block from WFP directly (it works even when the service is stuck or stopped) and saves "paused" | One command always gets the user's network back. |
+| Uninstalling removes every filter, the sublayer and the provider; **updating keeps the blocks** (`--unregister` keeps them unless `--remove-blocks` or `--delete-data`) | No gap in blocking during an update; nothing left behind after an uninstall. Without the saved rules nothing could lift the blocks later, so deleting the data also removes them. |
+| End-to-end test `scripts/blocking-e2e.ps1` (CI live job) | Runs the engine in console mode and checks app, domain and address rules, pause/resume, refusals and `--unblock-all` with a copy of curl. |
 
 ### 5.7 Storage
 

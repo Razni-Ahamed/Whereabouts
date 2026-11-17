@@ -24,7 +24,7 @@ use whereabouts_core::dns::LabelSource;
 use whereabouts_core::model::{Protocol, Signature};
 
 /// Version of the database layout this code writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Length of the database key in bytes.
 pub const KEY_LEN: usize = 32;
@@ -230,12 +230,109 @@ impl Store {
             })?;
         match version {
             Some(version) if version > SCHEMA_VERSION => Err(StoreError::NewerSchema(version)),
-            Some(_) => Ok(()),
+            Some(SCHEMA_VERSION) => Ok(()),
+            Some(_) => {
+                // Version 1 (Whereabouts 0.1): add blocking rules, keep history.
+                self.conn.execute_batch(SCHEMA_V2)?;
+                Ok(())
+            }
             None => {
                 self.conn.execute_batch(SCHEMA_V1)?;
+                self.conn.execute_batch(SCHEMA_V2)?;
                 Ok(())
             }
         }
+    }
+
+    /// Saves a blocking rule and returns its ID. Saving a rule that already
+    /// exists returns the existing rule's ID.
+    pub fn add_rule(&mut self, target: &RuleTarget, now: SystemTime) -> Result<i64, StoreError> {
+        let (kind, app, domain, ip) = target.columns();
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM rules WHERE kind = ?1 AND app_path IS ?2 AND domain IS ?3 \
+                 AND ip IS ?4",
+                params![kind, app, domain, ip],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        self.conn.execute(
+            "INSERT INTO rules (kind, app_path, domain, ip, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, app, domain, ip, unix_ms(now)],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Deletes a blocking rule. Returns `false` if there was no such rule.
+    pub fn remove_rule(&mut self, id: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute("DELETE FROM rules WHERE id = ?1", [id])? > 0)
+    }
+
+    /// All saved blocking rules, oldest first.
+    pub fn rules(&self) -> Result<Vec<StoredRule>, StoreError> {
+        let mut query = self
+            .conn
+            .prepare("SELECT id, kind, app_path, domain, ip, created FROM rules ORDER BY id")?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut rules = Vec::new();
+        for row in rows {
+            let (id, kind, app, domain, ip, created) = row?;
+            let target = match (kind.as_str(), app, domain, ip) {
+                ("app", Some(path), None, None) => RuleTarget::App { path },
+                ("domain", app, Some(name), None) => RuleTarget::Domain { name, app },
+                ("address", app, None, Some(ip)) => match ip.parse() {
+                    Ok(ip) => RuleTarget::Address { ip, app },
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            rules.push(StoredRule {
+                id,
+                target,
+                created: from_unix_ms(created),
+            });
+        }
+        Ok(rules)
+    }
+
+    /// A saved setting, if set.
+    pub fn setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Saves a setting.
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Stores finished flows in one transaction.
@@ -426,6 +523,70 @@ impl Store {
         Ok(())
     }
 }
+
+/// What a saved blocking rule blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleTarget {
+    /// Every connection of a program.
+    App {
+        /// The program's full path.
+        path: String,
+    },
+    /// A domain and its subdomains, for one program or every program.
+    Domain {
+        /// The domain, e.g. `tracker.example.com`.
+        name: String,
+        /// The program's full path, or `None` for every program.
+        app: Option<String>,
+    },
+    /// One remote address, for one program or every program.
+    Address {
+        /// The remote address.
+        ip: IpAddr,
+        /// The program's full path, or `None` for every program.
+        app: Option<String>,
+    },
+}
+
+impl RuleTarget {
+    fn columns(&self) -> (&'static str, Option<String>, Option<String>, Option<String>) {
+        match self {
+            Self::App { path } => ("app", Some(path.clone()), None, None),
+            Self::Domain { name, app } => ("domain", app.clone(), Some(name.clone()), None),
+            Self::Address { ip, app } => ("address", app.clone(), None, Some(ip.to_string())),
+        }
+    }
+}
+
+/// A saved blocking rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRule {
+    /// The rule's ID.
+    pub id: i64,
+    /// What it blocks.
+    pub target: RuleTarget,
+    /// When it was created.
+    pub created: SystemTime,
+}
+
+/// Schema version 2 (Whereabouts 0.2): blocking rules and settings.
+const SCHEMA_V2: &str = "
+BEGIN;
+CREATE TABLE rules (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('app', 'domain', 'address')),
+    app_path TEXT,
+    domain TEXT,
+    ip TEXT,
+    created INTEGER NOT NULL,
+    CHECK ((kind = 'app' AND app_path IS NOT NULL AND domain IS NULL AND ip IS NULL)
+        OR (kind = 'domain' AND domain IS NOT NULL AND ip IS NULL)
+        OR (kind = 'address' AND ip IS NOT NULL AND domain IS NULL))
+) STRICT;
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+UPDATE meta SET value = '2' WHERE key = 'schema_version';
+COMMIT;
+";
 
 const SCHEMA_V1: &str = "
 BEGIN;
@@ -720,6 +881,101 @@ mod tests {
         assert_eq!(report.flows_summarized, 1);
         assert_eq!(report.hourly_deleted, 2);
         assert_eq!(store.flow_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn rules_are_saved_listed_and_removed() {
+        let path = temp_db("rules");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let app = RuleTarget::App {
+            path: String::from(r"C:\Apps\x.exe"),
+        };
+        let domain = RuleTarget::Domain {
+            name: String::from("tracker.example.com"),
+            app: None,
+        };
+        let address = RuleTarget::Address {
+            ip: "203.0.113.5".parse().unwrap(),
+            app: Some(String::from(r"C:\Apps\x.exe")),
+        };
+        let a = store.add_rule(&app, at(1000)).unwrap();
+        let d = store.add_rule(&domain, at(1001)).unwrap();
+        let i = store.add_rule(&address, at(1002)).unwrap();
+        assert_eq!(
+            store.add_rule(&domain, at(2000)).unwrap(),
+            d,
+            "no duplicates"
+        );
+        let rules = store.rules().unwrap();
+        assert_eq!(
+            rules
+                .iter()
+                .map(|r| (r.id, r.target.clone()))
+                .collect::<Vec<_>>(),
+            vec![(a, app), (d, domain.clone()), (i, address)]
+        );
+        assert_eq!(rules[1].created, at(1001));
+        assert!(store.remove_rule(a).unwrap());
+        assert!(!store.remove_rule(a).unwrap());
+        drop(store);
+        // Rules survive reopening, and deleting the history keeps them.
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        store.wipe().unwrap();
+        assert_eq!(store.rules().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn settings_are_saved() {
+        let path = temp_db("settings");
+        let mut store = Store::open(&path, &key(8)).unwrap();
+        assert_eq!(store.setting("blocking_paused").unwrap(), None);
+        store.set_setting("blocking_paused", "true").unwrap();
+        store.set_setting("blocking_paused", "false").unwrap();
+        assert_eq!(
+            store.setting("blocking_paused").unwrap().as_deref(),
+            Some("false")
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_version_1_database_is_upgraded_and_keeps_its_history() {
+        let path = temp_db("upgrade");
+        // A database as Whereabouts 0.1 left it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", key(9).sqlcipher_literal())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;",
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+        }
+        let mut store = Store::open(&path, &key(9)).unwrap();
+        store
+            .insert_flows(&[record("old.exe", "example.com", 1000, 5)])
+            .unwrap();
+        assert_eq!(store.flow_count().unwrap(), 1);
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+        store
+            .add_rule(
+                &RuleTarget::App {
+                    path: String::from(r"C:\x.exe"),
+                },
+                at(1),
+            )
+            .unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

@@ -32,6 +32,9 @@ const MAX_CLIENTS: usize = 4;
 /// How long a client waits for the engine to delete everything.
 const DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a client waits for the engine to change the blocking rules.
+const RULES_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Work only the engine can do, asked for by a client.
 #[derive(Debug)]
 pub enum EngineCommand {
@@ -40,6 +43,13 @@ pub enum EngineCommand {
     DeleteAll {
         /// Where to send the result.
         reply: Sender<Result<(), String>>,
+    },
+    /// List or change the blocking rules, and send back the answer.
+    Rules {
+        /// What to do.
+        command: crate::blocking::RuleCommand,
+        /// Where to send the answer.
+        reply: Sender<Response>,
     },
 }
 
@@ -186,7 +196,37 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
             Err(response) => response,
         },
         Request::DeleteAll { confirm } => delete_all(state, &confirm),
+        Request::ListRules {} => rules(state, crate::blocking::RuleCommand::List),
+        Request::AddRule { rule } => rules(state, crate::blocking::RuleCommand::Add(rule)),
+        Request::RemoveRule { id } => rules(state, crate::blocking::RuleCommand::Remove(id)),
+        Request::SetBlockingPaused { paused } => {
+            rules(state, crate::blocking::RuleCommand::SetPaused(paused))
+        }
     }
+}
+
+/// Asks the engine to list or change the blocking rules, and waits for the
+/// answer.
+fn rules(state: &Mutex<LiveState>, command: crate::blocking::RuleCommand) -> Response {
+    let Some(commands) = lock(state).commands.clone() else {
+        return Response::Error {
+            message: String::from("Whereabouts is still starting"),
+        };
+    };
+    let (reply, answer) = mpsc::channel();
+    if commands
+        .send(EngineCommand::Rules { command, reply })
+        .is_err()
+    {
+        return Response::Error {
+            message: String::from("Whereabouts is stopping"),
+        };
+    }
+    answer
+        .recv_timeout(RULES_TIMEOUT)
+        .unwrap_or_else(|_| Response::Error {
+            message: String::from("Whereabouts did not answer in time"),
+        })
 }
 
 /// The connection's store, opened on first use.
@@ -337,6 +377,7 @@ mod tests {
         // A stand-in for the engine that answers one command.
         let engine = std::thread::spawn(move || match commands.recv().unwrap() {
             EngineCommand::DeleteAll { reply } => reply.send(Ok(())).unwrap(),
+            EngineCommand::Rules { .. } => panic!("unexpected command"),
         });
         let mut store = None;
         let done = answer(
@@ -370,6 +411,35 @@ mod tests {
             answer(request(), &state, &mut store),
             Response::Error { .. }
         ));
+    }
+
+    #[test]
+    fn rule_requests_are_passed_to_the_engine() {
+        let state = shared(1);
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        let engine = std::thread::spawn(move || match commands.recv().unwrap() {
+            EngineCommand::Rules {
+                command: crate::blocking::RuleCommand::Remove(7),
+                reply,
+            } => reply
+                .send(Response::Rules {
+                    rules: Vec::new(),
+                    paused: false,
+                })
+                .unwrap(),
+            other => panic!("{other:?}"),
+        });
+        let mut store = None;
+        let answer = answer(Request::RemoveRule { id: 7 }, &state, &mut store);
+        engine.join().unwrap();
+        assert_eq!(
+            answer,
+            Response::Rules {
+                rules: Vec::new(),
+                paused: false
+            }
+        );
     }
 
     #[test]

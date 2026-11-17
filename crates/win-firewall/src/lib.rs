@@ -68,7 +68,19 @@ pub enum Block {
         ip: IpAddr,
         /// The program, or `None` for every program.
         app: Option<PathBuf>,
+        /// The domain this address was learned for, when it comes from a
+        /// domain block (not part of the rule's identity).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+        /// When the address was learned, in seconds since 1970 (0 if it
+        /// was blocked directly; not part of the rule's identity).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        learned: u64,
     },
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Block {
@@ -85,7 +97,21 @@ impl Block {
         Ok(Self::Address {
             ip: ip.to_canonical(),
             app: app.map(normalize).transpose()?,
+            via: None,
+            learned: 0,
         })
+    }
+
+    /// Blocks `ip` because it is an address of the blocked `domain`, learned
+    /// at `learned` (seconds since 1970). `app` is an already normalised
+    /// path, or `None` for every program.
+    pub fn learned_address(ip: IpAddr, app: Option<PathBuf>, domain: &str, learned: u64) -> Self {
+        Self::Address {
+            ip: ip.to_canonical(),
+            app,
+            via: Some(domain.to_owned()),
+            learned,
+        }
     }
 
     /// The WFP layers (IPv4, IPv6) this rule needs a filter in.
@@ -110,14 +136,20 @@ impl Block {
         };
         match self {
             Self::App { path } => format!("{} (all connections)", name(path)),
-            Self::Address { ip, app: Some(app) } => format!("{} → {ip}", name(app)),
-            Self::Address { ip, app: None } => format!("every app → {ip}"),
+            Self::Address {
+                ip, app: Some(app), ..
+            } => format!("{} → {ip}", name(app)),
+            Self::Address { ip, app: None, .. } => format!("every app → {ip}"),
         }
     }
 }
 
 /// A full path in one canonical spelling (so the same program always gives
-/// the same rule), without the `\\?\` prefix.
+/// the same rule), without the `\\?\` prefix. The file must exist.
+pub fn normalize_path(path: &Path) -> io::Result<PathBuf> {
+    normalize(path)
+}
+
 fn normalize(path: &Path) -> io::Result<PathBuf> {
     let full = std::fs::canonicalize(path)?;
     let text = full.to_string_lossy();
@@ -129,7 +161,7 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
 fn filter_key(scope: &Scope, block: &Block, layer: GUID) -> GUID {
     let identity = match block {
         Block::App { path } => format!("app|{}", path.to_string_lossy().to_lowercase()),
-        Block::Address { ip, app } => format!(
+        Block::Address { ip, app, .. } => format!(
             "address|{ip}|{}",
             app.as_ref()
                 .map(|p| p.to_string_lossy().to_lowercase())
@@ -198,7 +230,10 @@ impl Firewall {
 
     fn open_scope(scope: Scope) -> io::Result<Self> {
         let engine = Engine::open()?;
-        engine.transaction(|| engine.ensure_scope(&scope))?;
+        engine.transaction(|| {
+            engine.ensure_scope(&scope)?;
+            add_exemptions(&engine, &scope)
+        })?;
         Ok(Self { engine, scope })
     }
 
@@ -211,11 +246,11 @@ impl Firewall {
         let description = String::from("Added by Whereabouts at the user's request.");
         let (app, remote) = match block {
             Block::App { path } => (Some(path.as_path()), None),
-            Block::Address { ip, app } => (app.as_deref(), Some(*ip)),
+            Block::Address { ip, app, .. } => (app.as_deref(), Some(*ip)),
         };
         self.engine.transaction(|| {
             for layer in block.layers() {
-                self.engine.add_block(
+                self.engine.add_filter(
                     &self.scope,
                     &FilterSpec {
                         key: filter_key(&self.scope, block, layer),
@@ -225,6 +260,7 @@ impl Firewall {
                         data: &data,
                         app,
                         remote,
+                        permit: false,
                     },
                 )?;
             }
@@ -262,9 +298,14 @@ impl Firewall {
         Ok(rules)
     }
 
-    /// Removes every Whereabouts rule. Returns how many filters were
-    /// removed.
+    /// Removes every Whereabouts block (the exemptions stay). Returns how
+    /// many filters were removed.
     pub fn remove_all(&self) -> io::Result<usize> {
+        self.remove_where(|data| serde_json::from_slice::<Block>(data).is_ok())
+    }
+
+    /// Removes our filters whose stored data `matches`.
+    fn remove_where(&self, matches: impl Fn(&[u8]) -> bool) -> io::Result<usize> {
         let mut keys = Vec::new();
         for layer in [
             FWPM_LAYER_ALE_AUTH_CONNECT_V4,
@@ -274,6 +315,7 @@ impl Firewall {
                 self.engine
                     .list(&self.scope, layer)?
                     .into_iter()
+                    .filter(|f| matches(&f.data))
                     .map(|f| f.key),
             );
         }
@@ -291,15 +333,72 @@ impl Firewall {
     /// Removes every rule, then Whereabouts' WFP provider and sublayer:
     /// nothing of Whereabouts is left in WFP (used when uninstalling).
     pub fn uninstall(self) -> io::Result<usize> {
-        let removed = self.remove_all()?;
+        let removed = self.remove_where(|_| true)?;
         self.engine
             .transaction(|| self.engine.remove_scope(&self.scope))?;
         Ok(removed)
     }
 }
 
-/// The guard-list check for `block`.
-fn check_guard(block: &Block) -> Result<(), Refusal> {
+/// Core Windows programs exempted from every Whereabouts block, including
+/// "every app" blocks: allows that outrank our blocks in our own sublayer.
+/// They never affect anyone else's firewall rules.
+const EXEMPT_PROGRAMS: [&str; 6] = [
+    "svchost.exe",
+    "lsass.exe",
+    "services.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "spoolsv.exe",
+];
+
+/// Adds (or keeps) the exemptions for core Windows programs.
+fn add_exemptions(engine: &Engine, scope: &Scope) -> io::Result<()> {
+    let system32 = std::env::var_os("SystemRoot")
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+        .join("System32");
+    for program in EXEMPT_PROGRAMS {
+        let path = system32.join(program);
+        if !path.is_file() {
+            continue;
+        }
+        let data = serde_json::json!({ "kind": "exempt", "path": path }).to_string();
+        let name = format!("Whereabouts: never block {program}");
+        let identity = Block::App { path: path.clone() };
+        for layer in [
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        ] {
+            engine.add_filter(
+                scope,
+                &FilterSpec {
+                    key: exemption_key(scope, &identity, layer),
+                    layer,
+                    name: &name,
+                    description: "Core Windows program: Whereabouts' blocks never apply to it.",
+                    data: data.as_bytes(),
+                    app: Some(&path),
+                    remote: None,
+                    permit: true,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The key of an exemption filter: never the same as any block's key.
+fn exemption_key(scope: &Scope, program: &Block, layer: GUID) -> GUID {
+    let exemptions = Scope {
+        provider: GUID::from_u128(scope.provider.to_u128() ^ 0xE),
+        ..*scope
+    };
+    filter_key(&exemptions, program, layer)
+}
+
+/// The guard-list check for `block`: whether Whereabouts refuses to block
+/// it (core Windows programs, DNS servers, the local network...).
+pub fn check_guard(block: &Block) -> Result<(), Refusal> {
     let system_root =
         std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
     let program = match block {
@@ -364,8 +463,15 @@ mod tests {
         let one = Block::Address {
             ip,
             app: Some(PathBuf::from(r"C:\Apps\x.exe")),
+            via: None,
+            learned: 0,
         };
-        let all = Block::Address { ip, app: None };
+        let all = Block::Address {
+            ip,
+            app: None,
+            via: None,
+            learned: 0,
+        };
         let layer = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
         assert_ne!(
             filter_key(&WHEREABOUTS, &one, layer),
@@ -375,6 +481,8 @@ mod tests {
         let v6 = Block::Address {
             ip: "2001:db8::1".parse().unwrap(),
             app: None,
+            via: None,
+            learned: 0,
         };
         assert_eq!(v6.layers(), vec![FWPM_LAYER_ALE_AUTH_CONNECT_V6]);
     }
@@ -386,6 +494,8 @@ mod tests {
             Block::Address {
                 ip: "203.0.113.5".parse().unwrap(),
                 app: None,
+                via: None,
+                learned: 0,
             },
         ] {
             let json = serde_json::to_vec(&block).unwrap();
@@ -395,11 +505,52 @@ mod tests {
     }
 
     #[test]
+    fn where_an_address_was_learned_does_not_change_its_rule() {
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let direct = Block::Address {
+            ip,
+            app: None,
+            via: None,
+            learned: 0,
+        };
+        let learned = Block::learned_address(ip, None, "tracker.example.com", 1_700_000_000);
+        let layer = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        assert_eq!(
+            filter_key(&WHEREABOUTS, &direct, layer),
+            filter_key(&WHEREABOUTS, &learned, layer)
+        );
+        let json = serde_json::to_vec(&learned).unwrap();
+        assert_eq!(serde_json::from_slice::<Block>(&json).unwrap(), learned);
+        // A direct block's JSON stays as short as before.
+        let direct_json = serde_json::to_string(&direct).unwrap();
+        assert!(
+            !direct_json.contains("via") && !direct_json.contains("learned"),
+            "{direct_json}"
+        );
+    }
+
+    #[test]
+    fn exemption_keys_never_collide_with_block_keys() {
+        let svchost = app(r"C:\Windows\System32\svchost.exe");
+        let layer = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        assert_ne!(
+            exemption_key(&WHEREABOUTS, &svchost, layer),
+            filter_key(&WHEREABOUTS, &svchost, layer)
+        );
+        // An exemption's stored data is not a block, so it is never listed
+        // as one, and "remove all" leaves it.
+        let data = serde_json::json!({ "kind": "exempt", "path": "x" }).to_string();
+        assert!(serde_json::from_str::<Block>(&data).is_err());
+    }
+
+    #[test]
     fn rules_describe_themselves() {
         assert_eq!(app(r"C:\Apps\x.exe").describe(), "x.exe (all connections)");
         let all = Block::Address {
             ip: "203.0.113.5".parse().unwrap(),
             app: None,
+            via: None,
+            learned: 0,
         };
         assert_eq!(all.describe(), "every app → 203.0.113.5");
     }
@@ -413,6 +564,8 @@ mod tests {
         let loopback = Block::Address {
             ip: "127.0.0.1".parse().unwrap(),
             app: None,
+            via: None,
+            learned: 0,
         };
         assert!(check_guard(&loopback).is_err());
     }
