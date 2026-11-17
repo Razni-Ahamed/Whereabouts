@@ -14,7 +14,7 @@ use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
 use whereabouts_core::privacy::is_web_browser;
 use whereabouts_core::text::display_safe;
 use whereabouts_enrich::{ATTRIBUTION, Enricher, Scope, registrable_domain};
-use whereabouts_ipc::{DomainTrust, FlowView, MAX_ROWS, PIPE_NAME, Status};
+use whereabouts_ipc::{DomainTrust, FlowView, MAX_FLOW_PATH, MAX_ROWS, PIPE_NAME, Status};
 use whereabouts_store::{FlowRecord, Store};
 use whereabouts_win_capture::identity::{DevicePaths, lock_running_image};
 use whereabouts_win_capture::resolver::IdentityResolver;
@@ -864,6 +864,13 @@ fn flow_view(row: &Row, names: &ProcessNames, enricher: &Enricher) -> FlowView {
     FlowView {
         pid: row.key.pid,
         app: truncate(&row.app, CLIENT_TEXT),
+        // A shortened path would name another program, so long ones are
+        // left out.
+        path: row
+            .token
+            .and_then(|token| names.identity(token))
+            .map(|identity| identity.path.clone())
+            .filter(|path| path.chars().count() <= MAX_FLOW_PATH),
         publisher: truncate(&publisher, CLIENT_TEXT),
         publisher_confirmed,
         protocol: String::from(protocol_text(row.key.protocol)),

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { CircleAlert, FlaskConical } from '@lucide/svelte';
+  import { CircleAlert, CircleCheck, FlaskConical, ShieldOff, X } from '@lucide/svelte';
   import Backdrop from './lib/components/Backdrop.svelte';
   import Logo from './lib/components/Logo.svelte';
   import { store } from './lib/state.svelte';
@@ -8,14 +8,18 @@
   import Apps from './screens/Apps.svelte';
   import Connections from './screens/Connections.svelte';
   import Privacy from './screens/Privacy.svelte';
+  import Rules from './screens/Rules.svelte';
 
-  type Screen = 'overview' | 'apps' | 'connections' | 'privacy';
+  type Screen = 'overview' | 'apps' | 'connections' | 'rules' | 'privacy';
   const TABS: { id: Screen; label: string }[] = [
     { id: 'overview', label: 'Overview' },
     { id: 'apps', label: 'Apps' },
     { id: 'connections', label: 'Connections' },
+    { id: 'rules', label: 'Rules' },
     { id: 'privacy', label: 'Privacy' },
   ];
+  const ruleCount = $derived(store.rules?.rules.length ?? 0);
+  const paused = $derived((store.rules?.paused ?? false) && ruleCount > 0);
 
   let screen = $state<Screen>('overview');
   let selectedApp = $state<string | null>(null);
@@ -69,6 +73,9 @@
           onclick={() => (screen = tab.id)}
         >
           {tab.label}
+          {#if tab.id === 'rules' && ruleCount > 0}
+            <span class="count num" class:off={paused}>{ruleCount}</span>
+          {/if}
         </button>
       {/each}
     </div>
@@ -98,6 +105,17 @@
     </div>
   {/if}
 
+  {#if paused}
+    <div class="glass banner fade-in" role="status">
+      <ShieldOff size={20} />
+      <div class="grow">
+        <strong>Blocking is paused.</strong>
+        <p>Nothing is blocked right now. Your {ruleCount} {ruleCount === 1 ? 'rule is' : 'rules are'} kept.</p>
+      </div>
+      <button class="btn btn-primary resume" type="button" onclick={() => store.setPaused(false)}>Resume</button>
+    </div>
+  {/if}
+
   <main>
     {#key screen}
       <div class="fade-in">
@@ -107,12 +125,28 @@
           <Apps bind:selected={selectedApp} />
         {:else if screen === 'connections'}
           <Connections onpickapp={openApp} />
+        {:else if screen === 'rules'}
+          <Rules />
         {:else}
           <Privacy />
         {/if}
       </div>
     {/key}
   </main>
+
+  {#if store.note}
+    {@const note = store.note}
+    <div class="glass note {note.tone} fade-in" role="status" aria-live="polite">
+      {#if note.tone === 'good'}<CircleCheck size={18} />{:else}<CircleAlert size={18} />{/if}
+      <span>{note.text}</span>
+      {#if note.undo !== undefined}
+        <button type="button" class="undo" onclick={() => store.unblock(note.undo!)}>Undo</button>
+      {/if}
+      <button type="button" class="dismiss" aria-label="Dismiss" onclick={() => store.showNote(null)}>
+        <X size={15} />
+      </button>
+    </div>
+  {/if}
 
   <footer>
     <span>Whereabouts {store.live?.version ?? ''} · never reads what your apps send</span>
@@ -252,6 +286,94 @@
   }
   main {
     flex: 1;
+  }
+  .tabs button {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+  }
+  .tabs .count {
+    display: inline-grid;
+    place-items: center;
+    min-width: 18px;
+    height: 18px;
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: 9px;
+    font-size: 11px;
+    font-weight: 700;
+    background: var(--danger-bg);
+    color: var(--danger);
+  }
+  .tabs button.active .count {
+    background: rgb(3 32 25 / 0.18);
+    color: var(--accent-ink);
+  }
+  .tabs .count.off {
+    background: var(--warn-bg);
+    color: var(--warn);
+  }
+  .banner .grow {
+    flex: 1;
+  }
+  .banner .resume {
+    align-self: center;
+    height: 36px;
+    padding: 0 18px;
+    font-size: 13px;
+  }
+  .note {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 26px;
+    z-index: 30;
+    width: fit-content;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: min(640px, calc(100vw - 40px));
+    padding: 10px 10px 10px 16px;
+    border-radius: var(--radius-pill);
+    background-color: rgb(11 26 39 / 0.94);
+  }
+  .note.good {
+    color: var(--accent);
+  }
+  .note.bad {
+    color: var(--warn);
+    border-radius: var(--radius-md);
+  }
+  .note span {
+    color: var(--text);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .note button {
+    border: 0;
+    background: none;
+    cursor: pointer;
+  }
+  .undo {
+    padding: 4px 12px;
+    border-radius: var(--radius-pill);
+    color: var(--mint);
+    font-weight: 600;
+  }
+  .undo:hover {
+    background: var(--glass-hover);
+  }
+  .dismiss {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    color: var(--text-muted);
+  }
+  .dismiss:hover {
+    background: var(--glass-hover);
   }
   footer {
     display: flex;

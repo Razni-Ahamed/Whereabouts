@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { ArrowDown, ArrowUp } from '@lucide/svelte';
+  import { ArrowDown, ArrowUp, Ban } from '@lucide/svelte';
   import AppAvatar from './AppAvatar.svelte';
+  import BlockMenu from './BlockMenu.svelte';
   import Trust from './Trust.svelte';
   import { appLabel, bytes, countryName, ownerParts } from '../format';
   import { isTracking } from '../state.svelte';
@@ -11,7 +12,13 @@
     showApp = true,
     onpickapp,
   }: { flows: FlowView[]; showApp?: boolean; onpickapp?: (app: string) => void } = $props();
+
+  let blocking = $state<FlowView | null>(null);
 </script>
+
+{#if blocking}
+  <BlockMenu flow={blocking} onclose={() => (blocking = null)} />
+{/if}
 
 <div class="table" role="table" aria-label="Connections">
   <div class="head" role="row" class:noapp={!showApp}>
@@ -21,6 +28,7 @@
     <span role="columnheader">Country</span>
     <span role="columnheader" class="right">Sent</span>
     <span role="columnheader" class="right">Received</span>
+    <span role="columnheader"><span class="sr">Block</span></span>
   </div>
   <!-- Keyed by position: the same app, protocol and address can appear twice
        (a closed flow and a newer one to the same place). -->
@@ -57,6 +65,17 @@
       </span>
       <span class="right num" role="cell"><ArrowUp size={12} /> {bytes(flow.bytes_sent)}</span>
       <span class="right num" role="cell"><ArrowDown size={12} /> {bytes(flow.bytes_received)}</span>
+      <span role="cell">
+        <button
+          class="block"
+          type="button"
+          title="Block…"
+          aria-label="Block {appLabel(flow.app)} → {flow.domain ?? flow.remote}"
+          onclick={() => (blocking = flow)}
+        >
+          <Ban size={15} />
+        </button>
+      </span>
     </div>
   {:else}
     <p class="muted empty">No connections yet.</p>
@@ -66,17 +85,18 @@
 <style>
   .table {
     display: grid;
+    overflow-x: auto;
   }
   .head,
   .row {
     display: grid;
-    grid-template-columns: minmax(170px, 1.2fr) minmax(200px, 1.6fr) minmax(140px, 1fr) minmax(110px, 0.8fr) 96px 104px;
+    grid-template-columns: minmax(170px, 1.2fr) minmax(200px, 1.6fr) minmax(140px, 1fr) minmax(110px, 0.8fr) 96px 104px 32px;
     align-items: center;
     gap: 14px;
     padding: 10px 14px;
   }
   .noapp {
-    grid-template-columns: minmax(200px, 1.6fr) minmax(140px, 1fr) minmax(110px, 0.8fr) 96px 104px;
+    grid-template-columns: minmax(160px, 1.6fr) minmax(110px, 1fr) minmax(80px, 0.8fr) 88px 96px 32px;
   }
   .head {
     font-size: 11px;
@@ -165,5 +185,43 @@
   .empty {
     padding: 18px 14px;
     margin: 0;
+  }
+  .block {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.2s var(--ease),
+      background 0.2s var(--ease),
+      color 0.2s var(--ease);
+  }
+  .row:hover .block,
+  .block:focus-visible {
+    opacity: 1;
+  }
+  .block:hover {
+    color: var(--danger);
+    background: var(--danger-bg);
+    border-color: rgb(255 138 122 / 0.3);
+  }
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  @media (hover: none) {
+    .block {
+      opacity: 1;
+    }
   }
 </style>

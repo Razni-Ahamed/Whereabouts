@@ -246,6 +246,16 @@ Implementation notes (v0.2, N2 saved rules and block commands, 2026-11-17):
 | Uninstalling removes every filter, the sublayer and the provider; **updating keeps the blocks** (`--unregister` keeps them unless `--remove-blocks` or `--delete-data`) | No gap in blocking during an update; nothing left behind after an uninstall. Without the saved rules nothing could lift the blocks later, so deleting the data also removes them. |
 | End-to-end test `scripts/blocking-e2e.ps1` (CI live job) | Runs the engine in console mode and checks app, domain and address rules, pause/resume, refusals and `--unblock-all` with a copy of curl. |
 
+Implementation notes (v0.2, N3 rules in the app, 2026-11-17):
+
+| Decision | Reason |
+|---|---|
+| **Block…** on every connection (Connections and Apps screens) offers: this domain for this app, this domain for every app (marked as a warning), this address for this app (when there is no domain), or the whole app; **Block app** on an app's page | The choices a person actually has in front of them; the "every app" choice is the one with side effects, so it says so. |
+| The app's `add_rule` command shows **exactly what will be blocked in a native Windows dialog** (title, program path, the every-app and first-connection caveats) and blocks only if the user agrees | Same pattern as Delete everything: a bug or injected script in the web view cannot block anything silently. Lifting blocks (`remove_rule`, `set_blocking_paused`) needs no dialog: it is the safe direction, and "Undo" must be one click. Text in the dialog is made safe to show (no control or bidirectional characters). |
+| Live flows carry the program's **full path** (`FlowView.path`, only when at most 260 characters; never shortened) | Rules need the path; a shortened path would name another program. |
+| **Rules** screen: what is blocked, for which app, since when, how many addresses a domain rule blocks now, **Unblock**; **Pause all blocks / Resume**; a banner on every screen while paused; a note with **Undo** after each block | Blocking must always be visible and reversible. |
+| Blocked-attempt counts are **not shown yet** | They need WFP's dropped-packet events (a system-wide setting and more native code); planned as a follow-up. |
+
 ### 5.7 Storage
 
 - **SQLite + SQLCipher** via `rusqlite` (feature `bundled-sqlcipher`).

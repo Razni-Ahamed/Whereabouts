@@ -18,6 +18,7 @@ serde.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 whereabouts-client.workspace = true
+whereabouts-core.workspace = true
 whereabouts-ipc.workspace = true
 
 [build-dependencies]

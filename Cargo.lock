@@ -4348,6 +4348,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "whereabouts-client",
+ "whereabouts-core",
  "whereabouts-ipc",
 ]
 

@@ -22,6 +22,8 @@ export type DomainTrust = 'verified' | 'app_reported' | 'guessed';
 export interface FlowView {
   pid: number;
   app: string;
+  /** The program's full path, when the service knows it. */
+  path: string | null;
   publisher: string;
   publisher_confirmed: boolean;
   protocol: string;
@@ -50,6 +52,26 @@ export type ProblemKind = 'not_running' | 'access_denied' | 'untrusted' | 'refus
 export interface Problem {
   kind: ProblemKind;
   message: string;
+}
+
+/** What a blocking rule blocks. */
+export type RuleSpec =
+  | { kind: 'app'; path: string }
+  | { kind: 'domain'; name: string; app: string | null }
+  | { kind: 'address'; ip: string; app: string | null };
+
+export interface RuleView {
+  id: number;
+  rule: RuleSpec;
+  /** Seconds since 1970. */
+  created_secs: number;
+  /** For a domain rule: how many of its addresses are blocked now. */
+  blocked_addresses: number;
+}
+
+export interface Rules {
+  rules: RuleView[];
+  paused: boolean;
 }
 
 export interface Live {

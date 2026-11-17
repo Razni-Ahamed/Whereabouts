@@ -2,23 +2,28 @@
 //!
 //! It reads data only from the service's local pipe (checked to really be
 //! the Whereabouts service before anything is sent) and makes no network
-//! requests of its own. The web view can call exactly four commands (see
-//! `build.rs`): `live` and `history` read data; `export_history` and
-//! `delete_history` take no arguments from the web view and ask the user
-//! through native Windows dialogs (where to save; whether to delete).
+//! requests of its own. The web view can call exactly these commands (see
+//! `build.rs`): `live`, `history` and `rules` read data; `export_history`
+//! and `delete_history` take no arguments from the web view and ask the
+//! user through native Windows dialogs (where to save; whether to delete);
+//! `add_rule` shows what will be blocked in a native Windows dialog and
+//! blocks only if the user agrees; `remove_rule` and `set_blocking_paused`
+//! lift blocks (the safe direction).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use whereabouts_client::{Client, Problem, unexpected};
+use whereabouts_core::text::display_safe;
 use whereabouts_ipc::{
     AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, MAX_HOURS, MAX_ROWS, PIPE_NAME,
-    Request, Response, Status,
+    Request, Response, RuleSpec, RuleView, Status,
 };
 
 /// The service's status and current flows.
@@ -228,6 +233,148 @@ async fn delete_history(
     .await
 }
 
+/// The blocking rules and whether blocking is paused.
+#[derive(Debug, Serialize)]
+struct Rules {
+    rules: Vec<RuleView>,
+    paused: bool,
+}
+
+/// Asks the service and expects the rule list back.
+fn ask_rules(client: &mut Client, request: &Request) -> Result<Rules, Problem> {
+    match client.ask(request)? {
+        Response::Rules { rules, paused } => Ok(Rules { rules, paused }),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[tauri::command]
+async fn rules(connection: tauri::State<'_, Arc<Connection>>) -> Result<Rules, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || connection.with(|client| ask_rules(client, &Request::ListRules {}))).await
+}
+
+/// A program's file name, for people.
+fn program_name(path: &str) -> String {
+    display_safe(
+        &Path::new(path)
+            .file_name()
+            .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned()),
+    )
+}
+
+/// What the confirmation dialog says for `rule`: its title and text.
+fn describe(rule: &RuleSpec) -> (String, String) {
+    const DOMAIN_NOTE: &str = "Whereabouts blocks the addresses Windows' DNS service confirms \
+                               for it, so a connection that is already starting may still get \
+                               through once.";
+    const EVERY_APP_NOTE: &str = "This applies to every app on this computer. Whereabouts never \
+                                  blocks addresses that other, unblocked sites also use, nor what \
+                                  Windows needs to stay online.";
+    let undo = "You can unblock it at any time on the Rules screen.";
+    match rule {
+        RuleSpec::App { path } => (
+            format!("Block {}?", program_name(path)),
+            format!(
+                "Every connection {} makes will be blocked, until you unblock it.\n\n{}\n\n{undo}",
+                program_name(path),
+                display_safe(path)
+            ),
+        ),
+        RuleSpec::Domain {
+            name,
+            app: Some(app),
+        } => (
+            format!("Block {} for {}?", display_safe(name), program_name(app)),
+            format!(
+                "{} will not be able to connect to {} or its subdomains.\n\n{DOMAIN_NOTE}\n\n{undo}",
+                program_name(app),
+                display_safe(name)
+            ),
+        ),
+        RuleSpec::Domain { name, app: None } => (
+            format!("Block {} for every app?", display_safe(name)),
+            format!(
+                "No app will be able to connect to {} or its subdomains.\n\n{EVERY_APP_NOTE}\n\n\
+                 {DOMAIN_NOTE}\n\n{undo}",
+                display_safe(name)
+            ),
+        ),
+        RuleSpec::Address { ip, app: Some(app) } => (
+            format!("Block {ip} for {}?", program_name(app)),
+            format!(
+                "{} will not be able to connect to {ip}.\n\nOther sites can share this address, \
+                 so this may block more than one site for this app.\n\n{undo}",
+                program_name(app)
+            ),
+        ),
+        RuleSpec::Address { ip, app: None } => (
+            format!("Block {ip} for every app?"),
+            format!(
+                "No app will be able to connect to {ip}.\n\nOther sites can share this address, \
+                 so this may block more than one site for every app.\n\n{undo}"
+            ),
+        ),
+    }
+}
+
+/// Shows exactly what will be blocked in a native Windows dialog and, if
+/// the user agrees, asks the service to block it. `None` if the user said
+/// no; otherwise the rule's ID.
+#[tauri::command]
+async fn add_rule(
+    rule: RuleSpec,
+    app: tauri::AppHandle,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Option<i64>, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        let (title, message) = describe(&rule);
+        let confirmed = app
+            .dialog()
+            .message(message)
+            .title(title)
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                String::from("Block"),
+                String::from("Cancel"),
+            ))
+            .blocking_show();
+        if !confirmed {
+            return Ok(None);
+        }
+        let request = Request::AddRule { rule };
+        connection.with(|client| match client.ask(&request)? {
+            Response::RuleAdded { id } => Ok(Some(id)),
+            other => Err(unexpected(&other)),
+        })
+    })
+    .await
+}
+
+/// Deletes a rule and lifts its block.
+#[tauri::command]
+async fn remove_rule(
+    id: i64,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Rules, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || connection.with(|client| ask_rules(client, &Request::RemoveRule { id }))).await
+}
+
+/// Pauses (lifts every block, keeps the rules) or resumes blocking.
+#[tauri::command]
+async fn set_blocking_paused(
+    paused: bool,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Rules, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        connection.with(|client| ask_rules(client, &Request::SetBlockingPaused { paused }))
+    })
+    .await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -236,8 +383,47 @@ fn main() {
             live,
             history,
             export_history,
-            delete_history
+            delete_history,
+            rules,
+            add_rule,
+            remove_rule,
+            set_blocking_paused
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Whereabouts app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmations_say_exactly_what_is_blocked() {
+        let app = String::from(r"C:\Apps\Chat\chat.exe");
+        let (title, text) = describe(&RuleSpec::App { path: app.clone() });
+        assert_eq!(title, "Block chat.exe?");
+        assert!(text.contains(&app));
+
+        let (title, text) = describe(&RuleSpec::Domain {
+            name: String::from("ads.example.com"),
+            app: None,
+        });
+        assert_eq!(title, "Block ads.example.com for every app?");
+        assert!(text.contains("every app on this computer"));
+
+        let (title, _) = describe(&RuleSpec::Address {
+            ip: "203.0.113.5".parse().unwrap(),
+            app: Some(app),
+        });
+        assert_eq!(title, "Block 203.0.113.5 for chat.exe?");
+    }
+
+    #[test]
+    fn confirmations_cannot_be_spoofed_with_control_characters() {
+        let (title, _) = describe(&RuleSpec::Domain {
+            name: String::from("evil.example\u{202e}moc.knab"),
+            app: None,
+        });
+        assert!(!title.contains('\u{202e}'), "{title:?}");
+    }
 }

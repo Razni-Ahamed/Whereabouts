@@ -47,6 +47,10 @@ pub const EXPORT_PAGE_BYTES: usize = 512 * 1024;
 /// everything cannot happen by accident.
 pub const DELETE_ALL_CONFIRMATION: &str = "delete all saved data";
 
+/// Longest program path sent with a flow, in characters (Windows' classic
+/// path limit); longer paths are left out rather than shortened.
+pub const MAX_FLOW_PATH: usize = 260;
+
 /// Most blocking rules the service keeps.
 pub const MAX_RULES: usize = 256;
 
@@ -308,6 +312,10 @@ pub struct FlowView {
     pub pid: u32,
     /// Executable file name.
     pub app: String,
+    /// The program's full path, when known and at most [`MAX_FLOW_PATH`]
+    /// characters long (so the app can offer to block it).
+    #[serde(default)]
+    pub path: Option<String>,
     /// Publisher: the signer (e.g. "Google LLC"), "UNSIGNED", "INVALID
     /// SIGNATURE", "…" while being checked, or "-" if there is no program
     /// file.
@@ -414,6 +422,7 @@ mod tests {
             flows: vec![FlowView {
                 pid: 7,
                 app: String::from("curl.exe"),
+                path: Some(String::from(r"C:\Windows\System32\curl.exe")),
                 publisher: String::from("Microsoft Windows"),
                 publisher_confirmed: true,
                 protocol: String::from("TCP"),

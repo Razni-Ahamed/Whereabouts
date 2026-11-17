@@ -1,7 +1,21 @@
 // Made-up data, shown only when the UI runs in an ordinary browser (for
 // design work). The desktop app always shows real data from the service.
 
-import type { AppTotals, FlowView, Live } from './types';
+import type { AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
+
+/** Where the demo apps live. */
+const PATHS: Record<string, string> = {
+  'chrome.exe': 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'ms-teams.exe': 'C:\\Program Files\\WindowsApps\\MSTeams_8wekyb3d8bbwe\\ms-teams.exe',
+  'Spotify.exe': 'C:\\Users\\you\\AppData\\Roaming\\Spotify\\Spotify.exe',
+  'OneDrive.exe': 'C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe',
+  'Discord.exe': 'C:\\Users\\you\\AppData\\Local\\Discord\\app-1.0.9200\\Discord.exe',
+  'steam.exe': 'C:\\Program Files (x86)\\Steam\\steam.exe',
+  'svchost.exe': 'C:\\Windows\\System32\\svchost.exe',
+  'updater.exe': 'C:\\Users\\you\\AppData\\Local\\Temp\\freeware\\updater.exe',
+  'Code.exe': 'C:\\Users\\you\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe',
+  'zoom.exe': 'C:\\Users\\you\\AppData\\Roaming\\Zoom\\bin\\zoom.exe',
+};
 
 interface Seed {
   pid: number;
@@ -53,6 +67,7 @@ export function demoLive(): Live {
   const flows: FlowView[] = SEEDS.map((s, i) => ({
     pid: s.pid,
     app: s.app,
+    path: PATHS[s.app] ?? null,
     publisher: s.publisher,
     publisher_confirmed: s.confirmed ?? true,
     protocol: s.protocol ?? 'TCP',
@@ -79,12 +94,59 @@ export function demoLive(): Live {
       kernel_events_protected: true,
       saving: true,
       tracker_domains: 47_359,
-      block_rules: 0,
-      blocking_paused: false,
+      block_rules: demo.rules.length,
+      blocking_paused: demo.paused,
     },
     flows,
     own_pids: [],
   };
+}
+
+// Demo blocking rules, kept in memory while the page is open.
+const day = 86_400;
+const now = () => Math.floor(Date.now() / 1000);
+let nextId = 3;
+const demo: Rules = {
+  rules: [
+    { id: 1, rule: { kind: 'domain', name: 'connect.facebook.net', app: null }, created_secs: now() - 3 * day, blocked_addresses: 2 },
+    { id: 2, rule: { kind: 'app', path: PATHS['updater.exe'] ?? 'updater.exe' }, created_secs: now() - 2 * 3600, blocked_addresses: 0 },
+  ],
+  paused: false,
+};
+
+const copy = (): Rules => ({ rules: demo.rules.map((r) => ({ ...r })), paused: demo.paused });
+
+export function demoRules(): Rules {
+  return copy();
+}
+
+export async function demoAddRule(
+  rule: RuleSpec,
+): Promise<{ ok: true; value: number | null } | { ok: false; problem: Problem }> {
+  await new Promise((r) => setTimeout(r, 300));
+  if (rule.kind === 'app' && /\\windows\\system32\\svchost\.exe$/i.test(rule.path)) {
+    return {
+      ok: false,
+      problem: {
+        kind: 'other',
+        message: 'Whereabouts answered: not blocked: svchost.exe is part of Windows; blocking it could cut the computer off',
+      },
+    };
+  }
+  if (!window.confirm(`Demo: block ${JSON.stringify(rule)}?`)) return { ok: true, value: null };
+  const id = nextId++;
+  demo.rules.push({ id, rule, created_secs: now(), blocked_addresses: rule.kind === 'domain' ? 1 : 0 });
+  return { ok: true, value: id };
+}
+
+export function demoRemoveRule(id: number): Rules {
+  demo.rules = demo.rules.filter((r) => r.id !== id);
+  return copy();
+}
+
+export function demoSetPaused(paused: boolean): Rules {
+  demo.paused = paused;
+  return copy();
 }
 
 export function demoHistory(): AppTotals[] {
