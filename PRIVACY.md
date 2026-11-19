@@ -16,7 +16,7 @@ If the code ever does something this page says it does not, that is a bug. Pleas
 |---|---|
 | Which app made the connection (path, publisher) | `TikTok.exe`, signed by "TikTok Pte. Ltd." |
 | The server's IP address and port | `203.0.113.10:443` |
-| The domain name, if known from a DNS lookup | `analytics.example.com` |
+| The domain name, if known from a DNS lookup (and, to spot trackers hidden behind a site's own name, the names it points to, kept in memory only) | `analytics.example.com` |
 | The company and country of that server (looked up offline) | "Example Analytics Inc., Singapore" |
 | How much data was sent and received, and when | 12 MB sent, 3 MB received, 03:12–03:15 |
 

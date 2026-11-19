@@ -358,6 +358,7 @@ fn decode_dns(record: &EventRecord, locator: &SchemaLocator, kind: DnsKind) -> D
         },
         DnsKind::Service => CaptureEvent::DnsConfirmed {
             name,
+            aliases: parsed.aliases,
             addresses: parsed.addresses,
             timestamp,
         },

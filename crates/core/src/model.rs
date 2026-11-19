@@ -186,6 +186,8 @@ pub enum CaptureEvent {
     DnsConfirmed {
         /// The name that was resolved, normalised.
         name: String,
+        /// CNAME aliases in the answer (the names it points to), in order.
+        aliases: Vec<String>,
         /// Addresses in the answer.
         addresses: Vec<IpAddr>,
         /// When the answer arrived.

@@ -91,6 +91,21 @@ pub struct DomainLabel {
     pub name: Arc<str>,
     /// How much the label can be trusted.
     pub source: LabelSource,
+    /// The names it points to (CNAME aliases), in order, as the Windows DNS
+    /// service confirmed them; empty if none are known. A tracker hidden
+    /// behind a site's own name ("CNAME cloaking") shows up here.
+    pub aliases: Arc<[Arc<str>]>,
+}
+
+impl DomainLabel {
+    /// A label without aliases.
+    pub fn new(name: &str, source: LabelSource) -> Self {
+        Self {
+            name: Arc::from(name),
+            source,
+            aliases: Arc::from([]),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +214,8 @@ pub struct DnsMap {
     /// Address -> names the DNS service resolved to it, each with when that
     /// pair was last confirmed.
     by_address: Recent<IpAddr, Vec<(Arc<str>, SystemTime)>>,
+    /// Name -> the CNAME aliases the DNS service last confirmed for it.
+    aliases: Recent<Arc<str>, Arc<[Arc<str>]>>,
     lifetime: Duration,
     max_per_process: usize,
     max_total: usize,
@@ -236,6 +253,7 @@ impl DnsMap {
             asked_entries: 0,
             by_name: Recent::new(max_confirmed),
             by_address: Recent::new(max_confirmed),
+            aliases: Recent::new(max_confirmed),
             lifetime,
             max_per_process,
             max_total,
@@ -335,6 +353,7 @@ impl DnsMap {
             // The confirmation may also arrive just after the app's answer.
             let verified = answer.verified || self.is_confirmed(&answer.name, address, at);
             return Some(DomainLabel {
+                aliases: self.aliases_of(&answer.name, at),
                 name: Arc::clone(&answer.name),
                 source: if verified {
                     LabelSource::Verified
@@ -351,6 +370,7 @@ impl DnsMap {
             .filter(|(_, confirmed_at)| self.is_fresh(*confirmed_at, at));
         match (fresh.next(), fresh.next()) {
             (Some((name, _)), None) => Some(DomainLabel {
+                aliases: self.aliases_of(name, at),
                 name: Arc::clone(name),
                 source: LabelSource::Inferred,
             }),
@@ -362,7 +382,7 @@ impl DnsMap {
     /// addresses still confirmed for it at `now`. Answers served from
     /// Windows' DNS cache are not confirmed again, so this is what is known
     /// for names that are still cached.
-    pub fn confirmed_answers(&self, now: SystemTime) -> Vec<(String, Vec<IpAddr>)> {
+    pub fn confirmed_answers(&self, now: SystemTime) -> Vec<(String, Vec<String>, Vec<IpAddr>)> {
         self.by_name
             .map
             .iter()
@@ -372,7 +392,12 @@ impl DnsMap {
                     .filter(|(_, seen)| self.is_fresh(*seen, now))
                     .map(|(address, _)| *address)
                     .collect();
-                (!fresh.is_empty()).then(|| (name.to_string(), fresh))
+                let aliases = self
+                    .aliases_of(name, now)
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect();
+                (!fresh.is_empty()).then(|| (name.to_string(), aliases, fresh))
             })
             .collect()
     }
@@ -395,6 +420,30 @@ impl DnsMap {
         self.asked_entries = self.asked.values().map(HashMap::len).sum();
         self.by_name.retain_fresh(now, lifetime);
         self.by_address.retain_fresh(now, lifetime);
+        self.aliases.retain_fresh(now, lifetime);
+    }
+
+    /// Records the CNAME aliases the DNS service confirmed for `name` (call
+    /// with [`DnsMap::record_confirmed`] for the same answer).
+    pub fn record_confirmed_aliases(&mut self, name: &str, aliases: &[String], at: SystemTime) {
+        if aliases.is_empty() {
+            return;
+        }
+        let chain: Arc<[Arc<str>]> = aliases.iter().map(|a| Arc::from(a.as_str())).collect();
+        self.aliases.upsert(
+            Arc::from(name),
+            at,
+            || Arc::clone(&chain),
+            |known| *known = Arc::clone(&chain),
+        );
+    }
+
+    /// The confirmed aliases of `name` that are still fresh at `at`.
+    pub fn aliases_of(&self, name: &str, at: SystemTime) -> Arc<[Arc<str>]> {
+        match self.aliases.get(&Arc::from(name)) {
+            Some((chain, seen)) if self.is_fresh(seen, at) => Arc::clone(chain),
+            _ => Arc::from([]),
+        }
     }
 
     /// Number of remembered app answers (process, address pairs).
@@ -505,8 +554,43 @@ mod tests {
         listed.sort();
         assert_eq!(
             listed,
-            vec![(String::from("example.com"), vec![ip("104.20.23.154")])]
+            vec![(
+                String::from("example.com"),
+                vec![],
+                vec![ip("104.20.23.154")]
+            )]
         );
+    }
+
+    #[test]
+    fn confirmed_aliases_travel_with_the_label() {
+        let mut map = DnsMap::new();
+        let chain = vec![
+            String::from("metrics.tracker.example"),
+            String::from("edge.cdn.example"),
+        ];
+        map.record_confirmed("metrics.shop.example", &[ip("203.0.113.5")], at(0));
+        map.record_confirmed_aliases("metrics.shop.example", &chain, at(0));
+        map.record_app_answer(7, "metrics.shop.example", &[ip("203.0.113.5")], at(0));
+        let label = map.lookup(7, ip("203.0.113.5"), at(1)).unwrap();
+        assert_eq!(&*label.name, "metrics.shop.example");
+        assert_eq!(
+            label
+                .aliases
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>(),
+            chain
+        );
+        // Guessed labels carry them too; old ones expire.
+        let guessed = map.lookup(8, ip("203.0.113.5"), at(1)).unwrap();
+        assert_eq!(guessed.aliases.len(), 2);
+        assert!(
+            map.aliases_of("metrics.shop.example", at(31 * 60))
+                .is_empty()
+        );
+        // Unconfirmed (app-reported) aliases never count.
+        assert!(map.aliases_of("other.example", at(1)).is_empty());
     }
 
     #[test]

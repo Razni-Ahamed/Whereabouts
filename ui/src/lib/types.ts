@@ -43,6 +43,8 @@ export interface FlowView {
   protocol: string;
   domain: string | null;
   domain_trust: DomainTrust | null;
+  /** The name `domain` points to that revealed the tracker or company behind it. */
+  via?: string | null;
   owner: string | null;
   country: string | null;
   remote: string;

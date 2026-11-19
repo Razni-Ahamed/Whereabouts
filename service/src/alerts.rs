@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use whereabouts_core::flow::FlowKey;
@@ -38,6 +39,8 @@ pub struct FlowFacts<'a> {
     /// The domain, only if confirmed by the Windows DNS service (or seen
     /// for the same address in its answers).
     pub domain: Option<&'a str>,
+    /// The names the domain points to (confirmed CNAME aliases).
+    pub aliases: &'a [Arc<str>],
 }
 
 /// A saved alert worth telling the user about now.
@@ -133,9 +136,23 @@ impl Detector {
         }
 
         if let Some(domain) = flow.domain {
-            let info = enricher.domain(domain);
+            // The domain itself, or a tracker hidden behind it (a CNAME
+            // alias of a site's own name).
+            let direct = enricher.domain(domain);
+            let (info, hidden_behind) = if direct.tracker {
+                (direct, None)
+            } else {
+                flow.aliases
+                    .iter()
+                    .map(|alias| enricher.domain(alias))
+                    .find(|info| info.tracker)
+                    .map_or((direct, None), |info| (info, Some(domain)))
+            };
             if info.tracker {
                 let tracker = info.registrable.unwrap_or_else(|| domain.to_owned());
+                let who = info
+                    .company
+                    .map_or_else(|| tracker.clone(), |company| company.name);
                 let alert = NewAlert {
                     key: format!("tracker|{app_key}|{tracker}|{day}"),
                     allow_key: flow.path.map(|_| format!("tracker|{app_key}|{tracker}")),
@@ -143,8 +160,11 @@ impl Detector {
                     severity: Severity::Info,
                     app_name: Some(flow.app.to_owned()),
                     app_path: flow.path.map(str::to_owned),
+                    detail: Some(match hidden_behind {
+                        Some(name) => format!("{who}, hidden behind {name}"),
+                        None => who,
+                    }),
                     target: Some(tracker),
-                    detail: info.company.map(|company| company.name),
                 };
                 // Info: saved for the Alerts screen and the daily digest only.
                 let _ = save(store, alert, now);
@@ -309,6 +329,7 @@ mod tests {
             app: "chat.exe",
             path: Some(r"C:\Apps\Chat.exe"),
             domain,
+            aliases: &[],
         }
     }
 
@@ -430,6 +451,24 @@ mod tests {
             at(T0),
         );
         assert_eq!(store.alerts(at(0), 10).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trackers_hidden_behind_a_sites_own_name_are_found() {
+        let (mut store, dir) = store("cloaked");
+        let mut detector = Detector::default();
+        let aliases: Vec<Arc<str>> = vec![Arc::from("eu.ads.example")];
+        let mut facts = flow("198.51.100.9:443", Some("metrics.shop.example"));
+        facts.aliases = &aliases;
+        detector.check_flow(&facts, &enricher(), &mut store, at(T0));
+        let saved = store.alerts(at(0), 10).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].target.as_deref(), Some("ads.example"));
+        assert_eq!(
+            saved[0].detail.as_deref(),
+            Some("ads.example, hidden behind metrics.shop.example")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

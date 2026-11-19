@@ -174,9 +174,15 @@ impl<F: Firewalls> Blocking<F> {
     }
 
     /// Called for each answer the Windows DNS service confirmed.
-    pub fn on_confirmed_answer(&mut self, name: &str, addresses: &[IpAddr], now: SystemTime) {
+    pub fn on_confirmed_answer(
+        &mut self,
+        name: &str,
+        aliases: &[String],
+        addresses: &[IpAddr],
+        now: SystemTime,
+    ) {
         if let Some(blocker) = self.blocker.as_mut() {
-            blocker.on_confirmed_answer(name, addresses, now);
+            blocker.on_confirmed_chain(name, aliases, addresses, now);
         }
     }
 
@@ -497,38 +503,62 @@ impl<F: Firewalls> Blocker<F> {
 
     /// Called for each answer the Windows DNS service confirmed: blocks the
     /// addresses of blocked domains.
+    #[cfg(test)]
     pub fn on_confirmed_answer(&mut self, name: &str, addresses: &[IpAddr], now: SystemTime) {
+        self.on_confirmed_chain(name, &[], addresses, now);
+    }
+
+    /// Like [`Blocker::on_confirmed_answer`], with the name's CNAME aliases:
+    /// a blocked domain is also blocked when another name points to it (a
+    /// tracker hidden behind a site's own name).
+    pub fn on_confirmed_chain(
+        &mut self,
+        name: &str,
+        aliases: &[String],
+        addresses: &[IpAddr],
+        now: SystemTime,
+    ) {
         if self.paused {
             return;
         }
         let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let mut chain = vec![name.clone()];
+        chain.extend(
+            aliases
+                .iter()
+                .map(|a| a.trim_end_matches('.').to_ascii_lowercase()),
+        );
+        // The name in the chain a domain covers, if any.
+        let covered = |domain: &str| chain.iter().find(|n| covers(domain, n)).cloned();
         // Only names no domain rule covers (for any app) show that an
         // address is used elsewhere.
         let blocked_name = self.rules.iter().any(|rule| {
-            matches!(&rule.target, RuleTarget::Domain { name: domain, .. } if covers(domain, &name))
+            matches!(&rule.target, RuleTarget::Domain { name: domain, .. } if covered(domain).is_some())
         });
         if !blocked_name {
             for ip in addresses {
                 self.note_shared(ip.to_canonical(), now);
             }
         }
-        let matching: Vec<(i64, Option<String>)> = self
+        // Each matching rule, with the name it matched (kept with learned
+        // addresses, so they still match the rule after a restart).
+        let matching: Vec<(i64, Option<String>, String)> = self
             .rules
             .iter()
             .filter_map(|rule| match &rule.target {
-                RuleTarget::Domain { name: domain, app } if covers(domain, &name) => {
-                    Some((rule.id, app.clone()))
+                RuleTarget::Domain { name: domain, app } => {
+                    covered(domain).map(|matched| (rule.id, app.clone(), matched))
                 }
                 _ => None,
             })
             .collect();
-        for (rule, app) in matching {
+        for (rule, app, matched) in matching {
             let app = match app.map(|a| normalize_path(Path::new(&a))).transpose() {
                 Ok(app) => app,
                 Err(_) => continue,
             };
             for ip in addresses {
-                self.learn(rule, *ip, app.clone(), &name, now);
+                self.learn(rule, *ip, app.clone(), &matched, now);
             }
         }
     }
@@ -1167,6 +1197,43 @@ mod tests {
             1,
             "the address rule's block stays"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_blocked_domain_is_blocked_behind_another_name() {
+        let (mut store, dir) = store("cname");
+        let (mut blocker, _) = Blocker::start(Fake::default(), &store, at(T0)).unwrap();
+        blocker
+            .add(
+                &mut store,
+                RuleTarget::Domain {
+                    name: String::from("tracker.example.com"),
+                    app: None,
+                },
+                at(T0),
+            )
+            .unwrap();
+        let ip: IpAddr = "203.0.113.50".parse().unwrap();
+        // metrics.shop.example points to the tracker (CNAME cloaking).
+        blocker.on_confirmed_chain(
+            "metrics.shop.example",
+            &[String::from("eu.tracker.example.com")],
+            &[ip],
+            at(T0 + 1),
+        );
+        assert_eq!(blocker.firewall.blocks.len(), 1);
+        // The learned address names the tracker, so it survives a restart.
+        let (restarted, _) = Blocker::start(
+            Fake {
+                blocks: blocker.firewall.blocks.clone(),
+            },
+            &store,
+            at(T0 + 2),
+        )
+        .unwrap();
+        assert_eq!(restarted.firewall.blocks.len(), 1);
+        assert_eq!(restarted.states()[0].learned, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
