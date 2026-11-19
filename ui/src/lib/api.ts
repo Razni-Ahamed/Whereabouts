@@ -3,8 +3,17 @@
 // data instead, and says so.
 
 import { invoke } from '@tauri-apps/api/core';
-import { demoAddRule, demoHistory, demoLive, demoRemoveRule, demoRules, demoSetPaused } from './demo';
-import type { AppSettings, AppTotals, Live, Problem, Rules, RuleSpec } from './types';
+import {
+  demoAddRule,
+  demoAlerts,
+  demoDismissAlert,
+  demoHistory,
+  demoLive,
+  demoRemoveRule,
+  demoRules,
+  demoSetPaused,
+} from './demo';
+import type { AlertView, AppSettings, AppTotals, Live, Problem, Rules, RuleSpec } from './types';
 
 export const isDemo = !('__TAURI_INTERNALS__' in window);
 
@@ -85,6 +94,21 @@ export async function removeRule(id: number): Promise<Result<Rules>> {
 export async function setBlockingPaused(paused: boolean): Promise<Result<Rules>> {
   if (isDemo) return { ok: true, value: demoSetPaused(paused) };
   return call<Rules>('set_blocking_paused', { paused });
+}
+
+/** Saved alerts of the last `hours`, newest first. */
+export async function alerts(hours = 30 * 24, limit = 500): Promise<Result<AlertView[]>> {
+  if (isDemo) return { ok: true, value: demoAlerts() };
+  return call<AlertView[]>('alerts', { hours, limit });
+}
+
+/**
+ * Marks an alert as seen and fine; with `allow`, alerts like it stop
+ * (Windows asks first for risky networks). `false` if the user said no.
+ */
+export async function dismissAlert(id: number, allow: boolean): Promise<Result<boolean>> {
+  if (isDemo) return { ok: true, value: demoDismissAlert(id, allow) };
+  return call<boolean>('dismiss_alert', { id, allow });
 }
 
 // Demo settings, kept while the page is open.

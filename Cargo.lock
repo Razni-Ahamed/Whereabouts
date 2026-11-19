@@ -4818,6 +4818,7 @@ version = "0.1.1"
 dependencies = [
  "maxminddb",
  "psl",
+ "serde_json",
 ]
 
 [[package]]

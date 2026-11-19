@@ -10,12 +10,14 @@
   import Connections from './screens/Connections.svelte';
   import Privacy from './screens/Privacy.svelte';
   import Rules from './screens/Rules.svelte';
+  import Alerts from './screens/Alerts.svelte';
 
-  type Screen = 'overview' | 'apps' | 'connections' | 'rules' | 'privacy';
+  type Screen = 'overview' | 'apps' | 'connections' | 'alerts' | 'rules' | 'privacy';
   const TABS: { id: Screen; label: string }[] = [
     { id: 'overview', label: 'Overview' },
     { id: 'apps', label: 'Apps' },
     { id: 'connections', label: 'Connections' },
+    { id: 'alerts', label: 'Alerts' },
     { id: 'rules', label: 'Rules' },
     { id: 'privacy', label: 'Privacy' },
   ];
@@ -81,6 +83,9 @@
           {#if tab.id === 'rules' && ruleCount > 0}
             <span class="count num" class:off={paused}>{ruleCount}</span>
           {/if}
+          {#if tab.id === 'alerts' && store.needsLook > 0}
+            <span class="count num alert">{store.needsLook}</span>
+          {/if}
         </button>
       {/each}
     </div>
@@ -130,6 +135,8 @@
           <Apps bind:selected={selectedApp} />
         {:else if screen === 'connections'}
           <Connections onpickapp={openApp} />
+        {:else if screen === 'alerts'}
+          <Alerts onpickapp={openApp} />
         {:else if screen === 'rules'}
           <Rules />
         {:else}
@@ -155,7 +162,11 @@
 
   <footer>
     <span>Whereabouts {store.live?.version ?? ''} · never reads what your apps send</span>
-    <span>Company and country data: DB-IP Lite (CC BY 4.0), EasyPrivacy</span>
+    <span>
+      Company and country data: DB-IP Lite (CC BY 4.0), EasyPrivacy{store.live?.status.drop_list
+        ? '; risky networks: Spamhaus DROP, The Spamhaus Project'
+        : ''}
+    </span>
   </footer>
 </div>
 
@@ -313,6 +324,10 @@
   .tabs button.active .count {
     background: rgb(3 32 25 / 0.18);
     color: var(--accent-ink);
+  }
+  .tabs .count.alert {
+    background: var(--warn-bg);
+    color: var(--warn);
   }
   .tabs .count.off {
     background: var(--warn-bg);

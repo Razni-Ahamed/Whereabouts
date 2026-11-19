@@ -128,6 +128,74 @@ pub enum Request {
         /// The last notice ID already seen.
         after: u64,
     },
+    /// Saved alerts, newest first.
+    Alerts {
+        /// How many hours back; clamped to [`MAX_HOURS`].
+        hours: u32,
+        /// Most alerts to return; clamped to [`MAX_ROWS`].
+        limit: u32,
+    },
+    /// Marks an alert as seen and fine.
+    DismissAlert {
+        /// The alert's ID.
+        id: i64,
+        /// Also stop alerts like it (same app and target), if it can.
+        allow: bool,
+    },
+}
+
+/// How much an alert matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Worth knowing; never notified on its own.
+    Info,
+    /// Worth a look.
+    Medium,
+    /// Needs a look.
+    High,
+    /// Needs a look now.
+    Critical,
+}
+
+/// What an alert is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertKind {
+    /// An app contacted a known tracker (`target` is its domain, `detail`
+    /// the company if known).
+    Tracker,
+    /// An app connected to a network on Spamhaus' DROP list (`target` is
+    /// the address, `detail` the listed range and its reference).
+    BadNetwork,
+    /// Events claimed to come from the Windows DNS service but did not
+    /// (`detail` says how many).
+    FakedDns,
+    /// Traffic could not be tied to any process (`detail` says how much).
+    Unattributed,
+}
+
+/// A saved alert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertView {
+    /// The alert's ID.
+    pub id: i64,
+    /// When it was raised, in seconds since 1970.
+    pub created_secs: u64,
+    pub kind: AlertKind,
+    pub severity: Severity,
+    /// Executable file name, if it concerns one app.
+    pub app: Option<String>,
+    /// The program's full path.
+    pub path: Option<String>,
+    /// The domain or address concerned.
+    pub target: Option<String>,
+    /// More detail: a company, a listing, a count.
+    pub detail: Option<String>,
+    /// Whether the user marked it as seen and fine.
+    pub dismissed: bool,
+    /// Whether "this is fine" can also stop alerts like it.
+    pub can_allow: bool,
 }
 
 /// Most notices the service keeps; older ones are dropped.
@@ -154,6 +222,16 @@ pub enum NoticeKind {
         app: String,
         /// The program's full path.
         path: String,
+    },
+    /// An alert worth notifying about (medium severity or higher).
+    Alert {
+        /// The alert's ID.
+        id: i64,
+        /// What it is about.
+        alert: AlertKind,
+        severity: Severity,
+        /// Executable file name, if it concerns one app.
+        app: Option<String>,
     },
 }
 
@@ -205,6 +283,10 @@ impl Request {
                 limit: limit.min(MAX_ROWS),
             },
             Self::History { hours, limit } => Self::History {
+                hours: hours.min(MAX_HOURS),
+                limit: limit.min(MAX_ROWS),
+            },
+            Self::Alerts { hours, limit } => Self::Alerts {
                 hours: hours.min(MAX_HOURS),
                 limit: limit.min(MAX_ROWS),
             },
@@ -270,6 +352,13 @@ pub enum Response {
         /// `after` next time.
         last: u64,
     },
+    /// Answer to [`Request::Alerts`].
+    Alerts {
+        /// The alerts, newest first.
+        alerts: Vec<AlertView>,
+    },
+    /// Answer to [`Request::DismissAlert`].
+    AlertDismissed {},
     /// Answer to [`Request::AddRule`].
     RuleAdded {
         /// The new rule's ID (or the existing one's, if it was already
@@ -319,6 +408,10 @@ pub struct Status {
     /// Whether blocking is paused.
     #[serde(default)]
     pub blocking_paused: bool,
+    /// Whether connections are checked against Spamhaus DROP (only once
+    /// this computer has downloaded it).
+    #[serde(default)]
+    pub drop_list: bool,
 }
 
 /// How far a flow's domain name can be trusted.
@@ -592,6 +685,37 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn alert_messages_round_trip_and_are_bounded() {
+        round_trip(Request::DismissAlert { id: 3, allow: true });
+        round_trip(Response::Alerts {
+            alerts: vec![AlertView {
+                id: 3,
+                created_secs: 1_800_000_000,
+                kind: AlertKind::BadNetwork,
+                severity: Severity::High,
+                app: Some(String::from("chat.exe")),
+                path: Some(String::from(r"C:\Apps\chat.exe")),
+                target: Some(String::from("203.0.113.5")),
+                detail: Some(String::from("203.0.113.0/24 (SBL1)")),
+                dismissed: false,
+                can_allow: true,
+            }],
+        });
+        assert_eq!(
+            Request::Alerts {
+                hours: u32::MAX,
+                limit: u32::MAX
+            }
+            .clamped(),
+            Request::Alerts {
+                hours: MAX_HOURS,
+                limit: MAX_ROWS
+            }
+        );
+        assert!(Severity::Critical > Severity::Medium);
     }
 
     #[test]

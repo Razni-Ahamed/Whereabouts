@@ -1,7 +1,7 @@
 // Made-up data, shown only when the UI runs in an ordinary browser (for
 // design work). The desktop app always shows real data from the service.
 
-import type { AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
+import type { AlertView, AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
 
 /** Where the demo apps live. */
 const PATHS: Record<string, string> = {
@@ -96,6 +96,7 @@ export function demoLive(): Live {
       tracker_domains: 47_359,
       block_rules: demo.rules.length,
       blocking_paused: demo.paused,
+      drop_list: false,
     },
     flows,
     own_pids: [],
@@ -147,6 +148,35 @@ export function demoRemoveRule(id: number): Rules {
 export function demoSetPaused(paused: boolean): Rules {
   demo.paused = paused;
   return copy();
+}
+
+// Demo alerts, kept in memory while the page is open.
+const minute = 60;
+let demoAlertList: AlertView[] = [
+  { id: 6, created_secs: now() - 4 * minute, kind: 'bad_network', severity: 'high', app: 'updater.exe', path: PATHS['updater.exe'] ?? null, target: '185.215.113.66', detail: '185.215.113.0/24 (SBL549867)', dismissed: false, can_allow: true },
+  { id: 5, created_secs: now() - 38 * minute, kind: 'faked_dns', severity: 'medium', app: null, path: null, target: null, detail: '3 events', dismissed: false, can_allow: false },
+  { id: 4, created_secs: now() - 52 * minute, kind: 'tracker', severity: 'info', app: 'chrome.exe', path: PATHS['chrome.exe'] ?? null, target: 'google-analytics.com', detail: 'Google', dismissed: false, can_allow: true },
+  { id: 3, created_secs: now() - 70 * minute, kind: 'tracker', severity: 'info', app: 'chrome.exe', path: PATHS['chrome.exe'] ?? null, target: 'facebook.net', detail: 'Meta', dismissed: false, can_allow: true },
+  { id: 2, created_secs: now() - 3 * 3600, kind: 'tracker', severity: 'info', app: 'Discord.exe', path: PATHS['Discord.exe'] ?? null, target: 'sentry.io', detail: 'Sentry', dismissed: false, can_allow: true },
+  { id: 1, created_secs: now() - day, kind: 'tracker', severity: 'info', app: 'Code.exe', path: PATHS['Code.exe'] ?? null, target: 'visualstudio.com', detail: null, dismissed: true, can_allow: true },
+];
+
+export function demoAlerts(): AlertView[] {
+  return demoAlertList.map((a) => ({ ...a }));
+}
+
+export function demoDismissAlert(id: number, allow: boolean): boolean {
+  const alert = demoAlertList.find((a) => a.id === id);
+  if (!alert) return false;
+  if (allow && alert.severity === 'high' && !window.confirm('Demo: stop warnings about this network for this app?')) {
+    return false;
+  }
+  demoAlertList = demoAlertList.map((a) =>
+    a.id === id || (allow && a.kind === alert.kind && a.path === alert.path && a.target === alert.target)
+      ? { ...a, dismissed: true }
+      : a,
+  );
+  return true;
 }
 
 export function demoHistory(): AppTotals[] {

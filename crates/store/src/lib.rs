@@ -24,7 +24,7 @@ use whereabouts_core::dns::LabelSource;
 use whereabouts_core::model::{Protocol, Signature};
 
 /// Version of the database layout this code writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Length of the database key in bytes.
 pub const KEY_LEN: usize = 32;
@@ -238,16 +238,152 @@ impl Store {
                 if version < 2 {
                     self.conn.execute_batch(SCHEMA_V2)?;
                 }
-                self.conn.execute_batch(SCHEMA_V3)?;
+                if version < 3 {
+                    self.conn.execute_batch(SCHEMA_V3)?;
+                }
+                self.conn.execute_batch(SCHEMA_V4)?;
                 Ok(())
             }
             None => {
                 self.conn.execute_batch(SCHEMA_V1)?;
                 self.conn.execute_batch(SCHEMA_V2)?;
                 self.conn.execute_batch(SCHEMA_V3)?;
+                self.conn.execute_batch(SCHEMA_V4)?;
                 Ok(())
             }
         }
+    }
+
+    /// Saves an alert. Returns its ID, or `None` if an alert with the same
+    /// key exists already, or the user said this is fine (its allow key).
+    pub fn add_alert(
+        &mut self,
+        alert: &NewAlert,
+        now: SystemTime,
+    ) -> Result<Option<i64>, StoreError> {
+        if let Some(allow) = &alert.allow_key {
+            let allowed: bool = self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM alert_allows WHERE key = ?1)",
+                [allow],
+                |row| row.get(0),
+            )?;
+            if allowed {
+                return Ok(None);
+            }
+        }
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO alerts (key, allow_key, created, kind, severity, app_name, \
+             app_path, target, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                alert.key,
+                alert.allow_key,
+                unix_ms(now),
+                alert.kind.as_str(),
+                alert.severity.as_str(),
+                alert.app_name,
+                alert.app_path,
+                alert.target,
+                alert.detail
+            ],
+        )?;
+        Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Alerts created since `since`, at most `limit`: those that need a
+    /// look (above info) first, then the rest, each newest first. So many
+    /// info alerts can never push a serious one out of the list.
+    pub fn alerts(&self, since: SystemTime, limit: usize) -> Result<Vec<StoredAlert>, StoreError> {
+        let mut query = self.conn.prepare(
+            "SELECT id, created, kind, severity, app_name, app_path, target, detail, dismissed, \
+             allow_key IS NOT NULL FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2",
+        )?;
+        let rows = query.query_map(
+            params![unix_ms(since), i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, bool>(8)?,
+                    row.get::<_, bool>(9)?,
+                ))
+            },
+        )?;
+        let mut alerts = Vec::new();
+        for row in rows {
+            let (
+                id,
+                created,
+                kind,
+                severity,
+                app_name,
+                app_path,
+                target,
+                detail,
+                dismissed,
+                can_allow,
+            ) = row?;
+            let (Some(kind), Some(severity)) =
+                (AlertKind::parse(&kind), Severity::parse(&severity))
+            else {
+                continue;
+            };
+            alerts.push(StoredAlert {
+                id,
+                created: from_unix_ms(created),
+                kind,
+                severity,
+                app_name,
+                app_path,
+                target,
+                detail,
+                dismissed,
+                can_allow,
+            });
+        }
+        Ok(alerts)
+    }
+
+    /// Marks an alert as seen and fine. With `allow`, alerts like it (same
+    /// app and target) are not raised again. `false` if there was no such
+    /// alert.
+    pub fn dismiss_alert(
+        &mut self,
+        id: i64,
+        allow: bool,
+        now: SystemTime,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.conn.transaction()?;
+        let allow_key: Option<Option<String>> = transaction
+            .query_row("SELECT allow_key FROM alerts WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let Some(allow_key) = allow_key else {
+            return Ok(false);
+        };
+        transaction.execute("UPDATE alerts SET dismissed = 1 WHERE id = ?1", [id])?;
+        if allow && let Some(key) = allow_key {
+            transaction.execute(
+                "INSERT OR IGNORE INTO alert_allows (key, created) VALUES (?1, ?2)",
+                params![key, unix_ms(now)],
+            )?;
+            transaction.execute(
+                "UPDATE alerts SET dismissed = 1 WHERE allow_key = ?1",
+                [&key],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// The programs that have used the network, as keys (see
@@ -477,6 +613,11 @@ impl Store {
         )?;
         let hourly_deleted =
             transaction.execute("DELETE FROM hourly WHERE hour < ?1", params![hourly_cutoff])?;
+        let alerts_cutoff = unix_ms(now.checked_sub(ALERTS_KEPT_FOR).unwrap_or(UNIX_EPOCH));
+        transaction.execute(
+            "DELETE FROM alerts WHERE created < ?1",
+            params![alerts_cutoff],
+        )?;
         transaction.commit()?;
         Ok(RetentionReport {
             flows_summarized: u64::try_from(flows_summarized).unwrap_or(0),
@@ -544,7 +685,7 @@ impl Store {
     /// the deleted data is not left behind in free pages.
     pub fn wipe(&mut self) -> Result<(), StoreError> {
         self.conn.execute_batch(
-            "DELETE FROM flows; DELETE FROM hourly; DELETE FROM known_apps; VACUUM;",
+            "DELETE FROM flows; DELETE FROM hourly; DELETE FROM known_apps; DELETE FROM alerts; VACUUM;",
         )?;
         Ok(())
     }
@@ -596,6 +737,137 @@ pub struct StoredRule {
 }
 
 /// Schema version 2 (Whereabouts 0.2): blocking rules and settings.
+/// How long alerts are kept.
+pub const ALERTS_KEPT_FOR: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// What an alert is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertKind {
+    /// An app contacted a known tracker.
+    Tracker,
+    /// An app connected to a network on Spamhaus' DROP list.
+    BadNetwork,
+    /// Events claimed to come from the Windows DNS service but did not.
+    FakedDns,
+    /// Traffic could not be tied to any process.
+    Unattributed,
+}
+
+impl AlertKind {
+    /// The stored spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tracker => "tracker",
+            Self::BadNetwork => "bad_network",
+            Self::FakedDns => "faked_dns",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        [
+            Self::Tracker,
+            Self::BadNetwork,
+            Self::FakedDns,
+            Self::Unattributed,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == text)
+    }
+}
+
+/// How much an alert matters (design spec §6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Worth knowing; never notified on its own.
+    Info,
+    /// Worth a look.
+    Medium,
+    /// Needs a look.
+    High,
+    /// Needs a look now.
+    Critical,
+}
+
+impl Severity {
+    /// The stored spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        [Self::Info, Self::Medium, Self::High, Self::Critical]
+            .into_iter()
+            .find(|severity| severity.as_str() == text)
+    }
+}
+
+/// An alert to save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAlert {
+    /// Identifies the alert: a second alert with the same key is not saved
+    /// (e.g. one per app, tracker and day).
+    pub key: String,
+    /// Identifies alerts like it, for "this is fine" (e.g. app and tracker);
+    /// `None` if it cannot be allowed.
+    pub allow_key: Option<String>,
+    pub kind: AlertKind,
+    pub severity: Severity,
+    /// Executable file name.
+    pub app_name: Option<String>,
+    /// The program's full path.
+    pub app_path: Option<String>,
+    /// The domain or address concerned.
+    pub target: Option<String>,
+    /// More detail: a company, a listing, a count.
+    pub detail: Option<String>,
+}
+
+/// A saved alert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAlert {
+    pub id: i64,
+    pub created: SystemTime,
+    pub kind: AlertKind,
+    pub severity: Severity,
+    pub app_name: Option<String>,
+    pub app_path: Option<String>,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+    /// Whether the user marked it as seen and fine.
+    pub dismissed: bool,
+    /// Whether "this is fine" can also stop alerts like it.
+    pub can_allow: bool,
+}
+
+/// Schema version 4 (Whereabouts 0.2): alerts, and what the user said is
+/// fine.
+const SCHEMA_V4: &str = "
+BEGIN;
+CREATE TABLE alerts (
+    id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL UNIQUE,
+    allow_key TEXT,
+    created INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('tracker', 'bad_network', 'faked_dns', 'unattributed')),
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'medium', 'high', 'critical')),
+    app_name TEXT,
+    app_path TEXT,
+    target TEXT,
+    detail TEXT,
+    dismissed INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE INDEX alerts_created ON alerts (created);
+CREATE TABLE alert_allows (key TEXT PRIMARY KEY, created INTEGER NOT NULL) STRICT;
+UPDATE meta SET value = '4' WHERE key = 'schema_version';
+COMMIT;
+";
+
 /// How a program path is compared: Windows paths ignore case (ASCII
 /// lowercase, the same as SQLite's `lower()`).
 pub fn known_app_key(path: &str) -> String {
@@ -988,6 +1260,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn tracker_alert(app: &str, day: u64) -> NewAlert {
+        NewAlert {
+            key: format!("tracker|{app}|ads.example|{day}"),
+            allow_key: Some(format!("tracker|{app}|ads.example")),
+            kind: AlertKind::Tracker,
+            severity: Severity::Info,
+            app_name: Some(String::from("chat.exe")),
+            app_path: Some(String::from(app)),
+            target: Some(String::from("ads.example")),
+            detail: Some(String::from("Example Ads")),
+        }
+    }
+
+    #[test]
+    fn alerts_are_saved_once_per_key_and_this_is_fine_stops_them() {
+        let path = temp_db("alerts");
+        let mut store = Store::open(&path, &key(11)).unwrap();
+        let first = store
+            .add_alert(&tracker_alert(r"c:\a.exe", 1), at(10))
+            .unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            store
+                .add_alert(&tracker_alert(r"c:\a.exe", 1), at(11))
+                .unwrap(),
+            None
+        );
+        store
+            .add_alert(&tracker_alert(r"c:\b.exe", 1), at(12))
+            .unwrap()
+            .unwrap();
+        let alerts = store.alerts(at(0), 10).unwrap();
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[1].kind, AlertKind::Tracker);
+        assert!(alerts[1].can_allow && !alerts[1].dismissed);
+        // "This is fine" for app a: no more alerts like it.
+        assert!(store.dismiss_alert(first.unwrap(), true, at(13)).unwrap());
+        assert_eq!(
+            store
+                .add_alert(&tracker_alert(r"c:\a.exe", 2), at(14))
+                .unwrap(),
+            None
+        );
+        assert!(
+            store
+                .add_alert(&tracker_alert(r"c:\b.exe", 2), at(15))
+                .unwrap()
+                .is_some()
+        );
+        assert!(!store.dismiss_alert(999, false, at(16)).unwrap());
+        // Serious alerts come first even when info alerts fill the limit.
+        for day in 10..20 {
+            store
+                .add_alert(&tracker_alert(r"c:.exe", day), at(20))
+                .unwrap();
+        }
+        let serious = NewAlert {
+            key: String::from("faked_dns|1"),
+            allow_key: None,
+            kind: AlertKind::FakedDns,
+            severity: Severity::Medium,
+            app_name: None,
+            app_path: None,
+            target: None,
+            detail: None,
+        };
+        store.add_alert(&serious, at(5)).unwrap().unwrap();
+        let top = store.alerts(at(0), 3).unwrap();
+        assert_eq!(top[0].kind, AlertKind::FakedDns);
+        // Deleting the history deletes alerts, but keeps "this is fine".
+        store.wipe().unwrap();
+        assert!(store.alerts(at(0), 10).unwrap().is_empty());
+        assert_eq!(
+            store
+                .add_alert(&tracker_alert(r"c:\a.exe", 3), at(17))
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn known_apps_are_remembered_once_and_deleted_with_the_history() {
         let path = temp_db("known");
@@ -1044,7 +1397,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         store
             .add_rule(
                 &RuleTarget::App {

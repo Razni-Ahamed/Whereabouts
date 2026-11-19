@@ -15,6 +15,8 @@ export interface Status {
   /** Saved blocking rules (0 from a 0.1 service). */
   block_rules: number;
   blocking_paused: boolean;
+  /** Whether connections are checked against Spamhaus DROP (once downloaded). */
+  drop_list: boolean;
 }
 
 export type DomainTrust = 'verified' | 'app_reported' | 'guessed';
@@ -72,6 +74,26 @@ export interface RuleView {
 export interface Rules {
   rules: RuleView[];
   paused: boolean;
+}
+
+export type Severity = 'info' | 'medium' | 'high' | 'critical';
+export type AlertKind = 'tracker' | 'bad_network' | 'faked_dns' | 'unattributed';
+
+export interface AlertView {
+  id: number;
+  /** Seconds since 1970. */
+  created_secs: number;
+  kind: AlertKind;
+  severity: Severity;
+  app: string | null;
+  path: string | null;
+  /** The domain or address concerned. */
+  target: string | null;
+  /** A company, a listing, a count. */
+  detail: string | null;
+  dismissed: boolean;
+  /** Whether "this is fine" also stops alerts like it. */
+  can_allow: boolean;
 }
 
 /** The app's own settings (per Windows user). */

@@ -224,6 +224,22 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
         Request::SetBlockingPaused { paused } => {
             rules(state, crate::blocking::RuleCommand::SetPaused(paused))
         }
+        Request::Alerts { hours, limit } => match open_store(store) {
+            Ok(store) => alerts(store, hours, limit),
+            Err(response) => response,
+        },
+        Request::DismissAlert { id, allow } => match open_store(store) {
+            Ok(store) => match store.dismiss_alert(id, allow, SystemTime::now()) {
+                Ok(true) => Response::AlertDismissed {},
+                Ok(false) => Response::Error {
+                    message: format!("there is no alert {id}"),
+                },
+                Err(error) => Response::Error {
+                    message: format!("could not change the alert: {error}"),
+                },
+            },
+            Err(response) => response,
+        },
         Request::Notices { after } => {
             let state = lock(state);
             Response::Notices {
@@ -264,16 +280,30 @@ fn rules(state: &Mutex<LiveState>, command: crate::blocking::RuleCommand) -> Res
 }
 
 /// The connection's store, opened on first use.
-fn open_store(store: &mut Option<Store>) -> Result<&Store, Response> {
+fn open_store(store: &mut Option<Store>) -> Result<&mut Store, Response> {
     if store.is_none() {
         let opened = crate::storage::open().map_err(|error| Response::Error {
             message: format!("history is not available: {error}"),
         })?;
         *store = Some(opened);
     }
-    store.as_ref().ok_or_else(|| Response::Error {
+    store.as_mut().ok_or_else(|| Response::Error {
         message: String::from("history is not available"),
     })
+}
+
+fn alerts(store: &Store, hours: u32, limit: u32) -> Response {
+    let since = SystemTime::now()
+        .checked_sub(Duration::from_secs(u64::from(hours) * 60 * 60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    match store.alerts(since, usize::try_from(limit).unwrap_or(usize::MAX)) {
+        Ok(alerts) => Response::Alerts {
+            alerts: alerts.into_iter().map(crate::alerts::view).collect(),
+        },
+        Err(error) => Response::Error {
+            message: format!("could not read the alerts: {error}"),
+        },
+    }
 }
 
 fn export_page(store: &Store, after: i64, limit: u32) -> Response {

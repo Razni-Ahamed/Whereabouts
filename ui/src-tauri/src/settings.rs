@@ -31,6 +31,8 @@ pub struct Settings {
     pub show_names: bool,
     /// Whether the "still running in the tray" hint was shown.
     pub tray_hint_shown: bool,
+    /// When the last daily tracker summary was due (seconds since 1970).
+    pub last_digest_secs: Option<u64>,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             notifications: true,
             show_names: false,
             tray_hint_shown: false,
+            last_digest_secs: None,
         }
     }
 }
@@ -108,6 +111,7 @@ mod tests {
             notifications: false,
             show_names: true,
             tray_hint_shown: true,
+            last_digest_secs: Some(1_800_000_000),
         };
         file.save(&chosen).unwrap();
         assert_eq!(file.load(), chosen);
