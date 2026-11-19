@@ -236,7 +236,9 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 /// Exactly `N` bytes from hex.
 pub fn from_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    let text = text.trim();
+    // Tolerates surrounding whitespace and a byte-order mark, which some
+    // Windows tools add when a key is copied or piped.
+    let text = text.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
     if text.len() != N * 2 {
         return None;
     }
@@ -333,6 +335,8 @@ mod tests {
         let seed = new_seed().unwrap();
         assert_eq!(from_hex::<32>(&to_hex(&seed)), Some(seed));
         assert_eq!(from_hex::<32>("abc"), None);
+        let wrapped = format!("\u{feff}{}\r\n", to_hex(&seed));
+        assert_eq!(from_hex::<32>(&wrapped), Some(seed));
         assert_eq!(from_hex::<2>("zzzz"), None);
     }
 
