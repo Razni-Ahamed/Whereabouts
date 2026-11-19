@@ -45,7 +45,7 @@ We recommend turning on **BitLocker** so that someone who steals your computer's
 ## Alerts (from version 0.2)
 
 - Whereabouts checks connections against lists on your computer and raises **alerts**: an app contacted a known tracker, connected to a network that Spamhaus lists as run by criminals, or something seems to be hiding from Whereabouts (fake name lookups, traffic that cannot be tied to an app). Alerts are kept in the encrypted database for 90 days and deleted with "Delete everything".
-- **"This is fine"** is remembered (which app and which tracker or network), like your blocking rules, so you aren't told again.
+- **Dismiss** only clears an alert. **"This is fine"** is remembered (which app and which tracker or network), like your blocking rules, so you aren't told again.
 - Tracker contacts are never notified one by one: you get one summary a day. Like all notifications, it names no apps or trackers unless you allow it.
 - The Spamhaus list is not part of Whereabouts: Spamhaus does not allow it to be passed on, so your computer downloads it from Spamhaus itself, if you allow it (see "Requests Whereabouts makes itself").
 
