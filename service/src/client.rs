@@ -345,6 +345,7 @@ mod tests {
             protocol: String::from("TCP"),
             domain: Some(String::from("codex-cloud-environments.chatgpt.com")),
             domain_trust: Some(DomainTrust::Guessed),
+            via: None,
             owner: None,
             country: None,
             remote: String::from("1.2.3.4:443"),

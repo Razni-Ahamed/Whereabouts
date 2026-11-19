@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use whereabouts_core::dns::{DnsMap, LabelSource};
+use whereabouts_core::dns::{DnsMap, DomainLabel, LabelSource};
 use whereabouts_core::flow::{FlowKey, FlowStats, FlowTable};
 use whereabouts_core::model::{AppIdentity, CaptureEvent, NetEvent, Protocol};
 use whereabouts_core::privacy::is_web_browser;
@@ -235,6 +235,11 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     // its ID *and* start time, not by its ID alone.
     let mut starts: HashMap<u32, SystemTime> = HashMap::new();
     let mut dns = DnsMap::new();
+    // Names Windows looked up before Whereabouts started.
+    let prefilled = prefill_from_cache(&mut dns, SystemTime::now());
+    if prefilled > 0 {
+        println!("Read {prefilled} names from Windows' DNS cache");
+    }
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(200)) {
@@ -289,11 +294,13 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             }
             Ok(CaptureEvent::DnsConfirmed {
                 name,
+                aliases,
                 addresses,
                 timestamp,
             }) => {
                 dns.record_confirmed(&name, &addresses, timestamp);
-                blocking.on_confirmed_answer(&name, &addresses, SystemTime::now());
+                dns.record_confirmed_aliases(&name, &aliases, timestamp);
+                blocking.on_confirmed_answer(&name, &aliases, &addresses, SystemTime::now());
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -341,8 +348,10 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     let now = SystemTime::now();
                     let answer = blocking.answer(store.as_mut(), command, now);
                     if replay && !matches!(answer, whereabouts_ipc::Response::Error { .. }) {
-                        for (name, addresses) in dns.confirmed_answers(now) {
-                            blocking.on_confirmed_answer(&name, &addresses, now);
+                        // Also what Windows still has cached from before.
+                        prefill_from_cache(&mut dns, now);
+                        for (name, aliases, addresses) in dns.confirmed_answers(now) {
+                            blocking.on_confirmed_answer(&name, &aliases, &addresses, now);
                         }
                     }
                     let _ = reply.send(answer);
@@ -383,6 +392,12 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                             .as_ref()
                             .filter(|label| label.source != LabelSource::Unverified)
                             .map(|label| label.name.as_ref()),
+                        aliases: row
+                            .stats
+                            .domain
+                            .as_ref()
+                            .filter(|label| label.source != LabelSource::Unverified)
+                            .map_or(&[][..], |label| &label.aliases[..]),
                     };
                     raised.extend(detector.check_flow(&facts, &enricher, store, now));
                 }
@@ -771,6 +786,37 @@ fn close(closed: &mut Closed, names: &ProcessNames, flows: Vec<(FlowKey, FlowSta
     }
 }
 
+/// The alias of a trusted label that revealed a tracker or company when
+/// the name alone did not (a tracker hidden behind a site's own name).
+fn revealing_alias(label: &DomainLabel, enricher: &Enricher) -> Option<String> {
+    if label.source == LabelSource::Unverified {
+        return None;
+    }
+    let known = |name: &str| {
+        let info = enricher.domain(name);
+        info.tracker || info.company.is_some()
+    };
+    if known(&label.name) {
+        return None;
+    }
+    label
+        .aliases
+        .iter()
+        .find(|alias| known(alias))
+        .map(|alias| truncate(alias, CLIENT_TEXT))
+}
+
+/// Records what Windows' DNS cache holds as confirmed answers (the DNS
+/// service filled it). Returns how many names were read.
+fn prefill_from_cache(dns: &mut DnsMap, now: SystemTime) -> usize {
+    let answers = whereabouts_win_capture::dns_cache::cached_answers();
+    for answer in &answers {
+        dns.record_confirmed(&answer.name, &answer.addresses, now);
+        dns.record_confirmed_aliases(&answer.name, &answer.aliases, now);
+    }
+    answers.len()
+}
+
 /// Saves finished flows to the store. Normally only flows closed at least
 /// [`LATE_TRAFFIC_WINDOW`] ago are saved, because late traffic may still be
 /// added to them; with `everything`, all unsaved flows are saved.
@@ -986,6 +1032,7 @@ fn flow_view(row: &Row, names: &ProcessNames, enricher: &Enricher) -> FlowView {
         protocol: String::from(protocol_text(row.key.protocol)),
         domain: domain.map(|label| truncate(&label.name, CLIENT_TEXT)),
         domain_trust: domain.map(|label| domain_trust(label.source)),
+        via: domain.and_then(|label| revealing_alias(label, enricher)),
         owner,
         country,
         remote,
@@ -1104,13 +1151,18 @@ fn owner_and_country(row: &Row, enricher: &Enricher) -> (String, String) {
         .as_ref()
         .filter(|label| label.source != LabelSource::Unverified);
     if let Some(label) = trusted_domain {
-        let info = enricher.domain(&label.name);
-        if let Some(company) = info.company {
-            return (format!("{} · {}", company.name, company.category), country);
-        }
-        if info.tracker {
-            let network = ip.network.as_deref().unwrap_or("unknown");
-            return (format!("tracker · {network}"), country);
+        // The name itself first, then the names it points to (a tracker or
+        // company hidden behind a site's own name).
+        let names = std::iter::once(&label.name).chain(label.aliases.iter());
+        for name in names {
+            let info = enricher.domain(name);
+            if let Some(company) = info.company {
+                return (format!("{} · {}", company.name, company.category), country);
+            }
+            if info.tracker {
+                let network = ip.network.as_deref().unwrap_or("unknown");
+                return (format!("tracker · {network}"), country);
+            }
         }
     }
     (ip.network.unwrap_or_else(|| String::from("-")), country)
@@ -1207,8 +1259,6 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use whereabouts_core::dns::DomainLabel;
     use whereabouts_enrich::{CompanyList, GeoDatabases, TrackerList};
 
     fn enricher() -> Enricher {
@@ -1221,10 +1271,7 @@ mod tests {
 
     fn row_to(remote: &str, domain: Option<(&str, LabelSource)>) -> Row {
         let mut stats = FlowStats::new(SystemTime::UNIX_EPOCH);
-        stats.domain = domain.map(|(name, source)| DomainLabel {
-            name: Arc::from(name),
-            source,
-        });
+        stats.domain = domain.map(|(name, source)| DomainLabel::new(name, source));
         Row {
             app: String::from("app.exe"),
             token: None,
@@ -1247,6 +1294,33 @@ mod tests {
         );
         let (owner, _) = owner_and_country(&row, &enricher());
         assert_eq!(owner, "Google (Firebase) · analytics");
+    }
+
+    #[test]
+    fn a_tracker_hidden_behind_a_sites_own_name_is_labelled() {
+        let mut row = row_to(
+            "198.51.100.9:443",
+            Some(("metrics.shop.example", LabelSource::Verified)),
+        );
+        if let Some(label) = row.stats.domain.as_mut() {
+            label.aliases = Arc::from([Arc::from("eu.tracker.example")]);
+        }
+        let (owner, _) = owner_and_country(&row, &enricher());
+        assert!(owner.starts_with("tracker"), "{owner}");
+        let label = row.stats.domain.as_ref().unwrap();
+        assert_eq!(
+            revealing_alias(label, &enricher()).as_deref(),
+            Some("eu.tracker.example")
+        );
+        // A name that is itself known needs no alias.
+        let plain = row_to(
+            "198.51.100.9:443",
+            Some(("tracker.example", LabelSource::Verified)),
+        );
+        assert_eq!(
+            revealing_alias(plain.stats.domain.as_ref().unwrap(), &enricher()),
+            None
+        );
     }
 
     #[test]

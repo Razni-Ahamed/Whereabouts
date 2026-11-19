@@ -15,6 +15,7 @@ ferrisetw.workspace = true
 sha2.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_Dns",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Security_Cryptography_Catalog",
@@ -24,6 +25,7 @@ windows = { workspace = true, features = [
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
     "Win32_System_Services",
     "Win32_System_Threading",
 ] }

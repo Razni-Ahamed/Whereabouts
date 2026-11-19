@@ -520,10 +520,7 @@ mod tests {
     }
 
     fn label(name: &str, source: LabelSource) -> Option<DomainLabel> {
-        Some(DomainLabel {
-            name: std::sync::Arc::from(name),
-            source,
-        })
+        Some(DomainLabel::new(name, source))
     }
 
     #[test]

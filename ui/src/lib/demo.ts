@@ -36,6 +36,7 @@ interface Seed {
   protocol?: string;
   domain: string | null;
   trust?: FlowView['domain_trust'];
+  via?: string;
   owner: string | null;
   country: string | null;
   remote: string;
@@ -64,6 +65,8 @@ const SEEDS: Seed[] = [
   { pid: 1404, app: 'zoom.exe', publisher: 'Zoom Video Communications, Inc.', protocol: 'UDP', domain: 'zoomsg.zoom.us', owner: 'Zoom Video Communications', country: 'SG', remote: '149.137.9.12:8801', sent: 3_100_000, received: 3_600_000, rate: 0.6 },
   // The same destination twice (an earlier, closed flow), as the service can report.
   { pid: 2216, app: 'Code.exe', publisher: 'Microsoft Corporation', domain: 'marketplace.visualstudio.com', owner: 'Microsoft Corporation', country: 'US', remote: '13.107.6.175:443', sent: 40_000, received: 900_000, rate: 0.01 },
+  // A tracker hidden behind a site's own name (CNAME cloaking).
+  { pid: 8124, app: 'chrome.exe', publisher: 'Google LLC', domain: 'metrics.shop.example', via: 'shop.example.sc.omtrdc.net', owner: 'Adobe · analytics', country: 'US', remote: '63.140.38.12:443', sent: 12_400, received: 3_100, rate: 0.05 },
   { pid: 8124, app: 'chrome.exe', publisher: 'Google LLC', domain: 'news.lk', owner: 'Sri Lanka Telecom PLC', country: 'LK', remote: '222.165.164.34:443', sent: 34_000, received: 2_100_000, rate: 0.2 },
 ];
 
@@ -84,6 +87,7 @@ export function demoLive(): Live {
     protocol: s.protocol ?? 'TCP',
     domain: s.domain,
     domain_trust: s.domain ? (s.trust ?? 'verified') : null,
+    via: s.via ?? null,
     owner: s.owner,
     country: s.country,
     remote: s.remote,

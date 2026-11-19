@@ -497,6 +497,10 @@ pub struct FlowView {
     pub domain: Option<String>,
     /// How far `domain` can be trusted.
     pub domain_trust: Option<DomainTrust>,
+    /// The name `domain` points to (a CNAME alias) that revealed the tracker
+    /// or company behind it, when `domain` alone did not.
+    #[serde(default)]
+    pub via: Option<String>,
     /// Company or network owner.
     pub owner: Option<String>,
     /// Two-letter country code.
@@ -596,6 +600,7 @@ mod tests {
                 protocol: String::from("TCP"),
                 domain: Some(String::from("example.com")),
                 domain_trust: Some(DomainTrust::AppReported),
+                via: None,
                 owner: None,
                 country: Some(String::from("US")),
                 remote: String::from("[2606:4700::1]:443"),

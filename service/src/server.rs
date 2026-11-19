@@ -441,6 +441,7 @@ mod tests {
             protocol: String::from("TCP"),
             domain: Some(String::from("example.com")),
             domain_trust: Some(whereabouts_ipc::DomainTrust::Verified),
+            via: None,
             owner: None,
             country: Some(String::from("US")),
             remote: String::from("93.184.215.14:443"),

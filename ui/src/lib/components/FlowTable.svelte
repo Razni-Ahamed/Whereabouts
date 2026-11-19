@@ -51,7 +51,13 @@
           {flow.domain ?? flow.remote}
           <Trust kind="domain" trust={flow.domain_trust} />
         </span>
-        <span class="minor mono">{flow.domain ? flow.remote : flow.protocol}</span>
+        {#if flow.via}
+          <span class="minor mono via" title="{flow.domain} points to {flow.via}, which is what shows who is behind it">
+            via {flow.via}
+          </span>
+        {:else}
+          <span class="minor mono">{flow.domain ? flow.remote : flow.protocol}</span>
+        {/if}
       </span>
       <span class="stack" role="cell">
         <span class="name">{owner.name}</span>
@@ -152,6 +158,9 @@
     font-feature-settings: 'tnum', 'zero';
   }
   .tracking {
+    color: var(--warn);
+  }
+  .via {
     color: var(--warn);
   }
   .country {

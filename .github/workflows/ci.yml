@@ -75,6 +75,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Live ETW tests
         run: cargo test -p whereabouts-win-capture --test live_capture -- --ignored --test-threads=1
+      - name: Reading Windows' DNS cache
+        run: cargo test -p whereabouts-win-capture --lib dns_cache -- --ignored
       - name: Live blocking tests (test scope and a copy of curl only)
         run: cargo test -p whereabouts-win-firewall --test live_block -- --ignored --test-threads=1
       - name: Blocking end to end (engine, command line and a copy of curl)
