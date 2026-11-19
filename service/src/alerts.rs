@@ -115,7 +115,11 @@ impl Detector {
         if let Some(entry) = self.drop.as_ref().and_then(|drop| drop.lookup(ip)) {
             let alert = NewAlert {
                 key: format!("bad_network|{app_key}|{ip}|{day}"),
-                allow_key: Some(format!("bad_network|{app_key}|{}", entry.cidr)),
+                // Only a known program path can be trusted again: a file name
+                // alone could be any program.
+                allow_key: flow
+                    .path
+                    .map(|_| format!("bad_network|{app_key}|{}", entry.cidr)),
                 kind: AlertKind::BadNetwork,
                 severity: Severity::High,
                 app_name: Some(flow.app.to_owned()),
@@ -134,7 +138,7 @@ impl Detector {
                 let tracker = info.registrable.unwrap_or_else(|| domain.to_owned());
                 let alert = NewAlert {
                     key: format!("tracker|{app_key}|{tracker}|{day}"),
-                    allow_key: Some(format!("tracker|{app_key}|{tracker}")),
+                    allow_key: flow.path.map(|_| format!("tracker|{app_key}|{tracker}")),
                     kind: AlertKind::Tracker,
                     severity: Severity::Info,
                     app_name: Some(flow.app.to_owned()),
@@ -379,6 +383,20 @@ mod tests {
                 )
                 .is_none()
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_a_program_path_alerts_cannot_be_allowed() {
+        let (mut store, dir) = store("nopath");
+        let mut detector = Detector::with_drop(drop());
+        let mut facts = flow("203.0.113.9:443", None);
+        facts.path = None;
+        let raised = detector
+            .check_flow(&facts, &enricher(), &mut store, at(T0))
+            .unwrap();
+        assert_eq!(raised.alert.allow_key, None);
+        assert!(!store.alerts(at(0), 10).unwrap()[0].can_allow);
         let _ = std::fs::remove_dir_all(dir);
     }
 

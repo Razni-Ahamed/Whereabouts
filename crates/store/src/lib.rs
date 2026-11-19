@@ -289,11 +289,13 @@ impl Store {
         Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
     }
 
-    /// Alerts created since `since`, newest first, at most `limit`.
+    /// Alerts created since `since`, at most `limit`: those that need a
+    /// look (above info) first, then the rest, each newest first. So many
+    /// info alerts can never push a serious one out of the list.
     pub fn alerts(&self, since: SystemTime, limit: usize) -> Result<Vec<StoredAlert>, StoreError> {
         let mut query = self.conn.prepare(
             "SELECT id, created, kind, severity, app_name, app_path, target, detail, dismissed, \
-             allow_key IS NOT NULL FROM alerts WHERE created >= ?1 ORDER BY id DESC LIMIT ?2",
+             allow_key IS NOT NULL FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2",
         )?;
         let rows = query.query_map(
             params![unix_ms(since), i64::try_from(limit).unwrap_or(i64::MAX)],
@@ -1308,6 +1310,25 @@ mod tests {
                 .is_some()
         );
         assert!(!store.dismiss_alert(999, false, at(16)).unwrap());
+        // Serious alerts come first even when info alerts fill the limit.
+        for day in 10..20 {
+            store
+                .add_alert(&tracker_alert(r"c:.exe", day), at(20))
+                .unwrap();
+        }
+        let serious = NewAlert {
+            key: String::from("faked_dns|1"),
+            allow_key: None,
+            kind: AlertKind::FakedDns,
+            severity: Severity::Medium,
+            app_name: None,
+            app_path: None,
+            target: None,
+            detail: None,
+        };
+        store.add_alert(&serious, at(5)).unwrap().unwrap();
+        let top = store.alerts(at(0), 3).unwrap();
+        assert_eq!(top[0].kind, AlertKind::FakedDns);
         // Deleting the history deletes alerts, but keeps "this is fine".
         store.wipe().unwrap();
         assert!(store.alerts(at(0), 10).unwrap().is_empty());
