@@ -13,6 +13,12 @@ on:
   schedule:
     - cron: '17 4 * * 1'
   workflow_dispatch:
+  # A changed bundle tool or workflow publishes a fresh bundle right away.
+  push:
+    branches: [main]
+    paths:
+      - 'crates/data-bundle/**'
+      - '.github/workflows/data.yml'
 
 permissions:
   contents: read
