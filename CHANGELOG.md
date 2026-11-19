@@ -4,15 +4,37 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-20
+
+*Control.* Whereabouts can now block apps, sites and addresses, warn you, and keep its lists current.
+
 ### Added
 
-- Blocking engine for v0.2 (`win-firewall`, not yet available in the app): block a program, or one address for one program or for every program, with persistent Windows Filtering Platform rules under Whereabouts' own provider; a guard-list refuses core Windows programs, Microsoft Defender, Whereabouts itself, and loopback, local-network, multicast and DNS-server addresses; rules can be listed from WFP and all removed at once. Live tests (separate test scope, a copy of curl) run in `scripts/live-test.ps1` and CI.
-- **Better names** (v0.2): trackers hidden behind a site's own name ("CNAME cloaking") are recognised: the names a domain points to, as confirmed by the Windows DNS service, now count for the company label, tracker alerts ("hidden behind …") and domain blocks; connections show "via …" when that revealed who is behind them. Whereabouts also reads Windows' DNS cache (cache only, never the network) when it starts and when a domain block is added, so sites looked up before Whereabouts started get names and blocks.
-- **List updates** (v0.2): Whereabouts can keep its lists current, but downloads nothing until you answer the app's question (both switches suggested on; change them on the Privacy screen). Whereabouts' lists come from its GitHub releases, checked daily; each set is signed with Ed25519 and refused if the signature, any file's SHA-256 or its sequence (no going back to an older set) is wrong, and is swapped in whole. Spamhaus' DROP list comes from spamhaus.org at most once a day and enables risky-network alerts; turning it off deletes it. HTTPS only, through Windows' own TLS and certificate store. A weekly CI workflow builds and signs the data bundle (new crate `whereabouts-data-bundle`); the private key is a repository secret. New pipe requests `SetListUpdates` and `CheckListsNow`; `Status.lists`.
-- **Alerts** (v0.2): a new Alerts screen with reasons and actions (Block…, Dismiss, This is fine; Dismiss only clears an alert, This is fine also stops alerts like it). Whereabouts raises an alert when an app contacts a known tracker (EasyPrivacy, confirmed names only; one per app and tracker a day), connects to a network on Spamhaus' DROP list (high; only once this computer has downloaded DROP, which is never bundled because Spamhaus does not allow redistribution), or when something seems to hide (fake DNS events, unattributed traffic; at most hourly). Medium and higher alerts are notified (at most one per app an hour); tracker contacts come in a daily summary; names only if allowed. "This is fine" stops alerts for that app and tracker or network; for a risky network Windows asks first. Database schema version 4; new pipe requests `Alerts` and `DismissAlert`; `Status.drop_list`.
-- **Tray and notifications** (v0.2): the app can start in the tray when you sign in (asked once on first run; changeable on the Privacy screen; only the installed app can do this, and uninstalling undoes it). The tray menu opens the app, pauses or resumes blocking, or closes the app. Windows notifications tell you when an app uses the internet for the first time (after a quiet first day; programs already in your history count as known), when Whereabouts stops watching and when it is back, and when blocking has stayed paused for an hour. Notifications name no apps unless you allow it. The service remembers which programs have used the network (database schema version 3, filled from the history when upgrading) and reports new ones over a new `Notices` pipe request. New crate `win-startup` for the sign-in entry.
-- **Blocking in the app** (v0.2): **Block…** on every connection lets you block that site for that app, that site for every app (with a warning), that address, or the whole app; app pages have **Block app**. Windows shows exactly what will be blocked and asks you to confirm; a note offers **Undo**. A new **Rules** screen lists what is blocked, for which app and since when, with **Unblock** and **Pause all blocks / Resume**; while blocking is paused, a banner says so on every screen. Live connections now carry the program's full path (shown on the app page).
-- Saved blocking rules (v0.2): the service saves rules in the encrypted database and re-applies them at start, so they survive restarts and updates. Block a program (`--block-app`), a domain and its subdomains (`--block-domain`, blocked by the addresses the Windows DNS service confirms; learned addresses expire a day after they were last seen) or an address (`--block-ip`), for one program (`--for`) or for every program; list with `--rules`, remove with `--unblock`, pause and resume with `--pause-blocking` / `--resume-blocking`. `--unblock-all` removes every block at once, even if the service is not running. Core Windows networking programs are always exempt from Whereabouts' blocks. Uninstalling removes every block from the firewall; updating keeps them. `--status` shows the number of rules. New pipe requests `ListRules`, `AddRule`, `RemoveRule` and `SetBlockingPaused`; the database schema moves to version 2 (a 0.1 database is upgraded and keeps its history).
+- **Blocking.** **Block…** on every connection blocks that site for that app, that site for every app (with a warning), that address, or the whole app; app pages have **Block app**. Windows shows exactly what will be blocked and asks you to confirm; a note offers **Undo**. The **Rules** screen lists what is blocked, for which app and since when, with **Unblock** and **Pause all blocks / Resume**; a banner shows on every screen while blocking is paused.
+  - Blocks are rules in the Windows Filtering Platform under Whereabouts' own name. They stay in force across restarts and while the app is closed, are saved in the encrypted database and re-applied when the service starts, and are kept when updating. Uninstalling removes every block.
+  - A site is blocked by the addresses the Windows DNS service confirms for it (and for names that point to it); learned addresses expire a day after they were last seen. A block for every app never blocks addresses that other, unblocked sites also use.
+  - Whereabouts never blocks core Windows programs, Microsoft Defender, itself, DNS servers, loopback or your local network; core Windows networking programs are always exempt from its blocks.
+  - Command line: `--rules`, `--block-app`, `--block-domain`, `--block-ip`, `--for`, `--unblock`, `--pause-blocking`, `--resume-blocking`, and the emergency switch `--unblock-all` (works even if the service is not running).
+- **Alerts.** A new **Alerts** screen with reasons and actions (Block…, Dismiss, This is fine): tracker contacts (EasyPrivacy; one per app and tracker a day), connections to networks on **Spamhaus' DROP** list (high), and signs that something is hiding from Whereabouts (fake DNS events, untraceable traffic). "This is fine" stops alerts for that app and tracker or network (for a risky network, Windows asks first); Dismiss only clears an alert.
+- **Tray and notifications.** The app can start in the tray when you sign in (asked once, suggested on; only the installed app). Windows notifications tell you when an app uses the internet for the first time (after a quiet first day), when Whereabouts stops watching and when it is back, when blocking stays paused for an hour, about alerts (at most one per app an hour), and once a day about tracker contacts. **Notifications name no apps or sites unless you allow it.**
+- **List updates.** Downloads nothing until you answer the app's question (both switches suggested on; change them on the Privacy screen):
+  - Whereabouts' tracker, company, country and network lists from its GitHub releases, checked daily, **signed with Ed25519** and refused if the signature, any file or its sequence is wrong; swapped in whole.
+  - Spamhaus' DROP list from spamhaus.org at most once a day (Spamhaus does not allow it to be passed on, so each computer fetches it itself). Turning it off deletes it.
+  - HTTPS only, through Windows' own TLS and certificate store. A weekly workflow builds and signs the data.
+- **Better names.** Trackers hidden behind a site's own name ("CNAME cloaking") are recognised for labels, alerts and blocks; connections show "via …" when that revealed who is behind them. Whereabouts reads Windows' DNS cache (cache only, never the network) at start and when a site block is added, so sites looked up earlier get names and blocks.
+- Live connections carry the program's full path (shown on app pages).
+
+### Changed
+
+- The database moves to schema version 4 (blocking rules, settings, known apps, alerts). A 0.1 database is upgraded in place and keeps its history; apps already in your history count as known.
+- New pipe requests for rules, notices, alerts and list updates; `Status` reports blocking, the DROP list and list updates.
+- CI: the live job (capture, firewall and end-to-end blocking tests, and reading the DNS cache) is now a required check.
+
+### Security
+
+- The service accepts program paths only on this computer's own drives and refuses links or `..` along them, before touching the file system, so it never connects to another computer as SYSTEM.
+- Native Windows confirmations for blocking and for silencing risky-network alerts, so the app's web view cannot do either on its own; confirmations show the full program path and cannot be spoofed with control characters.
+- "This is fine" needs a known program path; serious alerts can never be pushed out of the list by many tracker alerts.
 
 ## [0.1.1] - 2026-11-17
 
@@ -62,6 +84,7 @@ First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
 - `core`: connection metadata model, robust statistics (median, MAD, robust z-score) and domain entropy.
 - CI on Windows: formatting, Clippy, tests, and licence/advisory checks with `cargo-deny`.
 
-[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Razni-Ahamed/Whereabouts/releases/tag/v0.1.0

@@ -6,7 +6,7 @@ Whereabouts is a free, open-source app for Windows that shows **which app on you
 
 It never reads the contents of your traffic, and it never sends anything about you to anyone. Everything happens on your own computer.
 
-> **Status: early development.** There is nothing to install yet. Follow the [roadmap](#roadmap) or read the [design spec](docs/design-spec.md).
+> **Status: developer preview (0.2).** It watches, labels, blocks and warns today; learning what is normal for each app comes next. See the [roadmap](#roadmap) and [installing](#installing).
 
 ---
 
@@ -55,8 +55,8 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 
 | Version | Theme | What you get |
 |---|---|---|
-| v0.1 | *See* | Live view of every app's connections, companies and countries |
-| v0.2 | *Control* | Block apps and domains, alerts for known-bad servers |
+| v0.1 ✅ | *See* | Live view of every app's connections, companies and countries |
+| v0.2 ✅ | *Control* | Block apps, sites and addresses; alerts for trackers and known-bad networks; tray and notifications; signed list updates |
 | v0.3 | *Learn* | Per-app behaviour profiles and explained alerts |
 | v0.4 | *Detect* | On-device anomaly model (if it passes testing) |
 | v1.0 | *Trust* | Signed installer, external security review |
@@ -64,7 +64,7 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 
 ## Installing
 
-Whereabouts 0.1 is a **developer preview** for Windows 10 (22H2) and Windows 11, 64-bit.
+Whereabouts 0.2 is a **developer preview** for Windows 10 (22H2) and Windows 11, 64-bit.
 
 1. Download the latest `Whereabouts_<version>_x64-setup.exe` and its `SHA256SUMS.txt` from the [Releases](https://github.com/Razni-Ahamed/Whereabouts/releases) page.
 2. **Check the download.** The preview's installer is not code-signed yet, so Windows SmartScreen may warn about it. Compare its checksum with the published one before running it:
@@ -74,9 +74,9 @@ Whereabouts 0.1 is a **developer preview** for Windows 10 (22H2) and Windows 11,
    ```
 
 3. Run it and approve the administrator prompt. It installs to `C:\Program Files\Whereabouts` (the background service only trusts programs there), registers the **Whereabouts** service, which starts with Windows whoever is logged in, and adds **Whereabouts** to the Start menu.
-4. Open **Whereabouts** from the Start menu. The app runs as you, without administrator rights.
+4. Open **Whereabouts** from the Start menu. The app runs as you, without administrator rights. The first time, it asks whether to start in the tray when you sign in and whether to download list updates; nothing is downloaded until you answer.
 
-To remove it, uninstall **Whereabouts** from Windows Settings → Apps. You are asked whether to delete your saved history too (it is kept by default, encrypted, in `C:\ProgramData\Whereabouts`).
+To remove it, uninstall **Whereabouts** from Windows Settings → Apps. Every block is removed from the Windows firewall, and you are asked whether to delete your saved history too (it is kept by default, encrypted, in `C:\ProgramData\Whereabouts`).
 
 From a terminal, the installed service can also tell you how it is doing, and administrators can work with the saved history:
 
@@ -85,7 +85,12 @@ From a terminal, the installed service can also tell you how it is doing, and ad
 & "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --history            # top apps of the last 24 hours (as administrator)
 & "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --export flows.csv   # everything saved, as CSV (as administrator)
 & "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --delete-all --yes   # delete all saved data (as administrator)
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --rules              # what is blocked
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --block-domain ads.example.com --for "C:\Path\App.exe"
+& "$env:ProgramFiles\Whereabouts\whereabouts-service.exe" --unblock-all        # emergency: lift every block (as administrator)
 ```
+
+Run `whereabouts-service.exe --help` for every command (blocking an app or an address, pausing and resuming).
 
 ### Without installing
 
