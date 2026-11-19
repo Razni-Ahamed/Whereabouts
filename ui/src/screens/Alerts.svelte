@@ -84,9 +84,10 @@
     };
   }
 
-  async function dismiss(alert: AlertView) {
+  /** Clears an alert; with `trust`, alerts like it stop too ("This is fine"). */
+  async function dismiss(alert: AlertView, trust: boolean) {
     busy = alert.id;
-    await store.dismiss(alert.id, alert.can_allow);
+    await store.dismiss(alert.id, trust && alert.can_allow);
     busy = null;
   }
 </script>
@@ -150,16 +151,33 @@
           </div>
           <div class="actions">
             {#if alert.dismissed}
-              <span class="muted fine"><Check size={14} /> Marked fine</span>
+              <span class="muted fine"><Check size={14} /> Cleared</span>
             {:else}
               {#if alert.app && alert.path && (alert.kind === 'tracker' || alert.kind === 'bad_network')}
                 <button class="btn btn-ghost small" type="button" onclick={() => (blocking = asFlow(alert))}>
                   <Ban size={14} /> Block…
                 </button>
               {/if}
-              <button class="btn btn-ghost small" type="button" disabled={busy === alert.id} onclick={() => dismiss(alert)}>
-                {alert.can_allow ? 'This is fine' : 'Got it'}
+              <button
+                class="btn btn-ghost small"
+                type="button"
+                disabled={busy === alert.id}
+                title="Clear this alert. You'll be told again if it happens again."
+                onclick={() => dismiss(alert, false)}
+              >
+                {alert.can_allow ? 'Dismiss' : 'Got it'}
               </button>
+              {#if alert.can_allow}
+                <button
+                  class="btn btn-ghost small"
+                  type="button"
+                  disabled={busy === alert.id}
+                  title="Trust this: no more alerts about this app and {alert.kind === 'tracker' ? 'tracker' : 'network'}."
+                  onclick={() => dismiss(alert, true)}
+                >
+                  This is fine
+                </button>
+              {/if}
             {/if}
           </div>
         </li>
