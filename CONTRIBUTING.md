@@ -80,6 +80,16 @@ powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -Service
 
 CI runs the same live tests on GitHub's Windows runners (job "Live ETW tests"), plus `scripts/blocking-e2e.ps1`, which runs the engine in console mode and checks blocking rules end to end with a copy of curl. It needs administrator rights and no Whereabouts service running, and it removes every rule and Whereabouts' firewall entries when it finishes.
 
+## Data updates and the signing key
+
+Whereabouts' list updates are **data bundles** built and signed by CI each week (`.github/workflows/data.yml`, run it by hand with *Run workflow*). The workflow downloads the data with `scripts/update-data.ps1`, builds the bundle with `whereabouts-data-bundle build`, checks it with `whereabouts-data-bundle verify`, and publishes it as release `data-<sequence>`, then the signed manifest to `data-latest`. Those releases are not app releases.
+
+The bundle is signed with an Ed25519 key. Its public half is `PUBLIC_KEY_HEX` in `crates/data-bundle/src/lib.rs`; the private half is the repository secret `WHEREABOUTS_DATA_SIGNING_KEY` (and the maintainer's offline backup). It is never printed or committed. If it is ever lost or leaked:
+
+1. Make a new key: `cargo run -p whereabouts-data-bundle -- keygen <new file outside the repository>`. It prints only the public key.
+2. Put the private key into the secret (for example `gh secret set WHEREABOUTS_DATA_SIGNING_KEY < <file>`), keep a backup offline, and delete the file.
+3. Put the new public key in `PUBLIC_KEY_HEX` and release a new app version. Older versions keep using their last good data until they are updated.
+
 ## Code guidelines
 
 - **`unsafe` code** is forbidden in `core`, `enrich`, `ipc` and `store`. It is allowed only in the Windows API crates (`win-capture`, `win-firewall`, `win-pipe`, `win-secrets`, `win-startup`), and every `unsafe` block needs a `// SAFETY:` comment explaining why it is sound.

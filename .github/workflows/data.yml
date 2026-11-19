@@ -1,0 +1,81 @@
+name: Data updates
+
+# Builds a fresh offline data bundle each week, signs it with the data
+# signing key (a repository secret, used only in the signing step), and
+# publishes it for Whereabouts' list updates:
+#   - release `data-<sequence>` holds the files, the manifest and its signature;
+#   - release `data-latest` holds only the newest manifest and signature,
+#     uploaded last, so clients never see a half-published bundle.
+# Clients check the signature against the public key built into the app and
+# fetch the files from `data-<sequence>` named in the signed manifest.
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-updates
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle:
+    name: Build, sign and publish the data bundle
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Download the offline data
+        shell: pwsh
+        run: ./scripts/update-data.ps1
+      - name: Build the bundle tool
+        run: cargo build --release --locked -p whereabouts-data-bundle --bin whereabouts-data-bundle
+      - name: Build and sign the bundle
+        shell: pwsh
+        env:
+          WHEREABOUTS_DATA_SIGNING_KEY: ${{ secrets.WHEREABOUTS_DATA_SIGNING_KEY }}
+        run: |
+          $sequence = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmm')
+          "SEQUENCE=$sequence" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          ./target/release/whereabouts-data-bundle.exe build data bundle --sequence $sequence
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check the bundle with the built-in public key
+        run: ./target/release/whereabouts-data-bundle.exe verify bundle
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = '${{ github.repository }}'
+          $tag = "data-$env:SEQUENCE"
+          $notes = 'Signed offline data for Whereabouts list updates (EasyPrivacy, DB-IP Lite, company list). Not an app release.'
+          gh release create $tag bundle/* --repo $repo --title "Data $env:SEQUENCE" --notes $notes --prerelease --latest=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release view data-latest --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create data-latest --repo $repo --title 'Data (newest)' --notes 'The newest signed data manifest for Whereabouts list updates. Not an app release.' --prerelease --latest=false
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          gh release upload data-latest bundle/manifest.json bundle/manifest.sig --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Keep the newest four bundles
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = '${{ github.repository }}'
+          $old = gh release list --repo $repo --limit 100 --json tagName --jq '.[].tagName' |
+            Where-Object { $_ -match '^data-\d{12}$' } | Sort-Object -Descending | Select-Object -Skip 4
+          foreach ($tag in $old) { gh release delete $tag --repo $repo --yes --cleanup-tag }

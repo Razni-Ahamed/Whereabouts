@@ -3,6 +3,7 @@
   import { CircleAlert, CircleCheck, FlaskConical, ShieldOff, X } from '@lucide/svelte';
   import Backdrop from './lib/components/Backdrop.svelte';
   import FirstRun from './lib/components/FirstRun.svelte';
+  import ListsQuestion from './lib/components/ListsQuestion.svelte';
   import Logo from './lib/components/Logo.svelte';
   import { store } from './lib/state.svelte';
   import Overview from './screens/Overview.svelte';
@@ -58,6 +59,8 @@
 
 {#if store.settings && !store.settings.first_run_done}
   <FirstRun settings={store.settings} />
+{:else if store.settings && store.live && store.live.status.lists.data_updates === null}
+  <ListsQuestion />
 {/if}
 
 <div class="shell">

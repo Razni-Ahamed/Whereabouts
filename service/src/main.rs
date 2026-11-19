@@ -17,6 +17,7 @@ mod install;
 mod server;
 mod service_mode;
 mod storage;
+mod updates;
 
 use std::net::IpAddr;
 use std::path::PathBuf;

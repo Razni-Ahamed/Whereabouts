@@ -17,6 +17,18 @@ export interface Status {
   blocking_paused: boolean;
   /** Whether connections are checked against Spamhaus DROP (once downloaded). */
   drop_list: boolean;
+  lists: ListsView;
+}
+
+/** List updates: the user's switches (null until chosen) and what was downloaded. */
+export interface ListsView {
+  data_updates: boolean | null;
+  drop_updates: boolean | null;
+  data_version: string | null;
+  data_checked_secs: number | null;
+  drop_fetched_secs: number | null;
+  problem: string | null;
+  checking: boolean;
 }
 
 export type DomainTrust = 'verified' | 'app_reported' | 'guessed';

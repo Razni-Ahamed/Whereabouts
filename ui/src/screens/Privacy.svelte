@@ -2,6 +2,8 @@
   import {
     BellRing,
     CircleCheck,
+    CloudDownload,
+    RefreshCw,
     Clock,
     Download,
     FolderLock,
@@ -34,6 +36,20 @@
       ...patch,
     });
     saving = false;
+  }
+
+  const lists = $derived(store.live?.status.lists ?? null);
+  let listsBusy = $state(false);
+
+  async function changeLists(data: boolean, drop: boolean) {
+    listsBusy = true;
+    await store.setLists(data, drop);
+    listsBusy = false;
+  }
+
+  function when(secs: number | null): string {
+    if (!secs) return 'never';
+    return new Date(secs * 1000).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' });
   }
 
   async function runExport() {
@@ -113,8 +129,8 @@
         <b class="display">{store.live ? own.length : '—'}</b>
         <span>
           internet connections by Whereabouts itself right now: the service, this app and the
-          WebView2 helpers that draw its window. It watches itself like any other app; company and
-          country data are offline lists.
+          WebView2 helpers that draw its window. It watches itself like any other app. Its only
+          requests are the list updates you allow below; all lookups happen offline.
         </span>
       </div>
     </section>
@@ -136,6 +152,43 @@
         {/if}
       </p>
     </section>
+
+    {#if lists}
+      <section class="glass card">
+        <h2><CloudDownload size={18} strokeWidth={1.6} /> List updates</h2>
+        <p class="muted">The only requests Whereabouts makes. Plain downloads of public files; nothing about you is sent.</p>
+        <Toggle
+          checked={lists.data_updates === true}
+          disabled={listsBusy}
+          label="Whereabouts' lists (github.com)"
+          detail={lists.data_version
+            ? `Signed lists from ${when(Date.parse(lists.data_version) / 1000)}. Last checked ${when(lists.data_checked_secs)}.`
+            : `Signed tracker, company and country lists, checked once a day. Last checked ${when(lists.data_checked_secs)}.`}
+          onchange={(v) => changeLists(v, lists.drop_updates === true)}
+        />
+        <Toggle
+          checked={lists.drop_updates === true}
+          disabled={listsBusy}
+          label="Spamhaus' criminal networks (spamhaus.org)"
+          detail={`Once a day; needed for risky-network alerts. Last downloaded ${when(lists.drop_fetched_secs)}.`}
+          onchange={(v) => changeLists(lists.data_updates === true, v)}
+        />
+        {#if lists.problem}
+          <p class="outcome bad"><TriangleAlert size={16} /><span>{lists.problem}</span></p>
+        {/if}
+        <div class="controls">
+          <button
+            class="btn btn-ghost"
+            type="button"
+            disabled={listsBusy || lists.checking || !(lists.data_updates || lists.drop_updates)}
+            onclick={() => store.checkLists()}
+          >
+            <RefreshCw size={16} class={lists.checking ? 'spin' : ''} />
+            {lists.checking ? 'Checking…' : 'Check now'}
+          </button>
+        </div>
+      </section>
+    {/if}
 
     {#if store.settings}
       {@const s = store.settings}

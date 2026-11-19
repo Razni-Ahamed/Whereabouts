@@ -15,6 +15,8 @@ fn main() {
             "set_settings",
             "alerts",
             "dismiss_alert",
+            "set_list_updates",
+            "check_lists_now",
         ]),
     ))
     .expect("failed to run the Tauri build script");
