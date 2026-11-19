@@ -12,10 +12,17 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
+mod settings;
+
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
+
+use settings::{AppState, SettingsFile};
+use tauri::{Manager, RunEvent};
+use whereabouts_win_startup::BACKGROUND_ARG;
 
 use serde::Serialize;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -378,10 +385,120 @@ async fn set_blocking_paused(
     .await
 }
 
+/// The app's settings, as the window shows them.
+#[derive(Debug, Serialize)]
+struct SettingsView {
+    /// Whether Windows starts the app in the tray at sign-in.
+    start_at_sign_in: bool,
+    /// Whether starting at sign-in can be changed (only for the installed
+    /// app, not a developer build).
+    can_start_at_sign_in: bool,
+    notifications: bool,
+    show_names: bool,
+    first_run_done: bool,
+}
+
+/// The installed app's program file, if this is it.
+fn installed_exe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = whereabouts_client::install_dir().ok()?;
+    let installed = dir.join(whereabouts_client::APP_PROGRAM);
+    whereabouts_win_capture::identity::same_file(&exe, &installed).then_some(installed)
+}
+
+fn settings_view(state: &AppState) -> SettingsView {
+    let settings = state
+        .settings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let exe = installed_exe();
+    SettingsView {
+        start_at_sign_in: exe
+            .as_deref()
+            .is_some_and(|exe| whereabouts_win_startup::is_enabled(exe).unwrap_or(false)),
+        can_start_at_sign_in: exe.is_some(),
+        notifications: settings.notifications,
+        show_names: settings.show_names,
+        first_run_done: settings.first_run_done,
+    }
+}
+
+#[tauri::command]
+fn get_settings(state: tauri::State<'_, AppState>) -> SettingsView {
+    settings_view(&state)
+}
+
+/// Saves the user's choices (and marks the first-run question answered).
+#[tauri::command]
+fn set_settings(
+    start_at_sign_in: bool,
+    notifications: bool,
+    show_names: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<SettingsView, Problem> {
+    match (installed_exe(), start_at_sign_in) {
+        (Some(exe), true) => whereabouts_win_startup::enable(&exe),
+        (_, false) => whereabouts_win_startup::disable(),
+        (None, true) => {
+            return Err(Problem::other(
+                "Starting at sign-in works for the installed app only.",
+            ));
+        }
+    }
+    .map_err(|e| Problem::other(format!("Could not change starting at sign-in ({e}).")))?;
+    let saved = {
+        let mut settings = state
+            .settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        settings.notifications = notifications;
+        settings.show_names = show_names;
+        settings.first_run_done = true;
+        settings.clone()
+    };
+    state
+        .file
+        .save(&saved)
+        .map_err(|e| Problem::other(format!("Could not save the settings ({e}).")))?;
+    Ok(settings_view(&state))
+}
+
+/// Whether closing the window should leave the app running in the tray.
+fn keeps_running(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    state.background
+        || installed_exe()
+            .is_some_and(|exe| whereabouts_win_startup::is_enabled(&exe).unwrap_or(false))
+}
+
 fn main() {
     tauri::Builder::default()
+        // First, so a second start only brings the running app forward.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|arg| arg == BACKGROUND_ARG) {
+                background::show_main(app);
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(Connection::default()))
+        .setup(|app| {
+            let background_start = std::env::args().any(|arg| arg == BACKGROUND_ARG);
+            let file = SettingsFile::in_dir(&app.path().app_config_dir()?);
+            let settings = file.load();
+            app.manage(AppState {
+                file,
+                settings: Mutex::new(settings),
+                background: background_start,
+            });
+            background::create_tray(app.handle())?;
+            if !background_start {
+                background::show_main(app.handle());
+            }
+            background::start_checker(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             live,
             history,
@@ -390,10 +507,42 @@ fn main() {
             rules,
             add_rule,
             remove_rule,
-            set_blocking_paused
+            set_blocking_paused,
+            get_settings,
+            set_settings
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to start the Whereabouts app");
+        .build(tauri::generate_context!())
+        .expect("failed to start the Whereabouts app")
+        .run(|app, event| {
+            // The last window closed: stay in the tray if the user chose to
+            // run in the background; otherwise quit.
+            if let RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+                && keeps_running(app)
+            {
+                api.prevent_exit();
+                let state = app.state::<AppState>();
+                let first_time = {
+                    let mut settings = state
+                        .settings
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let first = !settings.tray_hint_shown;
+                    settings.tray_hint_shown = true;
+                    first.then(|| settings.clone())
+                };
+                if let Some(settings) = first_time {
+                    let _ = state.file.save(&settings);
+                    background::notify(
+                        app,
+                        "Whereabouts is still in the tray",
+                        "It keeps an eye on your connections. Open it from the tray icon, or \
+                         close it from the icon's menu.",
+                    );
+                }
+            }
+        });
 }
 
 #[cfg(test)]

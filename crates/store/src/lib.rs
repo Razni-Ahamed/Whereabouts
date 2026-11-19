@@ -24,7 +24,7 @@ use whereabouts_core::dns::LabelSource;
 use whereabouts_core::model::{Protocol, Signature};
 
 /// Version of the database layout this code writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Length of the database key in bytes.
 pub const KEY_LEN: usize = 32;
@@ -231,17 +231,42 @@ impl Store {
         match version {
             Some(version) if version > SCHEMA_VERSION => Err(StoreError::NewerSchema(version)),
             Some(SCHEMA_VERSION) => Ok(()),
-            Some(_) => {
-                // Version 1 (Whereabouts 0.1): add blocking rules, keep history.
-                self.conn.execute_batch(SCHEMA_V2)?;
+            Some(version) => {
+                // Older versions are upgraded step by step, keeping history:
+                // version 1 (Whereabouts 0.1) gets blocking rules, then
+                // every version gets the list of known apps.
+                if version < 2 {
+                    self.conn.execute_batch(SCHEMA_V2)?;
+                }
+                self.conn.execute_batch(SCHEMA_V3)?;
                 Ok(())
             }
             None => {
                 self.conn.execute_batch(SCHEMA_V1)?;
                 self.conn.execute_batch(SCHEMA_V2)?;
+                self.conn.execute_batch(SCHEMA_V3)?;
                 Ok(())
             }
         }
+    }
+
+    /// The programs that have used the network, as keys (see
+    /// [`known_app_key`]).
+    pub fn known_app_keys(&self) -> Result<Vec<String>, StoreError> {
+        let mut query = self.conn.prepare("SELECT key FROM known_apps")?;
+        let keys = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Remembers that the program at `path` used the network. Returns
+    /// `false` if it was already known.
+    pub fn add_known_app(&mut self, path: &str, now: SystemTime) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO known_apps (key, path, first_seen) VALUES (?1, ?2, ?3)",
+            params![known_app_key(path), path, unix_ms(now)],
+        )? > 0)
     }
 
     /// Saves a blocking rule and returns its ID. Saving a rule that already
@@ -518,8 +543,9 @@ impl Store {
     /// Deletes every stored flow and hourly total and compacts the file, so
     /// the deleted data is not left behind in free pages.
     pub fn wipe(&mut self) -> Result<(), StoreError> {
-        self.conn
-            .execute_batch("DELETE FROM flows; DELETE FROM hourly; VACUUM;")?;
+        self.conn.execute_batch(
+            "DELETE FROM flows; DELETE FROM hourly; DELETE FROM known_apps; VACUUM;",
+        )?;
         Ok(())
     }
 }
@@ -570,6 +596,29 @@ pub struct StoredRule {
 }
 
 /// Schema version 2 (Whereabouts 0.2): blocking rules and settings.
+/// How a program path is compared: Windows paths ignore case (ASCII
+/// lowercase, the same as SQLite's `lower()`).
+pub fn known_app_key(path: &str) -> String {
+    path.to_ascii_lowercase()
+}
+
+/// Schema version 3 (Whereabouts 0.2): programs that have used the network,
+/// so the first use of a new one can be announced. Filled from the saved
+/// history when upgrading.
+const SCHEMA_V3: &str = "
+BEGIN;
+CREATE TABLE known_apps (
+    key TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    first_seen INTEGER NOT NULL
+) STRICT;
+INSERT OR IGNORE INTO known_apps (key, path, first_seen)
+    SELECT lower(app_path), MIN(app_path), MIN(first_seen) FROM flows
+    WHERE app_path IS NOT NULL GROUP BY lower(app_path);
+UPDATE meta SET value = '3' WHERE key = 'schema_version';
+COMMIT;
+";
+
 const SCHEMA_V2: &str = "
 BEGIN;
 CREATE TABLE rules (
@@ -940,6 +989,25 @@ mod tests {
     }
 
     #[test]
+    fn known_apps_are_remembered_once_and_deleted_with_the_history() {
+        let path = temp_db("known");
+        let mut store = Store::open(&path, &key(10)).unwrap();
+        assert!(store.known_app_keys().unwrap().is_empty());
+        assert!(store.add_known_app(r"C:\Apps\Chat.exe", at(1)).unwrap());
+        assert!(
+            !store.add_known_app(r"c:\apps\chat.EXE", at(2)).unwrap(),
+            "case is ignored"
+        );
+        assert_eq!(
+            store.known_app_keys().unwrap(),
+            vec![String::from(r"c:\apps\chat.exe")]
+        );
+        store.wipe().unwrap();
+        assert!(store.known_app_keys().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn a_version_1_database_is_upgraded_and_keeps_its_history() {
         let path = temp_db("upgrade");
         // A database as Whereabouts 0.1 left it.
@@ -952,12 +1020,22 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO flows (app_name, app_path, signature_confirmed, protocol, remote_ip,                  remote_port, first_seen, last_seen, bytes_sent, bytes_received, connections)                  VALUES ('old.exe', ?1, 0, 'TCP', '203.0.113.1', 443, 1000, 1000, 1, 1, 1)",
+                [r"C:\Old\Old.exe"],
+            )
+            .unwrap();
         }
         let mut store = Store::open(&path, &key(9)).unwrap();
+        // The programs in the history are known apps from the start.
+        assert_eq!(
+            store.known_app_keys().unwrap(),
+            vec![String::from(r"c:\old\old.exe")]
+        );
         store
             .insert_flows(&[record("old.exe", "example.com", 1000, 5)])
             .unwrap();
-        assert_eq!(store.flow_count().unwrap(), 1);
+        assert_eq!(store.flow_count().unwrap(), 2);
         let version: String = store
             .conn
             .query_row(
@@ -966,7 +1044,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        assert_eq!(version, "3");
         store
             .add_rule(
                 &RuleTarget::App {

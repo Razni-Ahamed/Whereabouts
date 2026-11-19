@@ -122,6 +122,39 @@ pub enum Request {
         /// `true` to pause, `false` to resume.
         paused: bool,
     },
+    /// Things worth telling the user about (see [`Notice`]) newer than
+    /// `after`. Start with `after: 0`.
+    Notices {
+        /// The last notice ID already seen.
+        after: u64,
+    },
+}
+
+/// Most notices the service keeps; older ones are dropped.
+pub const MAX_NOTICES: usize = 100;
+
+/// Something worth telling the user about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    /// Increases with each notice (since the service started).
+    pub id: u64,
+    /// When it happened, in seconds since 1970.
+    pub at_secs: u64,
+    /// What happened.
+    pub kind: NoticeKind,
+}
+
+/// What a [`Notice`] is about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// A program used the network for the first time that Whereabouts saw.
+    NewApp {
+        /// Executable file name.
+        app: String,
+        /// The program's full path.
+        path: String,
+    },
 }
 
 /// What a blocking rule blocks.
@@ -227,6 +260,15 @@ pub enum Response {
         rules: Vec<RuleView>,
         /// Whether blocking is paused.
         paused: bool,
+    },
+    /// Answer to [`Request::Notices`].
+    Notices {
+        /// Notices newer than the one asked for, oldest first (at most
+        /// [`MAX_NOTICES`]).
+        notices: Vec<Notice>,
+        /// The newest notice ID, or 0 if there was none yet. Pass it as
+        /// `after` next time.
+        last: u64,
     },
     /// Answer to [`Request::AddRule`].
     RuleAdded {
@@ -550,6 +592,22 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn notices_round_trip() {
+        round_trip(Request::Notices { after: 3 });
+        round_trip(Response::Notices {
+            notices: vec![Notice {
+                id: 4,
+                at_secs: 1_800_000_000,
+                kind: NoticeKind::NewApp {
+                    app: String::from("chat.exe"),
+                    path: String::from(r"C:\Apps\chat.exe"),
+                },
+            }],
+            last: 4,
+        });
     }
 
     #[test]

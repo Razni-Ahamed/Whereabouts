@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "The main window may read live and saved data, export or delete it after the user confirms in a native dialog, block after the user confirms in a native dialog, and lift blocks. No dialog, file system, shell or network permissions of its own.",
+  "description": "The main window may read live and saved data, export or delete it after the user confirms in a native dialog, block after the user confirms in a native dialog, lift blocks, and read and change the app's own settings (start at sign-in, notifications). No dialog, file system, shell or network permissions of its own.",
   "windows": ["main"],
   "permissions": [
     "allow-live",
@@ -11,6 +11,8 @@
     "allow-rules",
     "allow-add-rule",
     "allow-remove-rule",
-    "allow-set-blocking-paused"
+    "allow-set-blocking-paused",
+    "allow-get-settings",
+    "allow-set-settings"
   ]
 }

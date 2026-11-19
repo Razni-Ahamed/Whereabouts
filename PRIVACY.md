@@ -42,6 +42,13 @@ Almost all of this is encrypted anyway. Whereabouts never decrypts traffic and n
 
 We recommend turning on **BitLocker** so that someone who steals your computer's disk cannot read it.
 
+## Notifications and the tray (from version 0.2)
+
+- Whereabouts remembers **which programs have used the network** (their path and when it first saw them), in the same encrypted database, so it can tell you when a program uses the internet for the first time. Programs seen in the first day, and those already in your history, are learned quietly. Deleting everything also deletes this list (and starts a quiet day again).
+- Notifications **don't name apps or sites** unless you turn that on on the Privacy screen. Windows keeps a history of notifications on your computer and can show them on the lock screen.
+- **Starting in the tray when you sign in** only happens if you say yes (you are asked once, and can change it on the Privacy screen). It adds one entry to your Windows sign-in programs, which uninstalling removes.
+- The app's own settings (these on/off choices) are kept in a small file in your user profile.
+
 ## Blocking (from version 0.2)
 
 - The **rules you make** (which programs, domains and addresses to block) are saved in the same encrypted database, and applied as rules in the Windows firewall (the Windows Filtering Platform), under Whereabouts' own name so they can be listed and removed. Deleting your history keeps your rules; deleting all data when uninstalling deletes them too.
