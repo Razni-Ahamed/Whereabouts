@@ -10,6 +10,7 @@ databases on your computer instead.
 | [DB-IP IP to Country Lite](https://db-ip.com) | CC BY 4.0 | Country of an IP address | `scripts/update-data.ps1` |
 | [DB-IP IP to ASN Lite](https://db-ip.com) | CC BY 4.0 | Organisation that runs an IP address's network | `scripts/update-data.ps1` |
 | [Public Suffix List](https://publicsuffix.org) | MPL-2.0 | Registrable domains (`a.cdn.example.com` → `example.com`) | Built in, via the `psl` crate |
+| [Spamhaus DROP](https://www.spamhaus.org/drop/) by The Spamhaus Project | Spamhaus DROP terms: free to use, **not** to redistribute; credit required | Networks run by criminals (alerts) | **Never bundled.** Each computer downloads it from Spamhaus itself into `%ProgramData%\Whereabouts\lists` (with list updates) |
 
 The downloaded files are large and change often, so they are **not committed**
 (see `.gitignore`). Run:

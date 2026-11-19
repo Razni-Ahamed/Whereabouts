@@ -10,8 +10,9 @@
 //! Windows keeps a history of notifications and may show them on the lock
 //! screen.
 
+use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -19,7 +20,9 @@ use tauri::{AppHandle, Manager, WebviewWindowBuilder, Wry};
 use tauri_plugin_notification::NotificationExt;
 use whereabouts_client::{Client, Problem, unexpected};
 use whereabouts_core::text::display_safe;
-use whereabouts_ipc::{NoticeKind, PIPE_NAME, Request, Response, Status};
+use whereabouts_ipc::{
+    AlertKind, AlertView, NoticeKind, PIPE_NAME, Request, Response, Severity, Status,
+};
 
 use crate::settings::AppState;
 
@@ -31,6 +34,11 @@ const DOWN_AFTER: Duration = Duration::from_secs(20);
 const PAUSED_REMINDER: Duration = Duration::from_secs(60 * 60);
 /// At most one "new app" notification this often; more are grouped.
 const NEW_APPS_EVERY: Duration = Duration::from_secs(60);
+/// At most one alert notification per app (or per kind of system alert)
+/// this often, except critical ones (design spec §6.4).
+const ALERTS_PER_APP_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How often the tracker summary is sent.
+const DIGEST_EVERY: u64 = 24 * 60 * 60;
 
 /// The tray menu's pause item, kept to update its text.
 pub struct TrayMenu {
@@ -201,12 +209,22 @@ struct Checker {
     /// New apps waiting to be announced, and when the last announcement was.
     new_apps: Vec<String>,
     last_new_apps: Option<Instant>,
+    /// When an alert was last notified, per app (or kind of system alert).
+    alerted: HashMap<String, Instant>,
+}
+
+/// An alert notice.
+struct AlertNotice {
+    kind: AlertKind,
+    severity: Severity,
+    app: Option<String>,
 }
 
 /// What one check learned.
 struct Snapshot {
     status: Status,
     new_apps: Vec<String>,
+    alerts: Vec<AlertNotice>,
     last_notice: u64,
 }
 
@@ -242,26 +260,126 @@ impl Checker {
             Response::Notices { notices, last } => (notices, last),
             other => return Err(unexpected(&other)),
         };
-        let new_apps = notices
-            .into_iter()
-            .map(|notice| match notice.kind {
-                NoticeKind::NewApp { app, .. } => display_safe(&app),
-            })
-            .collect();
+        let mut new_apps = Vec::new();
+        let mut alerts = Vec::new();
+        for notice in notices {
+            match notice.kind {
+                NoticeKind::NewApp { app, .. } => new_apps.push(display_safe(&app)),
+                NoticeKind::Alert {
+                    alert,
+                    severity,
+                    app,
+                    ..
+                } => alerts.push(AlertNotice {
+                    kind: alert,
+                    severity,
+                    app: app.as_deref().map(display_safe),
+                }),
+            }
+        }
         Ok(Snapshot {
             status,
             new_apps,
+            alerts,
             last_notice,
         })
     }
 
     fn check(&mut self, app: &AppHandle, now: Instant) {
         match self.ask() {
-            Ok(snapshot) => self.reachable(app, snapshot, now),
+            Ok(snapshot) => {
+                self.reachable(app, snapshot, now);
+                if let Err(problem) = self.digest(app, SystemTime::now()) {
+                    eprintln!("tracker summary: {}", problem.message);
+                }
+            }
             Err(_) => {
                 self.client = None;
                 self.unreachable(app, now);
             }
+        }
+    }
+
+    /// Once a day, a summary of tracker contacts (never a notification per
+    /// contact).
+    fn digest(&mut self, app: &AppHandle, now: SystemTime) -> Result<(), Problem> {
+        let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let state = app.state::<AppState>();
+        let (due, show_names) = {
+            let mut settings = state
+                .settings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match settings.last_digest_secs {
+                // The first summary comes a day after this feature first ran.
+                None => {
+                    settings.last_digest_secs = Some(now_secs);
+                    let saved = settings.clone();
+                    drop(settings);
+                    let _ = state.file.save(&saved);
+                    return Ok(());
+                }
+                Some(last) => (
+                    now_secs.saturating_sub(last) >= DIGEST_EVERY,
+                    settings.show_names,
+                ),
+            }
+        };
+        if !due {
+            return Ok(());
+        }
+        let Some(client) = self.client.as_mut() else {
+            return Ok(());
+        };
+        let alerts = match client.ask(&Request::Alerts {
+            hours: 24,
+            limit: 500,
+        })? {
+            Response::Alerts { alerts } => alerts,
+            other => return Err(unexpected(&other)),
+        };
+        let saved = {
+            let mut settings = state
+                .settings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            settings.last_digest_secs = Some(now_secs);
+            settings.clone()
+        };
+        let _ = state.file.save(&saved);
+        if let Some((title, body)) = digest_text(&alerts, show_names) {
+            notify(app, &title, &body);
+        }
+        Ok(())
+    }
+
+    /// Notifies medium and higher alerts, at most one per app an hour
+    /// (critical ones always).
+    fn announce_alerts(&mut self, app: &AppHandle, alerts: Vec<AlertNotice>, now: Instant) {
+        let show_names = app
+            .state::<AppState>()
+            .settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .show_names;
+        for alert in alerts {
+            if alert.severity < Severity::Medium {
+                continue;
+            }
+            let who = alert
+                .app
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", alert.kind));
+            let recent = self
+                .alerted
+                .get(&who)
+                .is_some_and(|last| now.duration_since(*last) < ALERTS_PER_APP_EVERY);
+            if recent && alert.severity < Severity::Critical {
+                continue;
+            }
+            self.alerted.insert(who, now);
+            let (title, body) = alert_text(&alert, show_names);
+            notify(app, &title, &body);
         }
     }
 
@@ -333,6 +451,7 @@ impl Checker {
         // Only notices that arrive while the app runs are announced.
         if self.last_notice.is_some() {
             self.new_apps.extend(snapshot.new_apps);
+            self.announce_alerts(app, snapshot.alerts, now);
         }
         self.last_notice = Some(snapshot.last_notice);
         let due = self
@@ -385,6 +504,78 @@ fn new_apps_text(apps: &[String], show_names: bool) -> (String, String) {
     }
 }
 
+/// The notification for an alert: without names unless allowed.
+fn alert_text(alert: &AlertNotice, show_names: bool) -> (String, String) {
+    let see = "Open Whereabouts and look at Alerts.";
+    match (alert.kind, alert.app.as_deref().filter(|_| show_names)) {
+        (AlertKind::BadNetwork, Some(name)) => (
+            format!("{name} connected to a risky network"),
+            format!("Spamhaus lists this network as run by criminals. {see}"),
+        ),
+        (AlertKind::BadNetwork, None) => (
+            String::from("An app connected to a risky network"),
+            format!("Spamhaus lists this network as run by criminals. {see}"),
+        ),
+        (AlertKind::FakedDns, _) => (
+            String::from("Something may be hiding from Whereabouts"),
+            format!(
+                "A program wrote fake name lookups, which could make sites look like others. {see}"
+            ),
+        ),
+        (AlertKind::Unattributed, _) => (
+            String::from("Some traffic couldn't be tied to an app"),
+            format!(
+                "Many connections at once filled Whereabouts' table, which can be used to hide. {see}"
+            ),
+        ),
+        (AlertKind::Tracker, _) => (
+            String::from("An app contacted a tracker"),
+            String::from(see),
+        ),
+    }
+}
+
+/// The daily tracker summary, or `None` if there were no contacts.
+fn digest_text(alerts: &[AlertView], show_names: bool) -> Option<(String, String)> {
+    let contacts: Vec<&AlertView> = alerts
+        .iter()
+        .filter(|alert| alert.kind == AlertKind::Tracker && !alert.dismissed)
+        .collect();
+    if contacts.is_empty() {
+        return None;
+    }
+    let apps = contacts
+        .iter()
+        .filter_map(|alert| alert.app.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let mut by_tracker: HashMap<String, usize> = HashMap::new();
+    for alert in &contacts {
+        let name = alert
+            .detail
+            .as_deref()
+            .or(alert.target.as_deref())
+            .map_or_else(String::new, display_safe);
+        *by_tracker.entry(name).or_default() += 1;
+    }
+    let trackers = by_tracker.len();
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut body = format!(
+        "{} contacted {} in the last day.",
+        plural(apps, "app", "apps"),
+        plural(trackers, "tracker", "trackers")
+    );
+    if show_names {
+        let mut top: Vec<(String, usize)> = by_tracker.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let names: Vec<String> = top.into_iter().take(3).map(|(name, _)| name).collect();
+        body.push_str(&format!(" Most often: {}.", list(&names)));
+    }
+    body.push_str(" See Alerts for which apps.");
+    Some((String::from("Your daily tracker summary"), body))
+}
+
 /// "a, b and 3 more".
 fn list(apps: &[String]) -> String {
     match apps {
@@ -401,6 +592,49 @@ mod tests {
 
     fn apps(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn tracker(id: i64, app: &str, company: &str) -> AlertView {
+        AlertView {
+            id,
+            created_secs: 0,
+            kind: AlertKind::Tracker,
+            severity: Severity::Info,
+            app: Some(app.to_owned()),
+            path: None,
+            target: Some(format!("{company}.example")),
+            detail: Some(company.to_owned()),
+            dismissed: false,
+            can_allow: true,
+        }
+    }
+
+    #[test]
+    fn the_tracker_summary_counts_and_names_only_if_allowed() {
+        let alerts = vec![
+            tracker(1, "chat.exe", "Adco"),
+            tracker(2, "game.exe", "Adco"),
+            tracker(3, "game.exe", "Metrix"),
+        ];
+        let (_, body) = digest_text(&alerts, false).unwrap();
+        assert!(body.starts_with("2 apps contacted 2 trackers"), "{body}");
+        assert!(!body.contains("Adco") && !body.contains("chat.exe"));
+        let (_, body) = digest_text(&alerts, true).unwrap();
+        assert!(body.contains("Most often: Adco and Metrix."), "{body}");
+        assert!(digest_text(&[], true).is_none());
+    }
+
+    #[test]
+    fn alert_notifications_name_apps_only_if_allowed() {
+        let alert = AlertNotice {
+            kind: AlertKind::BadNetwork,
+            severity: Severity::High,
+            app: Some(String::from("chat.exe")),
+        };
+        let (title, body) = alert_text(&alert, false);
+        assert!(!title.contains("chat.exe") && !body.contains("chat.exe"));
+        let (title, _) = alert_text(&alert, true);
+        assert_eq!(title, "chat.exe connected to a risky network");
     }
 
     #[test]

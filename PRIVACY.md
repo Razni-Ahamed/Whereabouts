@@ -42,6 +42,13 @@ Almost all of this is encrypted anyway. Whereabouts never decrypts traffic and n
 
 We recommend turning on **BitLocker** so that someone who steals your computer's disk cannot read it.
 
+## Alerts (from version 0.2)
+
+- Whereabouts checks connections against lists on your computer and raises **alerts**: an app contacted a known tracker, connected to a network that Spamhaus lists as run by criminals, or something seems to be hiding from Whereabouts (fake name lookups, traffic that cannot be tied to an app). Alerts are kept in the encrypted database for 90 days and deleted with "Delete everything".
+- **"This is fine"** is remembered (which app and which tracker or network), like your blocking rules, so you aren't told again.
+- Tracker contacts are never notified one by one: you get one summary a day. Like all notifications, it names no apps or trackers unless you allow it.
+- The Spamhaus list is not part of Whereabouts: Spamhaus does not allow it to be passed on, so each computer has to download it from Spamhaus itself. That download will come with list updates and will be described here, and can be switched off, before it happens.
+
 ## Notifications and the tray (from version 0.2)
 
 - Whereabouts remembers **which programs have used the network** (their path and when it first saw them), in the same encrypted database, so it can tell you when a program uses the internet for the first time. Programs seen in the first day, and those already in your history, are learned quietly. Deleting everything also deletes this list (and starts a quiet day again).

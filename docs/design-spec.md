@@ -412,6 +412,18 @@ The thresholds above are starting values and must be tuned in the lab (§6.6).
 - Every alert stores its **reasons** (list of signals with values) and is shown with them.
 - **Alert fatigue protection:** at most one pushed notification per app per hour; lower-severity alerts collect in a daily digest. Critical alerts always notify.
 
+Implementation notes (v0.2, N5 Layer 1 alerts, 2026-11-19):
+
+| Decision | Reason |
+|---|---|
+| **Malware/C2 list: Spamhaus DROP, downloaded by each computer itself** (decision D11; the download comes with N6, disclosed and switchable). Read from `lists\drop_v4.json` / `drop_v6.json` in the data folder; never bundled | Licences checked 2026-11-19: Feodo Tracker's CC0 grant conflicts with abuse.ch's "no copying" clause (and the list was empty); ThreatFox needs an account and is for not-for-profit use; Maltrail's trails need a written agreement to redistribute; C2IntelFeeds is non-commercial; C2-Tracker has no licence; HaGeZi's and DigitalSide's upstream terms are unclear. Spamhaus lets each user download DROP (credit required, at most once a day) but not redistribute it. Written permission for Feodo Tracker is being asked for. |
+| Alerts: **bad network** (DROP range, *high*), **tracker contact** (EasyPrivacy, *info*), **faked DNS events** and **unattributed traffic** (*medium*) | Layer 1 of §6.1 plus the evasion signals v0.1 already counted. Unprotected kernel events stay a status warning: the service (SYSTEM) cannot judge it for the user's account. |
+| Only domains confirmed by the Windows DNS service (or seen for the same address in its answers) raise tracker alerts | What an app says about itself is not evidence. |
+| One alert per app and tracker (or address) per day; evasion alerts at most once an hour; each flow is checked once a day | Alerts stay readable; the engine's work stays small. |
+| Alerts are stored encrypted (schema v4), kept 90 days, deleted with "Delete everything". **"This is fine"** marks an alert seen; for trackers and bad networks it also stops alerts for the same app and tracker (or listed range), kept like rules | The user decides what is normal. Stopping warnings about a bad network is confirmed in a native Windows dialog, so the web view cannot silence them on its own. |
+| Notifications: *medium* and higher, at most one per app (or kind of system alert) an hour, *critical* always; trackers only in a **daily summary** (user's choice). No app, site or tracker names unless allowed | §6.4 alert fatigue protection; lock-screen privacy. |
+| Spamhaus is credited in the app's footer whenever DROP is in use, and in every alert it raised | Spamhaus' DROP terms ask for credit when DROP is used in a product. |
+
 ### 6.5 User feedback
 
 - **“This is fine”** adds the destination to the app's profile and suppresses that signal.

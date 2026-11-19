@@ -385,6 +385,91 @@ async fn set_blocking_paused(
     .await
 }
 
+/// Saved alerts of the last `hours`, newest first.
+#[tauri::command]
+async fn alerts(
+    hours: u32,
+    limit: u32,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Vec<whereabouts_ipc::AlertView>, Problem> {
+    let connection = Arc::clone(&connection);
+    let (hours, limit) = (hours.min(MAX_HOURS), limit.min(MAX_ROWS));
+    blocking(move || {
+        connection.with(
+            |client| match client.ask(&Request::Alerts { hours, limit })? {
+                Response::Alerts { alerts } => Ok(alerts),
+                other => Err(unexpected(&other)),
+            },
+        )
+    })
+    .await
+}
+
+/// Marks an alert as seen and fine; with `allow`, alerts like it stop.
+/// Stopping alerts about a risky network is confirmed in a native Windows
+/// dialog first, so the web view cannot silence them on its own. `false` if
+/// the user said no.
+#[tauri::command]
+async fn dismiss_alert(
+    id: i64,
+    allow: bool,
+    app: tauri::AppHandle,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<bool, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        if allow {
+            let alert = connection.with(|client| {
+                match client.ask(&Request::Alerts {
+                    hours: MAX_HOURS,
+                    limit: MAX_ROWS,
+                })? {
+                    Response::Alerts { alerts } => Ok(alerts.into_iter().find(|a| a.id == id)),
+                    other => Err(unexpected(&other)),
+                }
+            })?;
+            let Some(alert) = alert else {
+                return Err(Problem::other("That alert no longer exists."));
+            };
+            if alert.severity >= whereabouts_ipc::Severity::High {
+                let program = alert
+                    .path
+                    .as_deref()
+                    .or(alert.app.as_deref())
+                    .map_or_else(|| String::from("this app"), display_safe);
+                let target = alert
+                    .detail
+                    .as_deref()
+                    .or(alert.target.as_deref())
+                    .map_or_else(|| String::from("this network"), display_safe);
+                let confirmed = app
+                    .dialog()
+                    .message(format!(
+                        "Whereabouts will no longer warn you when this program connects to this \
+                         network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
+                    ))
+                    .title("Stop these warnings?")
+                    .kind(MessageDialogKind::Warning)
+                    .buttons(MessageDialogButtons::OkCancelCustom(
+                        String::from("Stop these warnings"),
+                        String::from("Cancel"),
+                    ))
+                    .blocking_show();
+                if !confirmed {
+                    return Ok(false);
+                }
+            }
+        }
+        connection.with(
+            |client| match client.ask(&Request::DismissAlert { id, allow })? {
+                Response::AlertDismissed {} => Ok(true),
+                other => Err(unexpected(&other)),
+            },
+        )
+    })
+    .await
+}
+
 /// The app's settings, as the window shows them.
 #[derive(Debug, Serialize)]
 struct SettingsView {
@@ -509,7 +594,9 @@ fn main() {
             remove_rule,
             set_blocking_paused,
             get_settings,
-            set_settings
+            set_settings,
+            alerts,
+            dismiss_alert
         ])
         .build(tauri::generate_context!())
         .expect("failed to start the Whereabouts app")

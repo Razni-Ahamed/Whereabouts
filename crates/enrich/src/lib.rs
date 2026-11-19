@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod companies;
+pub mod drop;
 pub mod geo;
 pub mod trackers;
 
@@ -21,6 +22,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 pub use companies::{Category, Company, CompanyList};
+pub use drop::{DROP_ATTRIBUTION, DropEntry, DropList};
 pub use geo::{GeoDatabases, IpInfo, Scope};
 pub use trackers::TrackerList;
 

@@ -8,6 +8,7 @@
 #[macro_use]
 mod log;
 
+mod alerts;
 mod apps;
 mod blocking;
 mod client;

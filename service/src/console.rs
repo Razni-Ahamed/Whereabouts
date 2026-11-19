@@ -188,6 +188,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     };
     let mut last_retention = Instant::now();
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
+    let mut detector = crate::alerts::Detector::load(&crate::storage::home_dir().join("lists"));
     let mut blocking = crate::blocking::Blocking::start(
         whereabouts_win_firewall::Firewall::open,
         store.as_ref(),
@@ -342,6 +343,39 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 }
             }
             let view = View::collect(&table, &closed, &names);
+            if let Some(store) = store.as_mut() {
+                let now = SystemTime::now();
+                let mut raised = Vec::new();
+                for row in view.rows.iter().filter(|row| !row.key.is_overflow()) {
+                    let facts = crate::alerts::FlowFacts {
+                        key: row.key,
+                        app: &row.app,
+                        path: row
+                            .token
+                            .and_then(|token| names.identity(token))
+                            .map(|identity| identity.path.as_str()),
+                        domain: row
+                            .stats
+                            .domain
+                            .as_ref()
+                            .filter(|label| label.source != LabelSource::Unverified)
+                            .map(|label| label.name.as_ref()),
+                    };
+                    raised.extend(detector.check_flow(&facts, &enricher, store, now));
+                }
+                raised.extend(detector.check_counters(
+                    capture.counts().rejected,
+                    view.unattributed,
+                    store,
+                    now,
+                ));
+                if !raised.is_empty() {
+                    let mut state = live.lock().unwrap_or_else(PoisonError::into_inner);
+                    for alert in &raised {
+                        state.push_notice(crate::alerts::notice(alert), now);
+                    }
+                }
+            }
             if serving {
                 let counts = capture.counts();
                 let (block_rules, blocking_paused) = blocking.summary();
@@ -359,6 +393,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
                     block_rules,
                     blocking_paused,
+                    drop_list: detector.has_drop(),
                 };
                 publish(&live, &view, &names, &enricher, status);
             }

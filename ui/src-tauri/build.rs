@@ -13,6 +13,8 @@ fn main() {
             "set_blocking_paused",
             "get_settings",
             "set_settings",
+            "alerts",
+            "dismiss_alert",
         ]),
     ))
     .expect("failed to run the Tauri build script");

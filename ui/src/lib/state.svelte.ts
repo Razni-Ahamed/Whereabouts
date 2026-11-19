@@ -2,6 +2,8 @@
 
 import {
   addRule,
+  alerts,
+  dismissAlert,
   getSettings,
   history,
   isDemo,
@@ -11,11 +13,21 @@ import {
   setBlockingPaused,
   setSettings,
 } from './api';
-import type { AppSettings, AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
+import type {
+  AlertView,
+  AppSettings,
+  AppTotals,
+  FlowView,
+  Live,
+  Problem,
+  Rules,
+  RuleSpec,
+} from './types';
 
 const LIVE_EVERY_MS = 2000;
 const HISTORY_EVERY_MS = 30_000;
 const RULES_EVERY_MS = 10_000;
+const ALERTS_EVERY_MS = 15_000;
 /** How long the "Blocked · Undo" note stays. */
 const NOTE_MS = 8000;
 
@@ -35,6 +47,9 @@ class Store {
   updated = $state<Date | null>(null);
   rules = $state<Rules | null>(null);
   settings = $state<AppSettings | null>(null);
+  alerts = $state<AlertView[] | null>(null);
+  /** Alerts that need a look: medium or higher, not marked fine. */
+  needsLook = $derived((this.alerts ?? []).filter((a) => a.severity !== 'info' && !a.dismissed).length);
   note = $state<Note | null>(null);
   #noteTimer: ReturnType<typeof setTimeout> | undefined;
   /** Bytes per second between refreshes, oldest first. */
@@ -67,6 +82,22 @@ class Store {
       this.activity = [...this.activity, rate].slice(-ACTIVITY_SAMPLES);
     }
     this.#lastTotal = { bytes, at };
+  }
+
+  async refreshAlerts(): Promise<void> {
+    const result = await alerts();
+    if (result.ok) this.alerts = result.value;
+  }
+
+  /** Marks an alert as fine (with `allow`, alerts like it stop too). */
+  async dismiss(id: number, allow: boolean): Promise<void> {
+    const result = await dismissAlert(id, allow);
+    if (!result.ok) {
+      this.showNote({ text: result.problem.message, tone: 'bad' });
+    } else if (result.value) {
+      this.showNote({ text: allow ? "Marked as fine. You won't be told about this again." : 'Marked as seen.', tone: 'good' });
+      await this.refreshAlerts();
+    }
   }
 
   async loadSettings(): Promise<void> {
@@ -145,6 +176,8 @@ class Store {
     void this.refreshHistory();
     void this.refreshRules();
     void this.loadSettings();
+    void this.refreshAlerts();
+    const d = setInterval(() => void this.refreshAlerts(), ALERTS_EVERY_MS);
     const a = setInterval(() => void this.refreshLive(), LIVE_EVERY_MS);
     const b = setInterval(() => void this.refreshHistory(), HISTORY_EVERY_MS);
     const c = setInterval(() => void this.refreshRules(), RULES_EVERY_MS);
@@ -152,6 +185,7 @@ class Store {
       clearInterval(a);
       clearInterval(b);
       clearInterval(c);
+      clearInterval(d);
     };
   }
 }
