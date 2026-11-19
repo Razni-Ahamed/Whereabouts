@@ -454,13 +454,26 @@ This is the complete list. Anything not on it is a bug.
 
 | Request | Purpose | Data sent | Can disable? |
 |---|---|---|---|
-| Download list updates | Tracker, malware, geo databases | None beyond a plain HTTPS GET of a fixed URL (no IDs, no cookies, no custom headers) | Yes |
-| Check for app updates | New version available | Same as above | Yes |
+| Download list updates (github.com, Whereabouts' releases) | Tracker, company, country and network lists | None beyond plain HTTPS GETs of fixed URLs (no IDs, no cookies; the only header of our own is the user agent `Whereabouts list updates`) | Yes |
+| Download Spamhaus DROP (spamhaus.org) | Networks run by criminals (alerts); Spamhaus does not allow redistribution, so each computer fetches it | Same as above, at most once a day | Yes |
+| Check for app updates | New version available | Same as above | Yes (planned) |
 
-- Both downloads are **signed** (Ed25519, e.g. minisign); the public key is built into the app, and unsigned or invalid files are rejected.
-- Downloads come from static files (e.g. GitHub Releases), so we run no server and see no logs.
+- Whereabouts' own downloads are **signed** (Ed25519); the public key is built into the app, and unsigned or invalid files are rejected. Spamhaus DROP comes over HTTPS straight from Spamhaus and is only parsed, never executed.
+- Downloads come from static files (GitHub Releases, Spamhaus' public files), so we run no server and see no logs.
 - The Privacy screen shows when each request last happened.
 - The app monitors **itself** like any other app, so users can check this table against what they observe.
+
+Implementation notes (v0.2, N6 list updates, 2026-11-20):
+
+| Decision | Reason |
+|---|---|
+| **Nothing is downloaded until the user answers the app's question** (both switches suggested on; decision D12), asked once after the tray question and changeable on the Privacy screen. Two switches: Whereabouts' lists, and Spamhaus | The service starts at install, before anyone sees an explanation. A user who never opens the app never downloads anything. |
+| A **bundle** is the data files plus a manifest (format, sequence, date, each file's size and SHA-256, sources) and an **Ed25519 signature over the manifest's exact bytes** (`whereabouts-data-bundle` crate, `ed25519-dalek`). Manifests with unknown fields, missing, extra or repeated files, or files over 64 MB are refused | The signature covers what will be installed; nothing outside the four known file names can be written. |
+| The private key exists only as the GitHub Actions secret `WHEREABOUTS_DATA_SIGNING_KEY` and the maintainer's offline backup. The tool refuses to sign with a key that does not match the built-in public key | A leaked or lost key means a new key in an app update (see the threat model, §8). |
+| CI (`.github/workflows/data.yml`) builds a bundle weekly: release `data-<sequence>` holds the files; `data-latest` holds only the newest manifest and signature, uploaded last. Clients fetch files from the release named in the signed manifest | Clients never see a half-published bundle; old bundles stay fetchable (the newest four are kept). |
+| The service checks once a day (first 90 s after start, then every 15 min whether something is due; failures retried after 6 h). A bundle must have a **higher sequence** than the one in use; files go to `data.new`, are checked against the manifest, and replace `data` as a whole; then the engine reloads, keeping the old data if the new set is incomplete | No replay of old bundles; no half-updated data. |
+| Spamhaus DROP: at most once a day ("Check now" at most hourly); refused unless it parses into at least one range; turning it off deletes the copy | Spamhaus' terms; a stale threat list is worse than none. |
+| HTTPS only, through **Windows' own TLS and certificate store** (`ureq` with native-tls), redirects at most 5, 3-minute timeout, size limits on every response | Certificates are checked the way Windows checks them; no extra crypto library. |
 
 ---
 

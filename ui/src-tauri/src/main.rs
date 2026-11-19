@@ -470,6 +470,41 @@ async fn dismiss_alert(
     .await
 }
 
+/// Turns list updates on or off (nothing is downloaded until the user
+/// chose). Only lowers or raises what is downloaded; no dialog needed.
+#[tauri::command]
+async fn set_list_updates(
+    data: bool,
+    drop: bool,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<whereabouts_ipc::ListsView, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        connection.with(
+            |client| match client.ask(&Request::SetListUpdates { data, drop })? {
+                Response::Lists(lists) => Ok(lists),
+                other => Err(unexpected(&other)),
+            },
+        )
+    })
+    .await
+}
+
+/// Checks for list updates now.
+#[tauri::command]
+async fn check_lists_now(
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<whereabouts_ipc::ListsView, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        connection.with(|client| match client.ask(&Request::CheckListsNow {})? {
+            Response::Lists(lists) => Ok(lists),
+            other => Err(unexpected(&other)),
+        })
+    })
+    .await
+}
+
 /// The app's settings, as the window shows them.
 #[derive(Debug, Serialize)]
 struct SettingsView {
@@ -596,7 +631,9 @@ fn main() {
             get_settings,
             set_settings,
             alerts,
-            dismiss_alert
+            dismiss_alert,
+            set_list_updates,
+            check_lists_now
         ])
         .build(tauri::generate_context!())
         .expect("failed to start the Whereabouts app")

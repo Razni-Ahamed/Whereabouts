@@ -45,6 +45,10 @@ pub enum EngineCommand {
         /// Where to send the result.
         reply: Sender<Result<(), String>>,
     },
+    /// Load the offline data again (a data update was installed).
+    ReloadData,
+    /// Load Spamhaus DROP again (downloaded or removed).
+    ReloadDrop,
     /// List or change the blocking rules, and send back the answer.
     Rules {
         /// What to do.
@@ -67,6 +71,10 @@ pub struct LiveState {
     pub notices: VecDeque<Notice>,
     /// The ID of the newest notice (0 before the first).
     pub last_notice: u64,
+    /// List updates, as the updater last saw them.
+    pub lists: whereabouts_ipc::ListsView,
+    /// Where to send the list updater commands; `None` until it runs.
+    pub updates: Option<Sender<crate::updates::UpdaterCommand>>,
 }
 
 impl LiveState {
@@ -200,7 +208,38 @@ fn lock(state: &Mutex<LiveState>) -> MutexGuard<'_, LiveState> {
 fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>) -> Response {
     match request {
         Request::Hello { .. } => hello(),
-        Request::Status {} => Response::Status(lock(state).status.clone()),
+        Request::Status {} => {
+            let state = lock(state);
+            let mut status = state.status.clone();
+            status.lists = state.lists.clone();
+            Response::Status(status)
+        }
+        Request::SetListUpdates { data, drop } => match open_store(store) {
+            Ok(store) => match crate::updates::set_switches(store, data, drop) {
+                Ok(()) => {
+                    let mut state = lock(state);
+                    let checking = state.lists.checking;
+                    state.lists = crate::updates::view(store);
+                    state.lists.checking = checking;
+                    if let Some(updates) = &state.updates {
+                        let _ = updates.send(crate::updates::UpdaterCommand::SettingsChanged);
+                    }
+                    Response::Lists(state.lists.clone())
+                }
+                Err(message) => Response::Error {
+                    message: format!("could not save the choice: {message}"),
+                },
+            },
+            Err(response) => *response,
+        },
+        Request::CheckListsNow {} => {
+            let mut state = lock(state);
+            if let Some(updates) = &state.updates {
+                let _ = updates.send(crate::updates::UpdaterCommand::CheckNow);
+                state.lists.checking = true;
+            }
+            Response::Lists(state.lists.clone())
+        }
         Request::LiveFlows { limit } => Response::LiveFlows {
             flows: lock(state)
                 .flows
@@ -211,11 +250,11 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
         },
         Request::History { hours, limit } => match open_store(store) {
             Ok(store) => history(store, hours, limit),
-            Err(response) => response,
+            Err(response) => *response,
         },
         Request::ExportPage { after, limit } => match open_store(store) {
             Ok(store) => export_page(store, after, limit),
-            Err(response) => response,
+            Err(response) => *response,
         },
         Request::DeleteAll { confirm } => delete_all(state, &confirm),
         Request::ListRules {} => rules(state, crate::blocking::RuleCommand::List),
@@ -226,7 +265,7 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
         }
         Request::Alerts { hours, limit } => match open_store(store) {
             Ok(store) => alerts(store, hours, limit),
-            Err(response) => response,
+            Err(response) => *response,
         },
         Request::DismissAlert { id, allow } => match open_store(store) {
             Ok(store) => match store.dismiss_alert(id, allow, SystemTime::now()) {
@@ -238,7 +277,7 @@ fn answer(request: Request, state: &Mutex<LiveState>, store: &mut Option<Store>)
                     message: format!("could not change the alert: {error}"),
                 },
             },
-            Err(response) => response,
+            Err(response) => *response,
         },
         Request::Notices { after } => {
             let state = lock(state);
@@ -280,15 +319,19 @@ fn rules(state: &Mutex<LiveState>, command: crate::blocking::RuleCommand) -> Res
 }
 
 /// The connection's store, opened on first use.
-fn open_store(store: &mut Option<Store>) -> Result<&mut Store, Response> {
+fn open_store(store: &mut Option<Store>) -> Result<&mut Store, Box<Response>> {
     if store.is_none() {
-        let opened = crate::storage::open().map_err(|error| Response::Error {
-            message: format!("history is not available: {error}"),
+        let opened = crate::storage::open().map_err(|error| {
+            Box::new(Response::Error {
+                message: format!("history is not available: {error}"),
+            })
         })?;
         *store = Some(opened);
     }
-    store.as_mut().ok_or_else(|| Response::Error {
-        message: String::from("history is not available"),
+    store.as_mut().ok_or_else(|| {
+        Box::new(Response::Error {
+            message: String::from("history is not available"),
+        })
     })
 }
 
@@ -419,6 +462,8 @@ mod tests {
             commands: None,
             notices: VecDeque::new(),
             last_notice: 0,
+            lists: whereabouts_ipc::ListsView::default(),
+            updates: None,
         }))
     }
 
@@ -444,7 +489,7 @@ mod tests {
         // A stand-in for the engine that answers one command.
         let engine = std::thread::spawn(move || match commands.recv().unwrap() {
             EngineCommand::DeleteAll { reply } => reply.send(Ok(())).unwrap(),
-            EngineCommand::Rules { .. } => panic!("unexpected command"),
+            other => panic!("unexpected command {other:?}"),
         });
         let mut store = None;
         let done = answer(

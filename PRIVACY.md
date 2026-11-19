@@ -47,7 +47,7 @@ We recommend turning on **BitLocker** so that someone who steals your computer's
 - Whereabouts checks connections against lists on your computer and raises **alerts**: an app contacted a known tracker, connected to a network that Spamhaus lists as run by criminals, or something seems to be hiding from Whereabouts (fake name lookups, traffic that cannot be tied to an app). Alerts are kept in the encrypted database for 90 days and deleted with "Delete everything".
 - **"This is fine"** is remembered (which app and which tracker or network), like your blocking rules, so you aren't told again.
 - Tracker contacts are never notified one by one: you get one summary a day. Like all notifications, it names no apps or trackers unless you allow it.
-- The Spamhaus list is not part of Whereabouts: Spamhaus does not allow it to be passed on, so each computer has to download it from Spamhaus itself. That download will come with list updates and will be described here, and can be switched off, before it happens.
+- The Spamhaus list is not part of Whereabouts: Spamhaus does not allow it to be passed on, so your computer downloads it from Spamhaus itself, if you allow it (see "Requests Whereabouts makes itself").
 
 ## Notifications and the tray (from version 0.2)
 
@@ -64,16 +64,18 @@ We recommend turning on **BitLocker** so that someone who steals your computer's
 
 ## Requests Whereabouts makes itself
 
-**None.** Whereabouts makes no connections to the internet: the tracker, company and country data come with the installer, and there is no update check yet. Whereabouts monitors itself like every other app, and its Privacy screen counts its own internet connections, so you can check this.
+Only **list updates**, and only if you allow them. Nothing is downloaded until you answer the app's question about them (both are suggested on), and you can switch each off on the Privacy screen at any time:
 
-The one exception is the **installer**: the desktop app needs Microsoft Edge WebView2, which Windows 10 and 11 normally include. If it is missing, the installer downloads it from Microsoft.
+| Request | Why | How often | What it sends |
+|---|---|---|---|
+| **Whereabouts' lists** from Whereabouts' releases on github.com | Keep the tracker, company, country and network lists current | Checked once a day; about 20 MB when there is a new set (usually weekly) | A plain download of fixed public files. No ID, no cookies, nothing about you or your apps. |
+| **Spamhaus' list of criminal networks** from spamhaus.org | Risky-network alerts. Spamhaus does not allow the list to be passed on, so your computer fetches it itself | At most once a day; under 1 MB | The same: a plain download of fixed public files. |
 
-Planned for later versions, both optional and off-switchable, both digitally signed and rejected if the signature check fails:
+As with any website, those servers see your computer's IP address. Whereabouts' lists are digitally signed by Whereabouts and refused if the signature or any file does not match; an older set is never accepted in place of a newer one. Whereabouts monitors itself like every other app, and its Privacy screen counts its own internet connections and shows when each download last happened, so you can check this.
 
-| Request | Why | What it will send |
-|---|---|---|
-| Download list updates | Keep tracker, company and country data current | A plain download of a fixed public file. No ID, no cookies, nothing about you. |
-| Check for app updates | Tell you when a new version exists | The same: a plain download of a fixed public file. |
+The one other exception is the **installer**: the desktop app needs Microsoft Edge WebView2, which Windows 10 and 11 normally include. If it is missing, the installer downloads it from Microsoft.
+
+Planned for a later version, optional and off-switchable, signed and rejected if the signature check fails: **checking for app updates**, with the same kind of plain download.
 
 ## Company and country information
 
@@ -96,4 +98,4 @@ These are designed but not built yet. This page will describe them exactly when 
 - **Learning what is normal** for each app, to warn about unusual behaviour. It will happen **only on your computer**; learned profiles will be stored encrypted, viewable and resettable, and never shared, not even as anonymised model updates.
 - **Settings** to change how long history is kept, and to exclude web browsers from history completely.
 - **Recording whether an app was in use** (in the foreground) when it connected.
-- **List and app update downloads**, described above.
+- **App update checks**, described above.

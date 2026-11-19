@@ -156,7 +156,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     println!("Publisher: from the program's code signature · ? = checked by file path only, not");
     println!("           confirmed as the file the process ran (e.g. it had already exited)");
 
-    let (enricher, data) = Enricher::load(&options.data_dir.clone().unwrap_or_else(data_dir));
+    let (mut enricher, mut data) =
+        Enricher::load(&options.data_dir.clone().unwrap_or_else(data_dir));
     println!(
         "Offline data: {} tracker domains · {} company domains{}",
         data.tracker_domains,
@@ -188,7 +189,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     };
     let mut last_retention = Instant::now();
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
-    let mut detector = crate::alerts::Detector::load(&crate::storage::home_dir().join("lists"));
+    let mut detector = crate::alerts::Detector::load(&crate::updates::lists_dir());
     let mut blocking = crate::blocking::Blocking::start(
         whereabouts_win_firewall::Firewall::open,
         store.as_ref(),
@@ -211,6 +212,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             println!(
                 "Answering Whereabouts clients on {PIPE_NAME} (try --status in another terminal)"
             );
+            let updates = crate::updates::start(Arc::clone(&live));
+            live.lock().unwrap_or_else(PoisonError::into_inner).updates = Some(updates);
             true
         }
         Err(error) => {
@@ -305,6 +308,26 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                     let _ = reply.send(result);
                 }
+                crate::server::EngineCommand::ReloadData => {
+                    if options.data_dir.is_none() {
+                        let (fresh, report) = Enricher::load(&data_dir());
+                        if report.missing.is_empty() {
+                            enricher = fresh;
+                            data = report;
+                            println!(
+                                "Offline data reloaded: {} tracker domains",
+                                data.tracker_domains
+                            );
+                        } else {
+                            report!(
+                                "warning: the updated data is incomplete; keeping the old data"
+                            );
+                        }
+                    }
+                }
+                crate::server::EngineCommand::ReloadDrop => {
+                    detector = crate::alerts::Detector::load(&crate::updates::lists_dir());
+                }
                 crate::server::EngineCommand::Rules { command, reply } => {
                     // A new domain rule (or resuming) also applies to names
                     // still in Windows' DNS cache: their answers are not
@@ -394,6 +417,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     block_rules,
                     blocking_paused,
                     drop_list: detector.has_drop(),
+                    // Filled in from the updater's state when answering.
+                    lists: whereabouts_ipc::ListsView::default(),
                 };
                 publish(&live, &view, &names, &enricher, status);
             }
@@ -1091,14 +1116,20 @@ fn owner_and_country(row: &Row, enricher: &Enricher) -> (String, String) {
     (ip.network.unwrap_or_else(|| String::from("-")), country)
 }
 
-/// Finds the folder with the offline data files: `WHEREABOUTS_DATA`, a
-/// `data` folder next to the program or in the current folder, or the
-/// project's `data` folder for development builds.
+/// Finds the folder with the offline data files: `WHEREABOUTS_DATA`, the
+/// last accepted signed data update, a `data` folder next to the program
+/// or in the current folder, or the project's `data` folder for
+/// development builds.
 pub fn data_dir() -> PathBuf {
     use std::path::PathBuf;
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::var_os("WHEREABOUTS_DATA") {
         candidates.push(PathBuf::from(dir));
+    }
+    // Only a bundle the updater verified and swapped in has a manifest.
+    let updated = crate::updates::data_home();
+    if updated.join(whereabouts_data_bundle::MANIFEST).is_file() {
+        candidates.push(updated);
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()

@@ -1,7 +1,18 @@
 // Made-up data, shown only when the UI runs in an ordinary browser (for
 // design work). The desktop app always shows real data from the service.
 
-import type { AlertView, AppTotals, FlowView, Live, Problem, Rules, RuleSpec } from './types';
+import type { AlertView, AppTotals, FlowView, ListsView, Live, Problem, Rules, RuleSpec } from './types';
+
+// Demo list updates, kept while the page is open.
+export const demoLists: ListsView = {
+  data_updates: null,
+  drop_updates: null,
+  data_version: null,
+  data_checked_secs: null,
+  drop_fetched_secs: null,
+  problem: null,
+  checking: false,
+};
 
 /** Where the demo apps live. */
 const PATHS: Record<string, string> = {
@@ -96,7 +107,8 @@ export function demoLive(): Live {
       tracker_domains: 47_359,
       block_rules: demo.rules.length,
       blocking_paused: demo.paused,
-      drop_list: false,
+      drop_list: demoLists.drop_updates === true,
+      lists: { ...demoLists },
     },
     flows,
     own_pids: [],

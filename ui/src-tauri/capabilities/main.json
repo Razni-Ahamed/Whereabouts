@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "The main window may read live and saved data, export or delete it after the user confirms in a native dialog, block after the user confirms in a native dialog, lift blocks, read and change the app's own settings (start at sign-in, notifications), read alerts, and mark them as fine (stopping warnings about a risky network is confirmed in a native dialog). No dialog, file system, shell or network permissions of its own.",
+  "description": "The main window may read live and saved data, export or delete it after the user confirms in a native dialog, block after the user confirms in a native dialog, lift blocks, read and change the app's own settings (start at sign-in, notifications), read alerts, and mark them as fine (stopping warnings about a risky network is confirmed in a native dialog), and switch list updates on or off. No dialog, file system, shell or network permissions of its own.",
   "windows": ["main"],
   "permissions": [
     "allow-live",
@@ -15,6 +15,8 @@
     "allow-get-settings",
     "allow-set-settings",
     "allow-alerts",
-    "allow-dismiss-alert"
+    "allow-dismiss-alert",
+    "allow-set-list-updates",
+    "allow-check-lists-now"
   ]
 }

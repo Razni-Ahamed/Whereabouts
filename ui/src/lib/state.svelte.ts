@@ -3,6 +3,8 @@
 import {
   addRule,
   alerts,
+  checkListsNow,
+  setListUpdates,
   dismissAlert,
   getSettings,
   history,
@@ -97,6 +99,26 @@ class Store {
     } else if (result.value) {
       this.showNote({ text: allow ? "Marked as fine. You won't be told about this again." : 'Marked as seen.', tone: 'good' });
       await this.refreshAlerts();
+    }
+  }
+
+  /** Turns list updates on or off; `false` (with a note) if that failed. */
+  async setLists(data: boolean, drop: boolean): Promise<boolean> {
+    const result = await setListUpdates(data, drop);
+    if (!result.ok) {
+      this.showNote({ text: result.problem.message, tone: 'bad' });
+      return false;
+    }
+    if (this.live) this.live = { ...this.live, status: { ...this.live.status, lists: result.value } };
+    return true;
+  }
+
+  async checkLists(): Promise<void> {
+    const result = await checkListsNow();
+    if (!result.ok) {
+      this.showNote({ text: result.problem.message, tone: 'bad' });
+    } else if (this.live) {
+      this.live = { ...this.live, status: { ...this.live.status, lists: result.value } };
     }
   }
 

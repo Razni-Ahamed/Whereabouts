@@ -1,0 +1,20 @@
+[package]
+name = "whereabouts-data-bundle"
+description = "Signed data updates for Whereabouts: the manifest, its Ed25519 signature check, and the tool that builds and signs bundles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

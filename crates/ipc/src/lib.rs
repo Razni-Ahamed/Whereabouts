@@ -135,6 +135,15 @@ pub enum Request {
         /// Most alerts to return; clamped to [`MAX_ROWS`].
         limit: u32,
     },
+    /// Turns list updates on or off (both are off until the user chooses).
+    SetListUpdates {
+        /// Whereabouts' signed data updates.
+        data: bool,
+        /// Spamhaus' DROP list.
+        drop: bool,
+    },
+    /// Checks for list updates now (Spamhaus at most hourly).
+    CheckListsNow {},
     /// Marks an alert as seen and fine.
     DismissAlert {
         /// The alert's ID.
@@ -359,6 +368,8 @@ pub enum Response {
     },
     /// Answer to [`Request::DismissAlert`].
     AlertDismissed {},
+    /// Answer to [`Request::SetListUpdates`] and [`Request::CheckListsNow`].
+    Lists(ListsView),
     /// Answer to [`Request::AddRule`].
     RuleAdded {
         /// The new rule's ID (or the existing one's, if it was already
@@ -412,6 +423,28 @@ pub struct Status {
     /// this computer has downloaded it).
     #[serde(default)]
     pub drop_list: bool,
+    /// List updates.
+    #[serde(default)]
+    pub lists: ListsView,
+}
+
+/// List updates: the user's switches and what was downloaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListsView {
+    /// Whereabouts' signed data updates; `None` until the user chose.
+    pub data_updates: Option<bool>,
+    /// Spamhaus' DROP list; `None` until the user chose.
+    pub drop_updates: Option<bool>,
+    /// When the data in use was built, if it came from an update.
+    pub data_version: Option<String>,
+    /// When data updates were last checked (seconds since 1970).
+    pub data_checked_secs: Option<u64>,
+    /// When Spamhaus DROP was last downloaded (seconds since 1970).
+    pub drop_fetched_secs: Option<u64>,
+    /// What went wrong last time, if anything.
+    pub problem: Option<String>,
+    /// Whether a check is running.
+    pub checking: bool,
 }
 
 /// How far a flow's domain name can be trusted.

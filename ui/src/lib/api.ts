@@ -11,9 +11,10 @@ import {
   demoLive,
   demoRemoveRule,
   demoRules,
+  demoLists,
   demoSetPaused,
 } from './demo';
-import type { AlertView, AppSettings, AppTotals, Live, Problem, Rules, RuleSpec } from './types';
+import type { AlertView, AppSettings, AppTotals, ListsView, Live, Problem, Rules, RuleSpec } from './types';
 
 export const isDemo = !('__TAURI_INTERNALS__' in window);
 
@@ -94,6 +95,31 @@ export async function removeRule(id: number): Promise<Result<Rules>> {
 export async function setBlockingPaused(paused: boolean): Promise<Result<Rules>> {
   if (isDemo) return { ok: true, value: demoSetPaused(paused) };
   return call<Rules>('set_blocking_paused', { paused });
+}
+
+/** Turns list updates on or off. */
+export async function setListUpdates(data: boolean, drop: boolean): Promise<Result<ListsView>> {
+  if (isDemo) {
+    const now = Math.floor(Date.now() / 1000);
+    Object.assign(demoLists, {
+      data_updates: data,
+      drop_updates: drop,
+      data_version: data ? '2026-11-17T04:17:00Z' : null,
+      data_checked_secs: data ? now : null,
+      drop_fetched_secs: drop ? now : null,
+    });
+    return { ok: true, value: { ...demoLists } };
+  }
+  return call<ListsView>('set_list_updates', { data, drop });
+}
+
+/** Checks for list updates now. */
+export async function checkListsNow(): Promise<Result<ListsView>> {
+  if (isDemo) {
+    demoLists.data_checked_secs = Math.floor(Date.now() / 1000);
+    return { ok: true, value: { ...demoLists } };
+  }
+  return call<ListsView>('check_lists_now');
 }
 
 /** Saved alerts of the last `hours`, newest first. */
