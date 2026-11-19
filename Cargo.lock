@@ -5009,7 +5009,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5027,7 +5027,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5040,11 +5040,11 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-core"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "whereabouts-data-bundle"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
@@ -5055,7 +5055,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-enrich"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "maxminddb",
  "psl",
@@ -5064,7 +5064,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-ipc"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5072,7 +5072,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-service"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ureq",
  "whereabouts-client",
@@ -5090,7 +5090,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-store"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "whereabouts-core",
@@ -5098,7 +5098,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-win-capture"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ferrisetw",
  "sha2 0.11.0",
@@ -5108,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-win-firewall"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5118,21 +5118,21 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-win-pipe"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "whereabouts-win-secrets"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "whereabouts-win-startup"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "windows 0.62.2",
 ]

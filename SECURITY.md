@@ -37,7 +37,8 @@ These are documented in the [threat model](docs/design-spec.md#8-threat-model):
 
 | Version | Supported |
 |---|---|
-| 0.1.x (developer preview) | Yes: security fixes go into the latest 0.1 release |
+| 0.2.x (developer preview) | Yes: security fixes go into the latest 0.2 release |
+| 0.1.x | No: please update to 0.2 |
 | Older commits | No |
 
-Version 0.1 is a developer preview. Until code signing is in place, its installer is not signed: check the SHA-256 checksum published with each release before running it.
+Version 0.2 is a developer preview. Until code signing is in place, its installer is not signed: check the SHA-256 checksum published with each release before running it.
