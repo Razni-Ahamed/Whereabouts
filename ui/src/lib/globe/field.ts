@@ -5,7 +5,15 @@
 // shows what the app is given (see pings.ts); it never makes activity up.
 
 import { countryCentre, isLand, landMask } from './geo.ts';
+import { regrid, sameCountries } from './grid.ts';
 import type { Ping } from './pings.ts';
+
+declare global {
+  interface Window {
+    /** Set by the desktop app (main.rs) while its window is minimised. */
+    __whereaboutsMinimized?: boolean;
+  }
+}
 
 export interface Globe {
   /** Countries with a connection now; true = a tracker (amber). */
@@ -81,10 +89,11 @@ const INTERACTIVE = '.glass, button, a, input, select, textarea, label, [role="d
 
 export function startGlobe(canvas: HTMLCanvasElement): Globe {
   const ctx = canvas.getContext('2d');
-  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+  let reduceMotion = motionQuery.matches;
   const mask = landMask();
 
-  let dpr = 1, W = 0, H = 0, cols = 0, rows = 0;
+  let dpr = 0, W = 0, H = 0, cols = 0, rows = 0;
   let atlas = document.createElement('canvas');
   let field = new Float32Array(0); // the still background: faint scattered characters
   let base = new Float32Array(0); // field + globe + glows, this frame
@@ -96,8 +105,10 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
   let ripples: Ripple[] = [];
   let rot = 0.4;
   let drag: { x: number; lastX: number; moved: boolean; onGlobe: boolean } | null = null;
-  let raf = 0, last = 0, stopped = false;
-  let minimized = false, paused = false;
+  let raf = 0, last = 0, stopped = false, running = false;
+  // The page may load while the window is already minimised: the app leaves the state here too.
+  let minimized = window.__whereaboutsMinimized === true;
+  let paused = minimized || document.hidden;
 
   let active = new Map<string, boolean>();
   const flashes = new Map<string, { t: number; warn: boolean }>();
@@ -130,30 +141,62 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
     });
   }
 
-  function resize() {
-    dpr = window.devicePixelRatio || 1;
+  const randomGlyph = () => (Math.random() * CHARS.length) | 0;
+  const randomField = () => {
+    const r = Math.random();
+    return r < 0.5 ? 0.075 + r * 0.09 : 0;
+  };
+
+  /** Fit the canvas to the window. Characters that still fit keep their place. */
+  function applyResize() {
+    const newDpr = window.devicePixelRatio || 1;
     W = window.innerWidth;
     H = window.innerHeight;
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
+    canvas.width = Math.round(W * newDpr);
+    canvas.height = Math.round(H * newDpr);
     canvas.style.width = `${W}px`;
     canvas.style.height = `${H}px`;
-    cols = Math.ceil(W / CELL_W);
-    rows = Math.ceil(H / CELL_H);
-    const n = cols * rows;
-    field = new Float32Array(n);
-    base = new Float32Array(n);
-    warmBase = new Float32Array(n);
-    heat = new Float32Array(n);
-    glyph = new Uint8Array(n);
-    for (let i = 0; i < n; i++) {
-      glyph[i] = (Math.random() * CHARS.length) | 0;
-      const r = Math.random();
-      field[i] = r < 0.5 ? 0.075 + r * 0.09 : 0;
+    const newCols = Math.ceil(W / CELL_W);
+    const newRows = Math.ceil(H / CELL_H);
+    if (newCols !== cols || newRows !== rows) {
+      glyph = regrid(glyph, cols, rows, newCols, newRows, randomGlyph);
+      field = regrid(field, cols, rows, newCols, newRows, randomField);
+      cols = newCols;
+      rows = newRows;
+      const n = cols * rows;
+      base = new Float32Array(n);
+      warmBase = new Float32Array(n);
+      heat = new Float32Array(n);
     }
-    ripples = [];
-    buildAtlas();
+    if (newDpr !== dpr) {
+      dpr = newDpr;
+      buildAtlas();
+    }
     if (reduceMotion) draw(now());
+  }
+
+  /** Resize once per frame, however many resize events arrive. */
+  let resizeQueued = false;
+  function scheduleResize() {
+    if (resizeQueued) return;
+    resizeQueued = true;
+    requestAnimationFrame(() => {
+      resizeQueued = false;
+      if (!stopped) applyResize();
+    });
+  }
+
+  // Moving to a screen with another scale changes the pixel ratio, sometimes
+  // without a resize event: watch the ratio itself.
+  let dprQuery: MediaQueryList | null = null;
+  function watchDpr() {
+    dprQuery?.removeEventListener('change', onDprChange);
+    dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    dprQuery.addEventListener('change', onDprChange);
+  }
+  function onDprChange() {
+    watchDpr();
+    scheduleResize();
   }
 
   /** Where a latitude/longitude is on screen, and whether it faces us. */
@@ -318,21 +361,44 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
     draw(t, dt || 1 / TUNED_FPS);
   }
 
-  /** Stop drawing while the window is minimised or the page hidden. */
-  function updatePaused() {
-    const shouldPause = minimized || document.hidden;
-    if (shouldPause === paused || stopped) return;
-    paused = shouldPause;
-    if (paused) {
-      cancelAnimationFrame(raf);
-    } else {
+  /** Run the loop only while motion is allowed and the window can be seen. */
+  function syncLoop() {
+    const shouldRun = !stopped && !reduceMotion && !paused;
+    if (shouldRun && !running) {
+      running = true;
       last = 0;
       raf = requestAnimationFrame(tick);
+    } else if (!shouldRun && running) {
+      running = false;
+      cancelAnimationFrame(raf);
     }
+  }
+
+  /** Stop drawing while the window is minimised or the page hidden. */
+  function updatePaused() {
+    paused = minimized || document.hidden;
+    // Connections that came while nobody could see them are not flashed later as if live.
+    if (paused) queue.length = 0;
+    syncLoop();
   }
   function onMinimized(e: Event) {
     minimized = (e as CustomEvent<boolean>).detail === true;
     updatePaused();
+  }
+
+  /** The system's "reduce motion" can change while the app runs. */
+  function onMotionChange() {
+    reduceMotion = motionQuery.matches;
+    listenToPointer(!reduceMotion);
+    if (reduceMotion) {
+      ripples = [];
+      queue.length = 0;
+      flashes.clear();
+      drag = null;
+      mx = my = -1e4;
+    }
+    syncLoop();
+    if (reduceMotion && !stopped) draw(now());
   }
 
   const isBackground = (target: EventTarget | null) => target instanceof Element && !target.closest(INTERACTIVE);
@@ -364,48 +430,47 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
     drag = null;
   }
 
-  resize();
-  window.addEventListener('resize', resize);
-  if (!reduceMotion) {
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerdown', onDown);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onCancel);
-    window.addEventListener('blur', onCancel);
-    document.documentElement.addEventListener('pointerleave', onLeave);
-    window.addEventListener('whereabouts:minimized', onMinimized);
-    document.addEventListener('visibilitychange', updatePaused);
-    raf = requestAnimationFrame(tick);
+  function listenToPointer(on: boolean) {
+    const method = on ? 'addEventListener' : 'removeEventListener';
+    window[method]('pointermove', onMove as EventListener);
+    window[method]('pointerdown', onDown as EventListener);
+    window[method]('pointerup', onUp as EventListener);
+    window[method]('pointercancel', onCancel);
+    window[method]('blur', onCancel);
+    document.documentElement[method]('pointerleave', onLeave);
   }
+
+  applyResize();
+  watchDpr();
+  window.addEventListener('resize', scheduleResize);
+  window.addEventListener('whereabouts:minimized', onMinimized);
+  document.addEventListener('visibilitychange', updatePaused);
+  motionQuery.addEventListener('change', onMotionChange);
+  listenToPointer(!reduceMotion);
+  syncLoop();
 
   return {
     setActive(countries) {
+      const changed = !sameCountries(active, countries);
       active = new Map(countries);
-      if (reduceMotion && !stopped) draw(now());
+      // With reduced motion there is no loop: redraw only when something changed.
+      if (reduceMotion && changed && !stopped) draw(now());
     },
     ping(p) {
-      if (reduceMotion) {
-        if (!stopped) {
-          flashes.set(p.country, { t: now(), warn: p.warn });
-          draw(now());
-        }
-        return;
-      }
+      // No flashes with reduced motion, nor while nobody can see them.
+      if (reduceMotion || paused || stopped) return;
       queue.push(p);
       if (queue.length > MAX_QUEUE) queue.shift();
     },
     stop() {
       stopped = true;
-      cancelAnimationFrame(raf);
-      window.removeEventListener('resize', resize);
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerdown', onDown);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onCancel);
-      window.removeEventListener('blur', onCancel);
-      document.documentElement.removeEventListener('pointerleave', onLeave);
+      syncLoop();
+      listenToPointer(false);
+      window.removeEventListener('resize', scheduleResize);
       window.removeEventListener('whereabouts:minimized', onMinimized);
       document.removeEventListener('visibilitychange', updatePaused);
+      motionQuery.removeEventListener('change', onMotionChange);
+      dprQuery?.removeEventListener('change', onDprChange);
     },
   };
 }
