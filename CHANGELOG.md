@@ -4,6 +4,16 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- **A living background.** The background is now a slowly turning globe drawn in characters. Countries your apps are connected to right now glow, and when an app connects somewhere new, that country flashes (amber for trackers). It uses only what the app already shows: nothing new is collected or sent, and nothing flashes that did not happen. Moving the mouse stirs the characters, a click on the background sends a wave, and you can drag the globe to spin it. There is no "you are here" marker: Whereabouts does not know or guess where you are.
+- **Lighter on your computer.** The background stops while the window is minimised (Windows' web view kept drawing before) and draws slowly at rest. With the window open it now uses about a quarter of one processor core, down from about one core in 0.2.0. With Windows' "Animation effects" turned off, it stays still and changes only when your connections do.
+
+### Fixed
+
+- The frosted-glass cards now blur what is behind them. A screen's fade-in animation stayed in effect after it ended, which switched the blur off for every card on that screen.
+- CI runs the UI's own tests (Node's built-in test runner; no new packages).
+
 ## [0.2.0] - 2026-11-20
 
 *Control.* Whereabouts can now block apps, sites and addresses, warn you, and keep its lists current.
