@@ -208,8 +208,10 @@ button {
   color: var(--text-muted);
 }
 
+/* `backwards`, not `both`: an opacity animation left in effect after it ends
+   makes the element a backdrop root, and the glass inside it stops blurring. */
 .fade-in {
-  animation: fade-in 0.5s var(--ease) both;
+  animation: fade-in 0.5s var(--ease) backwards;
 }
 @keyframes fade-in {
   from {

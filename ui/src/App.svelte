@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { CircleAlert, CircleCheck, FlaskConical, ShieldOff, X } from '@lucide/svelte';
-  import Backdrop from './lib/components/Backdrop.svelte';
+  import GlobeBackdrop from './lib/components/GlobeBackdrop.svelte';
   import FirstRun from './lib/components/FirstRun.svelte';
   import ListsQuestion from './lib/components/ListsQuestion.svelte';
   import Logo from './lib/components/Logo.svelte';
@@ -55,7 +55,7 @@
   };
 </script>
 
-<Backdrop />
+<GlobeBackdrop flows={store.live?.flows ?? []} />
 
 {#if store.settings && !store.settings.first_run_done}
   <FirstRun settings={store.settings} />
