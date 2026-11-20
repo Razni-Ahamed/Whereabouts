@@ -208,6 +208,14 @@ button {
   color: var(--text-muted);
 }
 
+/* Out of sight (minimised or hidden; see main.ts): nothing animates. */
+:root[data-out-of-sight] *,
+:root[data-out-of-sight] *::before,
+:root[data-out-of-sight] *::after {
+  animation-play-state: paused !important;
+  transition: none !important;
+}
+
 /* `backwards`, not `both`: an opacity animation left in effect after it ends
    makes the element a backdrop root, and the glass inside it stops blurring. */
 .fade-in {

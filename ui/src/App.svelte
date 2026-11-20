@@ -267,7 +267,8 @@
   .good .dot {
     background: var(--accent);
     box-shadow: 0 0 0 0 rgb(95 224 195 / 0.6);
-    animation: pulse 2.4s infinite;
+    /* A few pulses, then rest: a pulse that never stops makes WebView2 recomposite the glass every frame. */
+    animation: pulse 2.4s 3;
   }
   .warn .dot {
     background: var(--warn);
