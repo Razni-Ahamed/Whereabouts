@@ -1,16 +1,17 @@
 <script lang="ts">
-  // The backdrop: a globe of characters (lib/globe/field.ts). Countries with a
-  // connection now glow; a new connection flashes its country, amber for
-  // trackers. Only what the live view already shows is used.
+  // The backdrop: a globe of characters (lib/globe/field.ts). Countries with an
+  // open connection glow; a new connection flashes its country, amber for
+  // trackers. Only what the live view already shows is used. While the service
+  // is unreachable the app passes no flows, so nothing glows that may be stale.
   import { onMount } from 'svelte';
   import { startGlobe, type Globe } from '../globe/field.ts';
   import { PingTracker, activeCountries } from '../globe/pings.ts';
   import { isTracking } from '../state.svelte';
   import type { FlowView } from '../types';
 
-  let { flows }: { flows: FlowView[] } = $props();
+  let { flows, uptime }: { flows: FlowView[]; uptime: number } = $props();
   let canvas: HTMLCanvasElement | undefined = $state();
-  let globe: Globe | undefined = $state();
+  let globe: Globe | undefined = $state.raw();
   const tracker = new PingTracker(isTracking);
 
   onMount(() => {
@@ -22,7 +23,7 @@
 
   $effect(() => {
     if (!globe) return;
-    for (const p of tracker.update(flows)) globe.ping(p);
+    for (const p of tracker.update(flows, uptime, Date.now() / 1000)) globe.ping(p);
     globe.setActive(activeCountries(flows, isTracking));
   });
 </script>

@@ -74,6 +74,11 @@ const SEEDS: Seed[] = [
 
 const started = Date.now() - 3 * 3600 * 1000 - 17 * 60 * 1000;
 
+/** A connection that comes back reaches another server (as CDNs do), so it is new each time. */
+function nextAddress(remote: string, cycle: number): string {
+  return remote.replace(/\.(\d+):/, (_, octet: string) => `.${((Number(octet) + cycle) % 254) + 1}:`);
+}
+
 export function demoLive(): Live {
   const elapsed = (Date.now() - started) / 1000;
   // Traffic that always grows, in bursts: the integral of
@@ -92,7 +97,7 @@ export function demoLive(): Live {
     via: s.via ?? null,
     owner: s.owner,
     country: s.country,
-    remote: s.remote,
+    remote: s.comes ? nextAddress(s.remote, Math.floor((elapsed / 9 + i) / (2 * Math.PI))) : s.remote,
     bytes_sent: Math.round(s.sent + grown(i) * s.rate * 9_000),
     bytes_received: Math.round(s.received + grown(i + 3) * s.rate * 42_000),
     active: i % 7 !== 6,

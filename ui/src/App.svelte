@@ -55,7 +55,7 @@
   };
 </script>
 
-<GlobeBackdrop flows={store.live?.flows ?? []} />
+<GlobeBackdrop flows={store.problem ? [] : (store.live?.flows ?? [])} uptime={store.live?.status.uptime_secs ?? 0} />
 
 {#if store.settings && !store.settings.first_run_done}
   <FirstRun settings={store.settings} />

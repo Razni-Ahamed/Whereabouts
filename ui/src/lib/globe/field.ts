@@ -339,8 +339,9 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
 
   function onMove(e: PointerEvent) {
     mx = e.clientX;
-    movedAt = now();
     my = e.clientY;
+    movedAt = now();
+    if (drag && e.buttons === 0) drag = null; // the button came up where we did not hear it
     if (!drag) return;
     if (Math.abs(e.clientX - drag.x) > 4) drag.moved = true;
     if (drag.onGlobe) rot -= (e.clientX - drag.lastX) / globe().R;
@@ -358,6 +359,10 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
   function onLeave() {
     mx = my = -1e4;
   }
+  /** A drag that ends without a pointerup (a cancelled touch, lost focus). */
+  function onCancel() {
+    drag = null;
+  }
 
   resize();
   window.addEventListener('resize', resize);
@@ -365,6 +370,8 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerdown', onDown);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    window.addEventListener('blur', onCancel);
     document.documentElement.addEventListener('pointerleave', onLeave);
     window.addEventListener('whereabouts:minimized', onMinimized);
     document.addEventListener('visibilitychange', updatePaused);
@@ -394,6 +401,8 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerdown', onDown);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      window.removeEventListener('blur', onCancel);
       document.documentElement.removeEventListener('pointerleave', onLeave);
       window.removeEventListener('whereabouts:minimized', onMinimized);
       document.removeEventListener('visibilitychange', updatePaused);
