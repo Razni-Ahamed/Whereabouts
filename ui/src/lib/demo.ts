@@ -43,6 +43,8 @@ interface Seed {
   sent: number;
   received: number;
   rate: number;
+  /** Comes and goes (about half the time), so the preview shows new connections. */
+  comes?: boolean;
 }
 
 const SEEDS: Seed[] = [
@@ -59,18 +61,23 @@ const SEEDS: Seed[] = [
   { pid: 3388, app: 'steam.exe', publisher: 'Valve Corp.', domain: 'cache8-sin1.steamcontent.com', owner: 'Valve Corporation', country: 'SG', remote: '103.10.124.98:443', sent: 640_000, received: 210_000_000, rate: 1.1 },
   { pid: 4410, app: 'svchost.exe', publisher: 'Microsoft Windows Publisher', protocol: 'UDP', domain: null, owner: 'local network', country: null, remote: '192.168.1.1:53', sent: 38_000, received: 91_000, rate: 0.1 },
   { pid: 4410, app: 'svchost.exe', publisher: 'Microsoft Windows Publisher', domain: 'settings-win.data.microsoft.com', owner: 'Microsoft · diagnostics', country: 'US', remote: '20.42.65.85:443', sent: 210_000, received: 52_000, rate: 0.1 },
-  { pid: 9921, app: 'updater.exe', publisher: 'UNSIGNED', domain: 'cdn.freeware-updates.net', trust: 'app_reported', owner: 'DigitalOcean, LLC', country: 'DE', remote: '164.92.137.55:443', sent: 2_400, received: 1_900_000, rate: 0.05 },
+  { pid: 9921, app: 'updater.exe', publisher: 'UNSIGNED', domain: 'cdn.freeware-updates.net', trust: 'app_reported', owner: 'DigitalOcean, LLC', country: 'DE', remote: '164.92.137.55:443', sent: 2_400, received: 1_900_000, rate: 0.05, comes: true },
   { pid: 2216, app: 'Code.exe', publisher: 'Microsoft Corporation', domain: 'marketplace.visualstudio.com', owner: 'Microsoft Corporation', country: 'US', remote: '13.107.6.175:443', sent: 120_000, received: 3_400_000, rate: 0.2 },
   { pid: 2216, app: 'Code.exe', publisher: 'Microsoft Corporation', domain: 'dc.services.visualstudio.com', owner: 'Microsoft · diagnostics', country: 'US', remote: '20.189.173.5:443', sent: 66_000, received: 8_000, rate: 0.05 },
-  { pid: 1404, app: 'zoom.exe', publisher: 'Zoom Video Communications, Inc.', protocol: 'UDP', domain: 'zoomsg.zoom.us', owner: 'Zoom Video Communications', country: 'SG', remote: '149.137.9.12:8801', sent: 3_100_000, received: 3_600_000, rate: 0.6 },
+  { pid: 1404, app: 'zoom.exe', publisher: 'Zoom Video Communications, Inc.', protocol: 'UDP', domain: 'zoomsg.zoom.us', owner: 'Zoom Video Communications', country: 'SG', remote: '149.137.9.12:8801', sent: 3_100_000, received: 3_600_000, rate: 0.6, comes: true },
   // The same destination twice (an earlier, closed flow), as the service can report.
   { pid: 2216, app: 'Code.exe', publisher: 'Microsoft Corporation', domain: 'marketplace.visualstudio.com', owner: 'Microsoft Corporation', country: 'US', remote: '13.107.6.175:443', sent: 40_000, received: 900_000, rate: 0.01 },
   // A tracker hidden behind a site's own name (CNAME cloaking).
-  { pid: 8124, app: 'chrome.exe', publisher: 'Google LLC', domain: 'metrics.shop.example', via: 'shop.example.sc.omtrdc.net', owner: 'Adobe · analytics', country: 'US', remote: '63.140.38.12:443', sent: 12_400, received: 3_100, rate: 0.05 },
-  { pid: 8124, app: 'chrome.exe', publisher: 'Google LLC', domain: 'news.lk', owner: 'Sri Lanka Telecom PLC', country: 'LK', remote: '222.165.164.34:443', sent: 34_000, received: 2_100_000, rate: 0.2 },
+  { pid: 8124, app: 'chrome.exe', publisher: 'Google LLC', domain: 'metrics.shop.example', via: 'shop.example.sc.omtrdc.net', owner: 'Adobe · analytics', country: 'US', remote: '63.140.38.12:443', sent: 12_400, received: 3_100, rate: 0.05, comes: true },
+  { pid: 8124, app: 'chrome.exe', publisher: 'Google LLC', domain: 'news.lk', owner: 'Sri Lanka Telecom PLC', country: 'LK', remote: '222.165.164.34:443', sent: 34_000, received: 2_100_000, rate: 0.2, comes: true },
 ];
 
 const started = Date.now() - 3 * 3600 * 1000 - 17 * 60 * 1000;
+
+/** A connection that comes back reaches another server (as CDNs do), so it is new each time. */
+function nextAddress(remote: string, cycle: number): string {
+  return remote.replace(/\.(\d+):/, (_, octet: string) => `.${((Number(octet) + cycle) % 254) + 1}:`);
+}
 
 export function demoLive(): Live {
   const elapsed = (Date.now() - started) / 1000;
@@ -90,11 +97,13 @@ export function demoLive(): Live {
     via: s.via ?? null,
     owner: s.owner,
     country: s.country,
-    remote: s.remote,
+    remote: s.comes ? nextAddress(s.remote, Math.floor((elapsed / 9 + i) / (2 * Math.PI))) : s.remote,
     bytes_sent: Math.round(s.sent + grown(i) * s.rate * 9_000),
     bytes_received: Math.round(s.received + grown(i + 3) * s.rate * 42_000),
     active: i % 7 !== 6,
-  })).sort((a, b) => b.bytes_sent + b.bytes_received - (a.bytes_sent + a.bytes_received));
+  }))
+    .filter((_, i) => !SEEDS[i]!.comes || Math.sin(elapsed / 9 + i) > 0)
+    .sort((a, b) => b.bytes_sent + b.bytes_received - (a.bytes_sent + a.bytes_received));
   return {
     version: '0.1.0',
     status: {

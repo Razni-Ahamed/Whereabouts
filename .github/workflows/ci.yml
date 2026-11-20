@@ -41,6 +41,9 @@ jobs:
       - name: Check the UI (Svelte and TypeScript)
         working-directory: ui
         run: npm run check
+      - name: Test the UI
+        working-directory: ui
+        run: npm test
       - name: Build the UI
         working-directory: ui
         run: npm run build

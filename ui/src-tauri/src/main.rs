@@ -18,10 +18,12 @@ mod settings;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use settings::{AppState, SettingsFile};
-use tauri::{Manager, RunEvent};
+use tauri::webview::PageLoadEvent;
+use tauri::{Manager, RunEvent, WindowEvent};
 use whereabouts_win_startup::BACKGROUND_ARG;
 
 use serde::Serialize;
@@ -592,6 +594,45 @@ fn keeps_running(app: &tauri::AppHandle) -> bool {
             .is_some_and(|exe| whereabouts_win_startup::is_enabled(&exe).unwrap_or(false))
 }
 
+/// Whether the main window is minimised, as last told to its page.
+static MINIMIZED: AtomicBool = AtomicBool::new(false);
+
+/// The script that tells the page whether its window is minimised: it leaves
+/// the state where a page still loading will read it, and tells a running page.
+fn minimized_script(minimized: bool) -> String {
+    format!(
+        "window.__whereaboutsMinimized = {minimized};          window.dispatchEvent(new CustomEvent('whereabouts:minimized', {{ detail: {minimized} }}))"
+    )
+}
+
+/// Tells the page when its window is minimised or restored, so it can pause
+/// its animated background: WebView2 keeps drawing while minimised. A script
+/// call from here rather than an event, so the page needs no extra permission.
+fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
+    match event {
+        WindowEvent::Resized(_) => {
+            let minimized = window.is_minimized().unwrap_or(false);
+            if MINIMIZED.swap(minimized, Ordering::Relaxed) != minimized
+                && let Some(webview) = window.app_handle().get_webview_window(window.label())
+            {
+                let _ = webview.eval(minimized_script(minimized));
+            }
+        }
+        WindowEvent::Destroyed => MINIMIZED.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+/// A page that (re)loads while the window is minimised has missed the last
+/// change: tell it the current state.
+fn on_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+    if payload.event() == PageLoadEvent::Finished {
+        let minimized = webview.window().is_minimized().unwrap_or(false);
+        MINIMIZED.store(minimized, Ordering::Relaxed);
+        let _ = webview.eval(minimized_script(minimized));
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         // First, so a second start only brings the running app forward.
@@ -603,6 +644,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(Connection::default()))
+        .on_window_event(on_window_event)
+        .on_page_load(on_page_load)
         .setup(|app| {
             let background_start = std::env::args().any(|arg| arg == BACKGROUND_ARG);
             let file = SettingsFile::in_dir(&app.path().app_config_dir()?);

@@ -4,6 +4,8 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -12,5 +14,8 @@
     "skipLibCheck": true,
     "types": ["svelte", "vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts"],
+  // Tests run under Node's own runner (type stripping, no type check): they use
+  // node:test, whose types are not installed.
+  "exclude": ["src/**/*.test.ts"]
 }

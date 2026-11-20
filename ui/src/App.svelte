@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { CircleAlert, CircleCheck, FlaskConical, ShieldOff, X } from '@lucide/svelte';
-  import Backdrop from './lib/components/Backdrop.svelte';
+  import GlobeBackdrop from './lib/components/GlobeBackdrop.svelte';
   import FirstRun from './lib/components/FirstRun.svelte';
   import ListsQuestion from './lib/components/ListsQuestion.svelte';
   import Logo from './lib/components/Logo.svelte';
@@ -55,7 +55,7 @@
   };
 </script>
 
-<Backdrop />
+<GlobeBackdrop flows={store.problem ? [] : (store.live?.flows ?? [])} uptime={store.live?.status.uptime_secs ?? 0} />
 
 {#if store.settings && !store.settings.first_run_done}
   <FirstRun settings={store.settings} />
@@ -267,7 +267,8 @@
   .good .dot {
     background: var(--accent);
     box-shadow: 0 0 0 0 rgb(95 224 195 / 0.6);
-    animation: pulse 2.4s infinite;
+    /* A few pulses, then rest: a pulse that never stops makes WebView2 recomposite the glass every frame. */
+    animation: pulse 2.4s 3;
   }
   .warn .dot {
     background: var(--warn);
