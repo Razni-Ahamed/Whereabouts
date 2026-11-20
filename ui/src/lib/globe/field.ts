@@ -24,6 +24,14 @@ const HOVER_RADIUS = 150;
 const MAX_RIPPLES = 8;
 const PING_GAP_S = 0.35;
 const SPIN = 0.07; // radians per second
+// Frames per second. The glass above the canvas is recomposited every frame,
+// so the globe draws slowly at rest (it turns about three characters a second,
+// so nothing is lost) and smoothly only while something moves.
+const BUSY_FRAME_S = 1 / 30;
+const IDLE_FRAME_S = 1 / 10;
+/** Per-frame rates below are tuned for 30 fps and scaled by the real frame time. */
+const TUNED_FPS = 30;
+const MAX_QUEUE = 8;
 const TILT = 0.38;
 
 type Rgb = [number, number, number];
@@ -84,11 +92,12 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
   let heat = new Float32Array(0); // how stirred a character is
   let glyph = new Uint8Array(0);
 
-  let mx = -1e4, my = -1e4;
+  let mx = -1e4, my = -1e4, movedAt = -10;
   let ripples: Ripple[] = [];
   let rot = 0.4;
   let drag: { x: number; lastX: number; moved: boolean; onGlobe: boolean } | null = null;
   let raf = 0, last = 0, stopped = false;
+  let minimized = false, paused = false;
 
   let active = new Map<string, boolean>();
   const flashes = new Map<string, { t: number; warn: boolean }>();
@@ -232,7 +241,9 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
     if (at.visible) addRipple(at.x, at.y, t, { speed: 150, life: 2.2, strength: 0.6, warn: p.warn });
   }
 
-  function draw(t: number) {
+  function draw(t: number, dt = 1 / TUNED_FPS) {
+    const steps = dt * TUNED_FPS;
+    const decay = 0.9 ** steps;
     if (!ctx) return;
     base.set(field);
     warmBase.fill(0);
@@ -263,7 +274,7 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
         const i = row * cols + col;
         const x = col * CELL_W + CELL_W / 2;
         let v = base[i]!;
-        let h = heat[i]! * 0.9;
+        let h = heat[i]! * decay;
         let warm = warmBase[i]!;
 
         const dh = Math.hypot(x - mx, y - my);
@@ -283,7 +294,7 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
         }
         heat[i] = h;
 
-        if (!reduceMotion && Math.random() < 0.0015 + h * 0.5) glyph[i] = (Math.random() * CHARS.length) | 0;
+        if (!reduceMotion && Math.random() < (0.0015 + h * 0.5) * steps) glyph[i] = (Math.random() * CHARS.length) | 0;
         const level = Math.min(LEVELS - 1, Math.floor(v * LEVELS));
         if (level < 1) continue;
         const p = warm > 0.25 ? 1 : 0;
@@ -293,7 +304,10 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
   }
 
   function tick(ms: number) {
+    raf = requestAnimationFrame(tick);
     const t = ms / 1000;
+    const busy = drag !== null || ripples.length > 0 || queue.length > 0 || flashes.size > 0 || t - movedAt < 1.5;
+    if (last && t - last < (busy ? BUSY_FRAME_S : IDLE_FRAME_S) - 0.002) return;
     const dt = last ? Math.min(0.1, t - last) : 0;
     last = t;
     if (!drag?.onGlobe) rot += dt * SPIN;
@@ -301,14 +315,31 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
       firePing(queue.shift()!, t);
       nextPingAt = t + PING_GAP_S;
     }
-    draw(t);
-    raf = requestAnimationFrame(tick);
+    draw(t, dt || 1 / TUNED_FPS);
+  }
+
+  /** Stop drawing while the window is minimised or the page hidden. */
+  function updatePaused() {
+    const shouldPause = minimized || document.hidden;
+    if (shouldPause === paused || stopped) return;
+    paused = shouldPause;
+    if (paused) {
+      cancelAnimationFrame(raf);
+    } else {
+      last = 0;
+      raf = requestAnimationFrame(tick);
+    }
+  }
+  function onMinimized(e: Event) {
+    minimized = (e as CustomEvent<boolean>).detail === true;
+    updatePaused();
   }
 
   const isBackground = (target: EventTarget | null) => target instanceof Element && !target.closest(INTERACTIVE);
 
   function onMove(e: PointerEvent) {
     mx = e.clientX;
+    movedAt = now();
     my = e.clientY;
     if (!drag) return;
     if (Math.abs(e.clientX - drag.x) > 4) drag.moved = true;
@@ -335,6 +366,8 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
     window.addEventListener('pointerdown', onDown);
     window.addEventListener('pointerup', onUp);
     document.documentElement.addEventListener('pointerleave', onLeave);
+    window.addEventListener('whereabouts:minimized', onMinimized);
+    document.addEventListener('visibilitychange', updatePaused);
     raf = requestAnimationFrame(tick);
   }
 
@@ -352,6 +385,7 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
         return;
       }
       queue.push(p);
+      if (queue.length > MAX_QUEUE) queue.shift();
     },
     stop() {
       stopped = true;
@@ -361,6 +395,8 @@ export function startGlobe(canvas: HTMLCanvasElement): Globe {
       window.removeEventListener('pointerdown', onDown);
       window.removeEventListener('pointerup', onUp);
       document.documentElement.removeEventListener('pointerleave', onLeave);
+      window.removeEventListener('whereabouts:minimized', onMinimized);
+      document.removeEventListener('visibilitychange', updatePaused);
     },
   };
 }
