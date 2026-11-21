@@ -20,6 +20,7 @@ use tauri::{AppHandle, Manager, WebviewWindowBuilder, Wry};
 use tauri_plugin_notification::NotificationExt;
 use whereabouts_client::{Client, Problem, unexpected};
 use whereabouts_core::text::display_safe;
+use whereabouts_ipc::notify::AlertLimiter;
 use whereabouts_ipc::{
     AlertKind, AlertView, NoticeKind, PIPE_NAME, Request, Response, Severity, Status,
 };
@@ -34,9 +35,6 @@ const DOWN_AFTER: Duration = Duration::from_secs(20);
 const PAUSED_REMINDER: Duration = Duration::from_secs(60 * 60);
 /// At most one "new app" notification this often; more are grouped.
 const NEW_APPS_EVERY: Duration = Duration::from_secs(60);
-/// At most one alert notification per app (or per kind of system alert)
-/// this often, except critical ones (design spec §6.4).
-const ALERTS_PER_APP_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How often the tracker summary is sent.
 const DIGEST_EVERY: u64 = 24 * 60 * 60;
 
@@ -209,8 +207,10 @@ struct Checker {
     /// New apps waiting to be announced, and when the last announcement was.
     new_apps: Vec<String>,
     last_new_apps: Option<Instant>,
-    /// When an alert was last notified, per app (or kind of system alert).
-    alerted: HashMap<String, Instant>,
+    /// Which alerts are notified (shared with the lab: `ipc::notify`).
+    alerts: AlertLimiter,
+    /// When the checker started (the limiter counts seconds from then).
+    started: Option<Instant>,
 }
 
 /// An alert notice.
@@ -362,22 +362,17 @@ impl Checker {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .show_names;
+        let now_secs = now
+            .duration_since(*self.started.get_or_insert(now))
+            .as_secs();
         for alert in alerts {
-            if alert.severity < Severity::Medium {
-                continue;
-            }
             let who = alert
                 .app
                 .clone()
                 .unwrap_or_else(|| format!("{:?}", alert.kind));
-            let recent = self
-                .alerted
-                .get(&who)
-                .is_some_and(|last| now.duration_since(*last) < ALERTS_PER_APP_EVERY);
-            if recent && alert.severity < Severity::Critical {
+            if !self.alerts.allow(&who, alert.severity, now_secs) {
                 continue;
             }
-            self.alerted.insert(who, now);
             let (title, body) = alert_text(&alert, show_names);
             notify(app, &title, &body);
         }

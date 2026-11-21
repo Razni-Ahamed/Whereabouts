@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod notify;
+
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
 
