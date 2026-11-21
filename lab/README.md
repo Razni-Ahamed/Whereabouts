@@ -54,4 +54,5 @@ Python runs only through uv (the version is pinned in `.python-version`, depende
 
 - The capture is the engine's CSV export: no process IDs and no DNS alias chains, so trackers hidden behind a site's own name are not detected in the lab (they are in the app).
 - New-app notices are not measured.
+- GitHub's runner agents (`Runner.Worker.exe`, the Azure guest agents, `provjobd.exe…`) are dropped from the data; `info.json` records how many flows were dropped.
 - Steam is left out (its terms assume an account); apps run logged out, so their traffic is start-up, update and telemetry chatter, not active use.

@@ -463,6 +463,21 @@ Implementation notes (v0.2, N5 Layer 1 alerts, 2026-11-19):
 
 The lab harness lives in `/lab` and may use Python for analysis and charts. Python is never part of the shipped app.
 
+Implementation notes (v0.3, L0 lab harness, 2026-11-21; see `lab/README.md`):
+
+| Decision | Reason |
+|---|---|
+| Sessions run on **GitHub-hosted Windows runners** (fresh VM per job), workflow `lab.yml`, by hand or weekly, never on pull requests | The development PC (Windows 11 Home) has no Hyper-V (D18); runners give a clean machine per session and never touch user data. |
+| Apps run **logged out**, launch only; each app's terms are recorded in `lab/APPS.md`; Steam is left out | No accounts or tokens in CI; Steam's terms assume an account and ban non-human-controlled use. |
+| The capture is the engine's own **CSV export** plus `session.json` (apps, versions, SHA-256, health counters from `--status --json`, live-scenario labels); GitHub's runner agents are dropped from the data | One format, no new capture code in the app; the runner's own agents exist on no real PC. |
+| Short sessions are **stitched into simulated user-weeks** (7 learning days, 7 test days) with **disjoint learning and test pools** per persona | "False alarms per user-week" needs weeks; sharing sessions between a user's two weeks would hide novelty-based false alarms (leakage). |
+| Live scenarios only reach example.com (listed as a test `SBL-LAB` entry next to Spamhaus' DROP, downloaded per run and never uploaded) and wikipedia.org (from a renamed copy of curl); upload, beaconing, random domains and swapped programs are **synthetic rows** with labels | Nothing risky is contacted and nothing is uploaded to third parties. |
+| Detection runs through the **shipped code**: the Layer 1 detector moved into `whereabouts-detect`, and the app's notification rule into `whereabouts_ipc::notify`; `whereabouts-lab-replay` (never bundled) replays each simulated user with a fresh encrypted store | The lab measures what users get, not a re-implementation. |
+| Scoring: a **medium-or-higher** alert for the same user and app within a scenario's window + 1 h detects it; a repeat the same day after a detection counts as covered; every other test-week alert is a false alarm | Tracker contacts (info) are background, not detections; the detector alerts once per app and address a day. |
+| Known gaps: no process IDs or DNS alias chains in the export; new-app notices not measured | Listed in every report. |
+
+First run (2026-11-21, run 44848943887; 3-minute sessions, 2 per persona, 1 simulated user per persona — a smoke run, not a measurement): **Layer 1 baseline** — 0.00 false alarms per user-week at medium and up; known-bad host detected in every instance; upload, beaconing, random domains, renamed and swapped programs: 0 % (expected: Layer 1 only knows lists; these are Layer 2's job).
+
 ---
 
 ## 7. Outbound requests made by the app itself
