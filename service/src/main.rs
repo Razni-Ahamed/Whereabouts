@@ -36,6 +36,7 @@ Options:
   --seconds <N>        With --console, stop after N seconds
   --status             Ask the running Whereabouts how it is doing, and show
                        the top flows and apps
+  --json               With --status, print only the status as one line of JSON
   --history            Show what is saved: top apps of the last 24 hours
   --export <FILE>      Write all saved flows to a CSV file
   --delete-all --yes   Delete all saved flows and totals (cannot be undone)
@@ -81,7 +82,10 @@ enum Command {
     Console {
         limit: Option<Duration>,
     },
-    Status,
+    Status {
+        /// Print the status as one line of JSON (for scripts, e.g. the lab).
+        json: bool,
+    },
     History,
     Export(PathBuf),
     DeleteAll {
@@ -109,6 +113,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut console = false;
     let mut seconds = None;
     let mut status = false;
+    let mut json = false;
     let mut history = false;
     let mut export = None;
     let mut delete_all = false;
@@ -142,6 +147,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 seconds = Some(Duration::from_secs(n));
             }
             "--status" => status = true,
+            "--json" => json = true,
             "--history" => history = true,
             "--export" => {
                 let value = iter.next().ok_or("--export needs a file name")?;
@@ -225,6 +231,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
              --install, --uninstall, --register, --unregister, or a blocking command",
         ));
     }
+    if json && !status {
+        return Err(String::from("--json works only with --status"));
+    }
     if seconds.is_some() && !console {
         return Err(String::from("--seconds only works with --console"));
     }
@@ -260,7 +269,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     Ok(if console {
         Command::Console { limit: seconds }
     } else if status {
-        Command::Status
+        Command::Status { json }
     } else if history {
         Command::History
     } else if let Some(path) = export {
@@ -294,7 +303,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Ok(Command::Console { limit }) => console::run(limit),
-        Ok(Command::Status) => client::status(),
+        Ok(Command::Status { json }) => client::status(json),
         Ok(Command::History) => storage::show_history(),
         Ok(Command::Export(path)) => storage::export(&path),
         Ok(Command::DeleteAll { confirmed }) => storage::delete_all(confirmed),
@@ -356,7 +365,18 @@ mod tests {
 
     #[test]
     fn parses_storage_commands() {
-        assert_eq!(parse_args(&args(&["--status"])), Ok(Command::Status));
+        assert_eq!(
+            parse_args(&args(&["--status"])),
+            Ok(Command::Status { json: false })
+        );
+        assert_eq!(
+            parse_args(&args(&["--status", "--json"])),
+            Ok(Command::Status { json: true })
+        );
+        assert_eq!(
+            parse_args(&args(&["--json"])),
+            Err(String::from("--json works only with --status"))
+        );
         assert_eq!(parse_args(&args(&["--history"])), Ok(Command::History));
         assert_eq!(
             parse_args(&args(&["--export", "out.csv"])),

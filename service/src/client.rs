@@ -19,9 +19,15 @@ const SHOW_FLOWS: u32 = 10;
 /// Apps shown by `--status`.
 const SHOW_APPS: u32 = 5;
 
-/// `--status`: prints the running service's status.
-pub fn status() -> ExitCode {
-    match show_status(PIPE_NAME) {
+/// `--status`: prints the running service's status (with `json`, only the
+/// status, as one line of JSON).
+pub fn status(json: bool) -> ExitCode {
+    let result = if json {
+        status_json(PIPE_NAME)
+    } else {
+        show_status(PIPE_NAME)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {message}");
@@ -57,6 +63,18 @@ fn ask(client: &mut Client, request: &Request) -> Result<Response, String> {
 
 fn unexpected(response: &Response) -> String {
     display_safe(&whereabouts_client::unexpected(response).message)
+}
+
+fn status_json(name: &str) -> Result<(), String> {
+    let mut client = Client::connect(name).map_err(|problem| explain(&problem))?;
+    match ask(&mut client, &Request::Status {})? {
+        Response::Status(status) => {
+            let line = serde_json::to_string(&status).map_err(|e| e.to_string())?;
+            println!("{line}");
+            Ok(())
+        }
+        other => Err(unexpected(&other)),
+    }
 }
 
 fn show_status(name: &str) -> Result<(), String> {
