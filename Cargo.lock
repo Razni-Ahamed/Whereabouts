@@ -5080,6 +5080,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "whereabouts-lab-replay"
+version = "0.2.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "whereabouts-core",
+ "whereabouts-detect",
+ "whereabouts-enrich",
+ "whereabouts-ipc",
+ "whereabouts-store",
+]
+
+[[package]]
 name = "whereabouts-service"
 version = "0.2.0"
 dependencies = [
