@@ -266,14 +266,24 @@ function Invoke-StorageTest {
         Write-Log 'FAIL: no database file'
         return $false
     }
-    $raw = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($database))
-    foreach ($needle in @('curl.exe', 'example.com', 'SQLite format 3')) {
-        if ($raw.Contains($needle)) {
-            Write-Log "FAIL: '$needle' is readable in the database file"
-            $passed = $false
+    # The write-ahead log only exists while the database is open.
+    foreach ($file in @($database, "$database-wal") | Where-Object { Test-Path $_ }) {
+        $stream = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite, Delete')
+        try {
+            $memory = New-Object IO.MemoryStream
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        }
+        finally { $stream.Dispose() }
+        $raw = [Text.Encoding]::ASCII.GetString($bytes)
+        foreach ($needle in @('curl.exe', 'example.com', 'SQLite format 3')) {
+            if ($raw.Contains($needle)) {
+                Write-Log "FAIL: '$needle' is readable in $(Split-Path $file -Leaf)"
+                $passed = $false
+            }
         }
     }
-    if ($passed) { Write-Log '    database file: no readable app names, domains or SQLite header' }
+    if ($passed) { Write-Log '    database files: no readable app names, domains or SQLite header' }
 
     $access = @((Get-Acl $dataHome).Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
     Write-Log "    folder access: $($access -join ', ')"
