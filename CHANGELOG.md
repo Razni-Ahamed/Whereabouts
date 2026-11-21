@@ -4,6 +4,11 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- **Choose whether history is saved.** A new **Save connection history** switch on the Privacy screen, also asked once when the app starts (on by default; history is saved until you answer). With it off, the service saves no finished connections; live connections, alerts, blocking and notifications keep working. Turning it off asks, in a Windows dialog, whether to keep what is saved (it still ages out after 30 days, hourly totals after 180) or delete it now; alerts, rules and the list of programs seen are kept either way. The History view, export and (from 0.3) learning what is normal for each app need history, and the app says so. Measured with Windows' file tracing on a PC in ordinary use, saving history writes about 20 MB an hour (about 0.5 GB a day): 5 MB to the database and 15 MB to SQLite's temporary journal.
+- Pipe request `SetSaveHistory`; `Status` reports the choice (`save_history`, `null` until chosen), and `saving` is false while history is off.
+
 ### Changed
 
 - **A living background.** The background is now a slowly turning globe drawn in characters. Countries your apps have an open connection to glow, and when an app connects somewhere new, that country flashes (amber for trackers). A connection counts as new if it was not listed in the last 10 minutes; for a minute and a half after the service starts, nothing flashes while it re-lists connections that were open all along. It uses only what the app already shows: nothing new is collected or sent, and nothing flashes that did not happen. Moving the mouse stirs the characters, a click on the background sends a wave, and you can drag the globe to spin it. There is no "you are here" marker: Whereabouts does not know or guess where you are.

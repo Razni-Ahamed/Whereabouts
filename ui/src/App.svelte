@@ -4,6 +4,7 @@
   import GlobeBackdrop from './lib/components/GlobeBackdrop.svelte';
   import FirstRun from './lib/components/FirstRun.svelte';
   import ListsQuestion from './lib/components/ListsQuestion.svelte';
+  import HistoryQuestion from './lib/components/HistoryQuestion.svelte';
   import Logo from './lib/components/Logo.svelte';
   import { store } from './lib/state.svelte';
   import Overview from './screens/Overview.svelte';
@@ -61,6 +62,8 @@
   <FirstRun settings={store.settings} />
 {:else if store.settings && store.live && store.live.status.lists.data_updates === null}
   <ListsQuestion />
+{:else if store.settings && store.live && store.live.status.save_history === null}
+  <HistoryQuestion />
 {/if}
 
 <div class="shell">

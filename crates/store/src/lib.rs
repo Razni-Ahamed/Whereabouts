@@ -689,6 +689,15 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Deletes every stored flow and hourly total, but keeps alerts, rules,
+    /// known apps and settings, and compacts the file (for turning history
+    /// off).
+    pub fn delete_history(&mut self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("DELETE FROM flows; DELETE FROM hourly; VACUUM;")?;
+        Ok(())
+    }
 }
 
 /// What a saved blocking rule blocks.
@@ -1510,6 +1519,52 @@ mod tests {
             .unwrap();
         store.wipe().unwrap();
         assert_eq!(store.flow_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn deleting_history_keeps_alerts_rules_apps_and_settings() {
+        let path = temp_db("delete-history");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        store
+            .insert_flows(&[
+                record("a.exe", "x.example", 1, 1),
+                record("b.exe", "y.example", 100 * 24 * 3600, 2),
+            ])
+            .unwrap();
+        // Fold the older flow into an hourly total.
+        store
+            .apply_retention(at(100 * 24 * 3600), Retention::default())
+            .unwrap();
+        let hourly = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT count(*) FROM hourly", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(hourly(&store), 1);
+        store.add_alert(&tracker_alert("a.exe", 1), at(5)).unwrap();
+        store
+            .add_rule(
+                &RuleTarget::App {
+                    path: String::from("C:/Apps/a.exe"),
+                },
+                at(5),
+            )
+            .unwrap();
+        store.add_known_app("C:/Apps/a.exe", at(5)).unwrap();
+        store.set_setting("save_history", "false").unwrap();
+
+        store.delete_history().unwrap();
+        assert_eq!(store.flow_count().unwrap(), 0);
+        assert_eq!(hourly(&store), 0);
+        assert_eq!(store.alerts(at(0), 10).unwrap().len(), 1);
+        assert_eq!(store.rules().unwrap().len(), 1);
+        assert_eq!(store.known_app_keys().unwrap().len(), 1);
+        assert_eq!(
+            store.setting("save_history").unwrap().as_deref(),
+            Some("false")
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

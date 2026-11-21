@@ -105,8 +105,13 @@
               : 'This Windows version lets apps fake kernel events',
           },
           {
-            ok: status.saving,
-            text: status.saving ? 'Saving history, encrypted on this PC' : 'History is not being saved',
+            // Off by the user's choice is not a problem.
+            ok: status.saving || status.save_history === false,
+            text: status.saving
+              ? 'Saving history, encrypted on this PC'
+              : status.save_history === false
+                ? 'History is off, as you chose'
+                : 'History is not being saved',
           },
           {
             ok: status.rejected === 0,
