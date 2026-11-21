@@ -19,6 +19,7 @@ $expectedHeader = 'app_name,app_path,app_sha256,signature,publisher,signature_co
 if (-not (Test-Path $jsonPath)) { $problems += 'session.json is missing' }
 else {
     $session = Get-Content $jsonPath -Raw | ConvertFrom-Json
+    if ($session.PSObject.Properties['error'] -and $session.error) { $problems += "the session failed: $($session.error)" }
     if (-not $session.ok) { $problems += 'the session captured no flows (ok is false)' }
     if (@($session.counters).Count -lt 1) { $problems += 'no health-counter samples (--status --json)' }
     if ($LiveScenarios) {

@@ -93,3 +93,30 @@ def test_drops_runner_infrastructure(tmp_path):
     [session] = sessions.load(tmp_path)
     assert [f["app_name"] for f in session.flows] == ["chrome.exe"]
     assert session.meta["dropped_runner_flows"] == 6
+
+
+def test_counters_keep_growing_across_sessions(tmp_path):
+    # Each captured session's counters start at 0; a simulated user's engine runs on,
+    # so stitched counters must only grow, or later increases would go unseen.
+    counters = [{"time": 1005, "rejected": 0, "unattributed": 0},
+                {"time": 1100, "rejected": 2, "unattributed": 5}]
+    loaded = make(tmp_path, count=2, counters=counters)
+    rows, _, _ = timeline.build(loaded, 1, seed=1)
+    samples = [r for r in rows if r["type"] == "counters"]
+    assert len(samples) == 14 * 2 * 2  # 14 days, 2 sessions a day, 2 samples each
+    unattributed = [r["unattributed"] for r in samples]
+    assert unattributed == sorted(unattributed)
+    assert unattributed[-1] == 5 * 28  # every placed session added its 5
+    assert [r["rejected"] for r in samples][-1] == 2 * 28
+
+
+def test_persona_without_usable_sessions_is_an_error(tmp_path):
+    make(tmp_path, persona="office", count=2)
+    write_session(tmp_path, "media-0", "media", ok=False)
+    with pytest.raises(ValueError, match=r"media: 0 usable sessions \(of 1\)"):
+        timeline.build(sessions.load(tmp_path), 1, seed=1)
+
+
+def test_no_sessions_is_an_error(tmp_path):
+    with pytest.raises(ValueError, match="no usable sessions"):
+        timeline.build([], 1, seed=1)

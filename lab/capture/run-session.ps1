@@ -34,7 +34,17 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# This script deletes C:\ProgramData\Whereabouts (saved history included)
+# and installs apps: it must never run on a real computer.
+if ($env:GITHUB_ACTIONS -ne 'true') {
+    Write-Host 'run-session.ps1 deletes Whereabouts'' saved data and installs apps, so it runs only on'
+    Write-Host 'GitHub''s disposable runners (GITHUB_ACTIONS=true). Nothing was changed.'
+    exit 2
+}
+
 $LabRoot = Split-Path -Parent $PSScriptRoot
+$InstallTimeoutSeconds = 600
 $DataHome = Join-Path $env:ProgramData 'Whereabouts'
 
 function Get-UnixNow { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
@@ -65,6 +75,15 @@ function Get-AppRecord([string]$Id, [hashtable]$App, [bool]$Installed, [string]$
     }
 }
 
+# Runs an installer, stopping it if it takes longer than the time limit.
+function Invoke-Installer([string]$Program, [string[]]$Arguments) {
+    $process = Start-Process -FilePath $Program -ArgumentList $Arguments -NoNewWindow -PassThru
+    if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
+        Write-Warning "$Program took longer than $InstallTimeoutSeconds s; stopping it"
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Installs one app (winget, else Chocolatey, both preinstalled on GitHub's
 # runners or one of them). A failure is recorded, never fatal.
 function Install-LabApp([string]$Id) {
@@ -75,11 +94,12 @@ function Install-LabApp([string]$Id) {
     try {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             $via = 'winget'
-            & winget install --id $app.winget --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
+            Invoke-Installer 'winget' @('install', '--id', $app.winget, '--exact', '--silent',
+                '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
         }
         if (-not (Test-Path (Get-AppExe $app)) -and (Get-Command choco -ErrorAction SilentlyContinue)) {
             $via = 'choco'
-            & choco install $app.choco -y --no-progress | Out-Host
+            Invoke-Installer 'choco' @('install', $app.choco, '-y', '--no-progress')
         }
     } catch {
         Write-Warning "installing $Id failed: $_"
@@ -108,6 +128,7 @@ $session = [ordered]@{
     id            = $SessionId
     persona       = $Persona
     ok            = $false
+    error         = $null
     start         = $null
     end           = $null
     runner_image  = "$env:ImageOS $env:ImageVersion".Trim()
@@ -117,77 +138,100 @@ $session = [ordered]@{
     counters      = @()
     live          = @()
 }
-
-# 1. Apps for this persona (before capture, so installers are not recorded).
-$personaScript = Join-Path $PSScriptRoot "personas\$Persona.ps1"
-$session.apps = @(& $personaScript -Install -LabRoot $LabRoot)
-
-# 2. The engine records for the whole session.
-$engineSeconds = [int]($Minutes * 60) + 120
-$engineLog = Join-Path $Out 'engine.log'
-$engine = Start-Process -FilePath $Service -ArgumentList '--console', '--seconds', $engineSeconds `
-    -RedirectStandardOutput $engineLog -RedirectStandardError (Join-Path $Out 'engine.err.log') `
-    -WindowStyle Hidden -PassThru
-Start-Sleep -Seconds 15
-$session.start = Get-UnixNow
-
-# 3. Health counters every 10 seconds while the engine runs.
+$engine = $null
+$sampler = $null
 $countersFile = Join-Path $Out 'counters.jsonl'
-$sampler = Start-Job -ArgumentList $Service, $countersFile, $engine.Id -ScriptBlock {
-    param($service, $file, $enginePid)
-    while (Get-Process -Id $enginePid -ErrorAction SilentlyContinue) {
-        $line = & $service --status --json 2>$null
-        if ($LASTEXITCODE -eq 0 -and $line) {
-            $status = $line | ConvertFrom-Json
-            $sample = [ordered]@{
-                time         = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-                rejected     = $status.rejected
-                unattributed = $status.unattributed
+$csv = Join-Path $Out 'session.csv'
+$engineSeconds = [int]($Minutes * 60) + 120
+
+# Whatever happens, session.json is written (ok = false with the error, so
+# the analysis lists the session as skipped) and the engine is stopped.
+try {
+    # 1. Apps for this persona (before capture, so installers are not recorded).
+    $personaScript = Join-Path $PSScriptRoot "personas\$Persona.ps1"
+    $session.apps = @(& $personaScript -Install -LabRoot $LabRoot)
+
+    # 2. The engine records for the whole session.
+    $engine = Start-Process -FilePath $Service -ArgumentList '--console', '--seconds', $engineSeconds `
+        -RedirectStandardOutput (Join-Path $Out 'engine.log') -RedirectStandardError (Join-Path $Out 'engine.err.log') `
+        -WindowStyle Hidden -PassThru
+    Start-Sleep -Seconds 15
+    if ($engine.HasExited) { throw "the engine stopped at once (exit code $($engine.ExitCode)); see engine.log" }
+    $session.start = Get-UnixNow
+
+    # 3. Health counters every 10 seconds while the engine runs.
+    $sampler = Start-Job -ArgumentList $Service, $countersFile, $engine.Id -ScriptBlock {
+        param($service, $file, $enginePid)
+        while (Get-Process -Id $enginePid -ErrorAction SilentlyContinue) {
+            $line = & $service --status --json 2>$null
+            if ($LASTEXITCODE -eq 0 -and $line) {
+                $status = $line | ConvertFrom-Json
+                $sample = [ordered]@{
+                    time         = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                    rejected     = $status.rejected
+                    unattributed = $status.unattributed
+                }
+                ($sample | ConvertTo-Json -Compress) | Add-Content -Path $file
             }
-            ($sample | ConvertTo-Json -Compress) | Add-Content -Path $file
+            Start-Sleep -Seconds 10
         }
-        Start-Sleep -Seconds 10
-    }
-}
-
-# 4. The persona uses its apps.
-& $personaScript -Run -LabRoot $LabRoot -Minutes $Minutes -Seed $Seed -Apps $session.apps
-
-# 5. Live scenarios.
-if ($LiveScenarios) {
-    $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-
-    $fake = Join-Path $env:LOCALAPPDATA 'Lab\Discord.exe'
-    New-Item -ItemType Directory -Force -Path (Split-Path $fake) | Out-Null
-    Copy-Item $curl $fake -Force
-    $from = Get-UnixNow
-    1..3 | ForEach-Object { & $fake -s -o NUL https://www.wikipedia.org/; Start-Sleep -Seconds 3 }
-    $session.live += [ordered]@{
-        scenario = "$SessionId-renamed"; type = 'renamed_binary'; app_name = 'Discord.exe'
-        app_path = $fake; start = $from; end = Get-UnixNow
     }
 
-    $addresses = @(Resolve-DnsName example.com -Type A_AAAA -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress })
-    $from = Get-UnixNow
-    1..3 | ForEach-Object { & $curl -s -o NUL https://example.com/; Start-Sleep -Seconds 3 }
-    $session.live += [ordered]@{
-        scenario = "$SessionId-knownbad"; type = 'known_bad'; app_name = 'curl.exe'
-        app_path = $curl; start = $from; end = Get-UnixNow; addresses = $addresses
+    # 4. The persona uses its apps.
+    & $personaScript -Run -LabRoot $LabRoot -Minutes $Minutes -Seed $Seed -Apps $session.apps
+
+    # 5. Live scenarios (while the engine still records).
+    if ($LiveScenarios) {
+        if ($engine.HasExited) { throw 'the engine stopped before the live scenarios' }
+        $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+
+        $fake = Join-Path $env:LOCALAPPDATA 'Lab\Discord.exe'
+        New-Item -ItemType Directory -Force -Path (Split-Path $fake) | Out-Null
+        Copy-Item $curl $fake -Force
+        $from = Get-UnixNow
+        1..3 | ForEach-Object { & $fake -s -o NUL https://www.wikipedia.org/; Start-Sleep -Seconds 3 }
+        $session.live += [ordered]@{
+            scenario = "$SessionId-renamed"; type = 'renamed_binary'; app_name = 'Discord.exe'
+            app_path = $fake; start = $from; end = Get-UnixNow
+        }
+
+        $addresses = @(Resolve-DnsName example.com -Type A_AAAA -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSObject.Properties['IPAddress'] } | ForEach-Object { $_.IPAddress })
+        $from = Get-UnixNow
+        1..3 | ForEach-Object { & $curl -s -o NUL https://example.com/; Start-Sleep -Seconds 3 }
+        $session.live += [ordered]@{
+            scenario = "$SessionId-knownbad"; type = 'known_bad'; app_name = 'curl.exe'
+            app_path = $curl; start = $from; end = Get-UnixNow; addresses = $addresses
+        }
     }
-}
+    $session.end = Get-UnixNow
 
-# 6. Let the engine finish and save, then export.
-$session.end = Get-UnixNow
-$engine | Wait-Process -Timeout ($engineSeconds + 120)
-Stop-Job $sampler -ErrorAction SilentlyContinue; Remove-Job $sampler -Force -ErrorAction SilentlyContinue
-& $Service --export (Join-Path $Out 'session.csv') | Out-Host
-$rows = @(Get-Content (Join-Path $Out 'session.csv') -ErrorAction SilentlyContinue).Count - 1
-$session.ok = $rows -ge 1
-if (Test-Path $countersFile) {
-    $session.counters = @(Get-Content $countersFile | ForEach-Object { $_ | ConvertFrom-Json })
+    # 6. Let the engine finish and save.
+    if (-not $engine.WaitForExit(($engineSeconds + 120) * 1000)) {
+        throw 'the engine did not stop by itself in time'
+    }
+} catch {
+    $session.error = "$_"
+    Write-Warning "session $SessionId failed: $_"
+} finally {
+    if ($sampler) {
+        Stop-Job $sampler -ErrorAction SilentlyContinue
+        Remove-Job $sampler -Force -ErrorAction SilentlyContinue
+    }
+    if ($engine -and -not $engine.HasExited) {
+        Stop-Process -Id $engine.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    if (-not $session.end) { $session.end = Get-UnixNow }
+    if (-not $session.start) { $session.start = $session.end }
+    try { & $Service --export $csv | Out-Host } catch { Write-Warning "export failed: $_" }
+    $rows = @(Get-Content $csv -ErrorAction SilentlyContinue).Count - 1
+    $session.ok = ($rows -ge 1) -and -not $session.error
+    if (Test-Path $countersFile) {
+        $session.counters = @(Get-Content $countersFile | ForEach-Object { $_ | ConvertFrom-Json })
+    }
+    $session | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $Out 'session.json') -Encoding utf8
+    Remove-Item -Recurse -Force $DataHome -ErrorAction SilentlyContinue
+    $failed = if ($session.error) { ", error: $($session.error)" } else { '' }
+    Write-Host "session $SessionId ($Persona): $rows flows, ok=$($session.ok)$failed"
 }
-$session | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $Out 'session.json') -Encoding utf8
-
-Remove-Item -Recurse -Force $DataHome -ErrorAction SilentlyContinue
-Write-Host "session $SessionId ($Persona): $rows flows, ok=$($session.ok)"

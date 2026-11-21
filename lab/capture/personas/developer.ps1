@@ -23,7 +23,8 @@ if ($Run) {
     $code = $Apps | Where-Object { $_.id -eq 'vscode' -and $_.installed } | Select-Object -First 1
     if ($code) {
         $cli = Join-Path (Split-Path $code.path) 'bin\code.cmd'
-        & $cli --install-extension rust-lang.rust-analyzer --force | Out-Host
+        if (Test-Path $cli) { & $cli --install-extension rust-lang.rust-analyzer --force | Out-Host }
+        else { Write-Warning "VS Code's command line was not found at $cli" }
     }
     foreach ($repo in 'https://github.com/rust-lang/rustlings', 'https://github.com/pallets/flask') {
         & git clone --depth 1 --quiet $repo (Join-Path $work (Split-Path $repo -Leaf))

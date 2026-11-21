@@ -49,8 +49,12 @@ def build(
     """Returns (timeline rows sorted by time, live labels, info)."""
     rng = random.Random(seed)
     skipped = [s.id for s in sessions if not s.ok]
+    if not any(s.ok for s in sessions):
+        raise ValueError(f"no usable sessions ({len(sessions)} found, {len(skipped)} captured nothing)")
+    totals: dict[str, int] = defaultdict(int)
     by_persona: dict[str, list[Session]] = defaultdict(list)
     for session in sessions:
+        totals[session.persona] += 1
         if session.ok:
             by_persona[session.persona].append(session)
 
@@ -58,24 +62,27 @@ def build(
     labels: list[dict] = []
     pools: dict[str, dict[str, int]] = {}
     days = learning_days + test_days
-    for persona in sorted(by_persona):
-        group = sorted(by_persona[persona], key=lambda s: s.id)
+    for persona in sorted(totals):
+        group = sorted(by_persona.get(persona, []), key=lambda s: s.id)
         learn, test = _split(group, rng)
         if not learn or not test:
             raise ValueError(
-                f"{persona}: {len(group)} usable session{'s' if len(group) != 1 else ''}; "
-                "need at least 2 (separate ones for the learning and the test week)"
+                f"{persona}: {len(group)} usable session{'s' if len(group) != 1 else ''} "
+                f"(of {totals[persona]}); need at least 2 (separate ones for the learning and the test week)"
             )
         pools[persona] = {"learning": len(learn), "test": len(test)}
         hours = list(PERSONA_HOURS.get(persona, range(8, 22)))
         for number in range(1, users_per_persona + 1):
             user = f"{persona}-{number}"
+            # A user's engine runs on between sessions, so its health counters
+            # only grow: each session's counters start from the user's total so far.
+            base = [0, 0]
             for day in range(1, days + 1):
                 pool = learn if day <= learning_days else test
                 for hour in sorted(rng.sample(hours, min(sessions_per_day, len(hours)))):
                     session = rng.choice(pool)
                     shift = T0 + (day - 1) * DAY + hour * HOUR - session.start
-                    _place(session, user, day, hour, shift, rows, labels)
+                    _place(session, user, day, hour, shift, rows, labels, base)
     rows.sort(key=lambda r: (r["first_seen"] if r["type"] == "flow" else r["time"]))
     info = {"seed": seed, "users_per_persona": users_per_persona, "pools": pools,
             "skipped": skipped, "learning_days": learning_days, "test_days": test_days, "t0": T0}
@@ -83,7 +90,7 @@ def build(
 
 
 def _place(session: Session, user: str, day: int, hour: int, shift: int,
-           rows: list[dict], labels: list[dict]) -> None:
+           rows: list[dict], labels: list[dict], base: list[int]) -> None:
     day_start = T0 + (day - 1) * DAY
     day_end = day_start + DAY - 1
 
@@ -95,11 +102,16 @@ def _place(session: Session, user: str, day: int, hour: int, shift: int,
                "first_seen": clamp(flow["first_seen"]), "last_seen": clamp(flow["last_seen"]),
                "scenario": None}
         rows.append(row)
+    peak = [0, 0]
     for sample in session.counters:
+        rejected = int(sample.get("rejected") or 0)
+        unattributed = int(sample.get("unattributed") or 0)
+        peak = [max(peak[0], rejected), max(peak[1], unattributed)]
         rows.append({"type": "counters", "user": user, "day": day, "session": session.id,
                      "time": clamp(int(sample["time"])),
-                     "rejected": int(sample.get("rejected") or 0),
-                     "unattributed": int(sample.get("unattributed") or 0)})
+                     "rejected": base[0] + rejected, "unattributed": base[1] + unattributed})
+    base[0] += peak[0]
+    base[1] += peak[1]
     for live in session.live:
         label = {**live, "scenario": f"{live['scenario']}@{user}-d{day}-h{hour}", "user": user,
                  "start": clamp(int(live["start"])), "end": clamp(int(live["end"])), "live": True}
