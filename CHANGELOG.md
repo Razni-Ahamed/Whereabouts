@@ -6,7 +6,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ### Added
 
-- **Choose whether history is saved.** A new **Save connection history** switch on the Privacy screen, also asked once when the app starts (on by default; history is saved until you answer). With it off, the service saves no finished connections; live connections, alerts, blocking and notifications keep working. Turning it off asks, in a Windows dialog, whether to keep what is saved (it still ages out after 30 days, hourly totals after 180) or delete it now; alerts, rules and the list of programs seen are kept either way. The History view, export and (from 0.3) learning what is normal for each app need history, and the app says so.
+- **Choose whether history is saved.** A new **Save connection history** switch on the Privacy screen, also asked once when the app starts (on by default; history is saved until you answer). With it off, the service saves no finished connections; live connections, alerts, blocking and notifications keep working. Turning it off asks, in a Windows dialog, whether to keep what is saved (it still ages out after 30 days, hourly totals after 180) or delete it now; alerts, rules and the list of programs seen are kept either way. The History view, export and (from 0.3) learning what is normal for each app need history, and the app says so. Measured with Windows' file tracing on a PC in ordinary use, saving history writes about 20 MB an hour (about 0.5 GB a day): 5 MB to the database and 15 MB to SQLite's temporary journal.
 - Pipe request `SetSaveHistory`; `Status` reports the choice (`save_history`, `null` until chosen), and `saving` is false while history is off.
 
 ### Changed

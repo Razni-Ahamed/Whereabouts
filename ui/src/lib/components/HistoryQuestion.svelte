@@ -39,8 +39,8 @@
     <div class="choice">
       <span class="icon"><Radio size={18} /></span>
       <p class="muted plain">
-        Without it you still see live connections, get alerts and can block apps and sites. Saving writes only a
-        little to your disk.
+        Without it you still see live connections, get alerts and can block apps and sites. Saving writes about 20 MB
+        an hour to your disk (about 0.5 GB a day), far too little to wear out an SSD.
       </p>
     </div>
 
