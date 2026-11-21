@@ -41,8 +41,18 @@ function Get-UnixNow { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 
 function Expand-LabPath([string]$Path) { [Environment]::ExpandEnvironmentVariables($Path) }
 
+# Where the app's program is: its usual place, or a second one (per-user installs).
+function Get-AppExe([hashtable]$App) {
+    $places = @($App.exe) + @(if ($App.ContainsKey('exe_alt')) { $App.exe_alt })
+    foreach ($place in $places) {
+        $path = Expand-LabPath $place
+        if (Test-Path $path) { return $path }
+    }
+    Expand-LabPath $App.exe
+}
+
 function Get-AppRecord([string]$Id, [hashtable]$App, [bool]$Installed, [string]$Via) {
-    $exe = Expand-LabPath $App.exe
+    $exe = Get-AppExe $App
     $present = Test-Path $exe
     [ordered]@{
         id        = $Id
@@ -60,14 +70,14 @@ function Get-AppRecord([string]$Id, [hashtable]$App, [bool]$Installed, [string]$
 function Install-LabApp([string]$Id) {
     $apps = Get-Content (Join-Path $PSScriptRoot 'apps.json') -Raw | ConvertFrom-Json -AsHashtable
     $app = $apps[$Id]
-    if (Test-Path (Expand-LabPath $app.exe)) { return Get-AppRecord $Id $app $true 'preinstalled' }
+    if (Test-Path (Get-AppExe $app)) { return Get-AppRecord $Id $app $true 'preinstalled' }
     $via = 'none'
     try {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             $via = 'winget'
             & winget install --id $app.winget --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
         }
-        if (-not (Test-Path (Expand-LabPath $app.exe)) -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path (Get-AppExe $app)) -and (Get-Command choco -ErrorAction SilentlyContinue)) {
             $via = 'choco'
             & choco install $app.choco -y --no-progress | Out-Host
         }

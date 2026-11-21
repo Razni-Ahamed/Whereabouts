@@ -1,5 +1,5 @@
 {
-  "_comment": "Apps the lab sessions use, all started logged out. See lab/APPS.md for each app's terms. 'exe' is where the app's program ends up; %VAR% is expanded.",
+  "_comment": "Apps the lab sessions use, all started logged out. See lab/APPS.md for each app's terms. 'exe' is where the app's program ends up; %VAR% is expanded. 'exe_alt' is a second place it may install to (per-user installs).",
   "chrome": {
     "name": "Google Chrome",
     "winget": "Google.Chrome",
@@ -19,17 +19,11 @@
     "exe": "%LOCALAPPDATA%\\Discord\\Update.exe",
     "start_args": "--processStart Discord.exe"
   },
-  "steam": {
-    "name": "Steam",
-    "winget": "Valve.Steam",
-    "choco": "steam",
-    "exe": "%ProgramFiles(x86)%\\Steam\\steam.exe",
-    "start_args": "-silent"
-  },
   "vscode": {
     "name": "Visual Studio Code",
     "winget": "Microsoft.VisualStudioCode",
     "choco": "vscode",
-    "exe": "%ProgramFiles%\\Microsoft VS Code\\Code.exe"
+    "exe": "%ProgramFiles%\\Microsoft VS Code\\Code.exe",
+    "exe_alt": "%LOCALAPPDATA%\\Programs\\Microsoft VS Code\\Code.exe"
   }
 }
