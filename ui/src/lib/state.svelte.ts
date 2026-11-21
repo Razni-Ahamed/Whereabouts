@@ -5,6 +5,7 @@ import {
   alerts,
   checkListsNow,
   setListUpdates,
+  setSaveHistory,
   dismissAlert,
   getSettings,
   history,
@@ -110,6 +111,25 @@ class Store {
       return false;
     }
     if (this.live) this.live = { ...this.live, status: { ...this.live.status, lists: result.value } };
+    return true;
+  }
+
+  /**
+   * Turns saving history on or off (turning it off asks whether to keep or
+   * delete what is saved). `false` if it was cancelled or failed (with a note).
+   */
+  async setSaveHistory(save: boolean): Promise<boolean> {
+    const result = await setSaveHistory(save);
+    if (!result.ok) {
+      this.showNote({ text: result.problem.message, tone: 'bad' });
+      return false;
+    }
+    if (result.value === null) return false;
+    const chosen = result.value;
+    if (this.live) {
+      this.live = { ...this.live, status: { ...this.live.status, save_history: chosen, saving: chosen } };
+    }
+    void this.refreshHistory();
     return true;
   }
 

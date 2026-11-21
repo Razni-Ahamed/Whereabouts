@@ -7,6 +7,7 @@
     Clock,
     Download,
     FolderLock,
+    History,
     LoaderCircle,
     ShieldCheck,
     Trash2,
@@ -45,6 +46,19 @@
     listsBusy = true;
     await store.setLists(data, drop);
     listsBusy = false;
+  }
+
+  let historyBusy = $state(false);
+
+  // Redraws the switch when a change was cancelled or failed, so it shows
+  // the real state again (the checkbox flips itself when clicked).
+  let historyRedraw = $state(0);
+
+  async function changeHistory(save: boolean) {
+    historyBusy = true;
+    const changed = await store.setSaveHistory(save);
+    historyBusy = false;
+    if (!changed) historyRedraw += 1;
   }
 
   function when(secs: number | null): string {
@@ -145,13 +159,42 @@
       <h2><Clock size={18} strokeWidth={1.6} /> Right now</h2>
       <p class="muted">
         {#if store.live}
-          {store.live.status.saving ? 'Saving connection history, encrypted.' : 'Not saving history.'}
+          {store.live.status.saving
+            ? 'Saving connection history, encrypted.'
+            : store.live.status.save_history === false
+              ? 'Not saving history: you turned it off.'
+              : 'Not saving history.'}
           {count(store.live.status.tracker_domains)} tracker domains are checked offline.
         {:else}
           Waiting for the Whereabouts service.
         {/if}
       </p>
     </section>
+
+    {#if store.live && store.live.status.save_history !== undefined}
+      {@const on = store.live.status.save_history !== false}
+      <section class="glass card">
+        <h2><History size={18} strokeWidth={1.6} /> Connection history</h2>
+        {#key historyRedraw}
+          <Toggle
+            checked={on}
+            disabled={historyBusy}
+            label="Save connection history"
+            detail="Each finished connection for 30 days, then hourly totals for 180 days, encrypted on this PC."
+            onchange={changeHistory}
+          />
+        {/key}
+        <p class="muted">
+          {#if on}
+            Needed for the History view, Export and, from version 0.3, learning what is normal for each app. Turning it
+            off asks whether to keep or delete what is saved.
+          {:else}
+            Live connections, alerts and blocking still work. The History view and Export get nothing new, and from
+            version 0.3 Whereabouts can't learn what is normal for each app without it.
+          {/if}
+        </p>
+      </section>
+    {/if}
 
     {#if lists}
       <section class="glass card">

@@ -17,6 +17,7 @@ fn main() {
             "dismiss_alert",
             "set_list_updates",
             "check_lists_now",
+            "set_save_history",
         ]),
     ))
     .expect("failed to run the Tauri build script");

@@ -12,6 +12,7 @@ import {
   demoRemoveRule,
   demoRules,
   demoLists,
+  demoHistorySetting,
   demoSetPaused,
 } from './demo';
 import type { AlertView, AppSettings, AppTotals, ListsView, Live, Problem, Rules, RuleSpec } from './types';
@@ -111,6 +112,23 @@ export async function setListUpdates(data: boolean, drop: boolean): Promise<Resu
     return { ok: true, value: { ...demoLists } };
   }
   return call<ListsView>('set_list_updates', { data, drop });
+}
+
+/**
+ * Turns saving connection history on or off. Turning it off asks first (a
+ * native Windows dialog) whether to keep or delete what is saved. The new
+ * choice, or `null` if the user cancelled.
+ */
+export async function setSaveHistory(save: boolean): Promise<Result<boolean | null>> {
+  if (isDemo) {
+    if (!save) {
+      const ok = window.confirm('Demo: stop saving connection history? (The app also asks whether to keep or delete it.)');
+      if (!ok) return { ok: true, value: null };
+    }
+    demoHistorySetting.save = save;
+    return { ok: true, value: save };
+  }
+  return call<boolean | null>('set_save_history', { save });
 }
 
 /** Checks for list updates now. */

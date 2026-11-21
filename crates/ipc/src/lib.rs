@@ -144,6 +144,16 @@ pub enum Request {
     },
     /// Checks for list updates now (Spamhaus at most hourly).
     CheckListsNow {},
+    /// Turns saving connection history on or off (on until the user
+    /// chooses). Answered with [`Response::SaveHistory`]. The live view,
+    /// alerts and blocking work either way.
+    SetSaveHistory {
+        /// `true` to save finished connections, `false` to stop.
+        save: bool,
+        /// When turning saving off: also delete the connections and hourly
+        /// totals saved so far. Ignored when turning it on.
+        delete_saved: bool,
+    },
     /// Marks an alert as seen and fine.
     DismissAlert {
         /// The alert's ID.
@@ -370,6 +380,12 @@ pub enum Response {
     AlertDismissed {},
     /// Answer to [`Request::SetListUpdates`] and [`Request::CheckListsNow`].
     Lists(ListsView),
+    /// Answer to [`Request::SetSaveHistory`]: the choice is saved and in
+    /// effect (and, if asked, the saved history is deleted).
+    SaveHistory {
+        /// Whether connection history is saved now.
+        save: bool,
+    },
     /// Answer to [`Request::AddRule`].
     RuleAdded {
         /// The new rule's ID (or the existing one's, if it was already
@@ -409,8 +425,13 @@ pub struct Status {
     /// allowed; clients repeat the check from their own, ordinary account
     /// (see `whereabouts_client::kernel_events_protected`).
     pub kernel_events_protected: bool,
-    /// Whether finished flows are being saved.
+    /// Whether finished flows are being saved: the database is open and
+    /// the user has not turned history off.
     pub saving: bool,
+    /// The user's choice whether connection history is saved; `None` until
+    /// they chose (it is saved meanwhile).
+    #[serde(default)]
+    pub save_history: Option<bool>,
     /// Tracker domains loaded from the offline data.
     pub tracker_domains: u64,
     /// Saved blocking rules.
@@ -684,6 +705,11 @@ mod tests {
             last: Some(7),
         });
         round_trip(Response::Deleted {});
+        round_trip(Request::SetSaveHistory {
+            save: false,
+            delete_saved: true,
+        });
+        round_trip(Response::SaveHistory { save: false });
     }
 
     #[test]
