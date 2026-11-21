@@ -1,0 +1,8 @@
+# Lab outputs are workflow artifacts, never committed.
+out/
+.venv/
+__pycache__/
+*.csv
+*.jsonl
+!tests/fixtures/*.csv
+!tests/fixtures/*.jsonl

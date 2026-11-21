@@ -1,0 +1,27 @@
+[project]
+name = "wlab"
+version = "0.1.0"
+description = "Whereabouts lab: simulated user-weeks from scripted sessions, scenarios and scoring (never shipped)"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.9",
+    "numpy>=2.0",
+    "playwright>=1.48",
+]
+
+[project.scripts]
+lab = "wlab.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wlab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

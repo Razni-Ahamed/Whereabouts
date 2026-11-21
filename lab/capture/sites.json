@@ -1,0 +1,30 @@
+{
+  "_comment": "Public sites the lab's scripted browsing visits: a few page loads per site per session, never crawling.",
+  "general": [
+    "https://en.wikipedia.org/wiki/Special:Random",
+    "https://www.bbc.com/news",
+    "https://www.theguardian.com/international",
+    "https://www.reuters.com/",
+    "https://www.weather.gov/",
+    "https://www.imdb.com/chart/top/",
+    "https://www.amazon.com/",
+    "https://www.ebay.com/",
+    "https://www.booking.com/",
+    "https://www.microsoft.com/",
+    "https://www.apple.com/",
+    "https://www.nasa.gov/",
+    "https://www.allrecipes.com/",
+    "https://www.espn.com/"
+  ],
+  "developer": [
+    "https://github.com/explore",
+    "https://stackoverflow.com/questions",
+    "https://doc.rust-lang.org/std/",
+    "https://docs.python.org/3/",
+    "https://developer.mozilla.org/en-US/",
+    "https://learn.microsoft.com/en-us/windows/",
+    "https://crates.io/",
+    "https://pypi.org/",
+    "https://www.npmjs.com/"
+  ]
+}
