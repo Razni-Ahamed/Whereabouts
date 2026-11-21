@@ -83,3 +83,13 @@ def test_live_labels_shift_with_their_session(tmp_path):
         assert (label["start"] - timeline.T0) % 3600 in (29, 30)
         assert label["addresses"] == ["93.184.215.14"]
     assert len({label["scenario"] for label in labels}) == len(labels)
+
+
+def test_drops_runner_infrastructure(tmp_path):
+    flows = [flow(app=name, at=1010) for name in (
+        "Runner.Worker.exe", "Runner.Listener.exe", "WindowsAzureGuestAgent.exe", "WaAppAgent.exe",
+        "hosted-compute-agent", "provjobd.exe2979537984", "chrome.exe")]
+    write_session(tmp_path, "r", "office", flows=flows)
+    [session] = sessions.load(tmp_path)
+    assert [f["app_name"] for f in session.flows] == ["chrome.exe"]
+    assert session.meta["dropped_runner_flows"] == 6

@@ -10,6 +10,19 @@ from pathlib import Path
 # Text the export guarded against spreadsheet formulas gets a leading "'".
 _RISKY = ("=", "+", "-", "@")
 
+# GitHub's own runner machinery, which no real PC runs: left out of the data.
+RUNNER_APPS = {
+    "runner.worker.exe", "runner.listener.exe", "windowsazureguestagent.exe",
+    "waappagent.exe", "hosted-compute-agent",
+}
+RUNNER_PREFIXES = ("provjobd.exe",)
+
+
+def is_runner_app(name: str | None) -> bool:
+    lower = (name or "").lower()
+    return lower in RUNNER_APPS or lower.startswith(RUNNER_PREFIXES)
+
+
 INT_FIELDS = ("remote_port", "bytes_sent", "bytes_received", "connections")
 TEXT_FIELDS = (
     "app_name", "app_path", "app_sha256", "protocol", "remote_ip",
@@ -62,7 +75,9 @@ def load(root: Path) -> list[Session]:
     for meta_path in sorted(Path(root).rglob("session.json")):
         meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
         csv_path = meta_path.with_name("session.csv")
-        flows = read_flows(csv_path) if csv_path.exists() else []
+        all_flows = read_flows(csv_path) if csv_path.exists() else []
+        flows = [f for f in all_flows if not is_runner_app(f["app_name"])]
+        meta["dropped_runner_flows"] = len(all_flows) - len(flows)
         found.append(Session(
             id=str(meta["id"]),
             persona=meta["persona"],

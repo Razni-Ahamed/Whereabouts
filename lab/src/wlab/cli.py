@@ -35,6 +35,7 @@ def cmd_timeline(args: argparse.Namespace) -> None:
         info["injected_per_user"] = counts
     info["sessions"] = [
         {"id": s.id, "persona": s.persona, "ok": s.ok, "flows": len(s.flows),
+         "dropped_runner_flows": s.meta.get("dropped_runner_flows", 0),
          "runner_image": s.meta.get("runner_image"), "engine_commit": s.meta.get("engine_commit"),
          "apps": s.meta.get("apps", [])}
         for s in loaded
