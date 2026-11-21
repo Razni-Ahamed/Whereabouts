@@ -4,6 +4,7 @@ members = [
     "crates/client",
     "crates/core",
     "crates/data-bundle",
+    "crates/detect",
     "crates/enrich",
     "crates/ipc",
     "crates/store",
@@ -29,6 +30,7 @@ publish = false
 whereabouts-client = { path = "crates/client" }
 whereabouts-core = { path = "crates/core" }
 whereabouts-data-bundle = { path = "crates/data-bundle" }
+whereabouts-detect = { path = "crates/detect" }
 whereabouts-enrich = { path = "crates/enrich" }
 whereabouts-ipc = { path = "crates/ipc" }
 whereabouts-store = { path = "crates/store" }

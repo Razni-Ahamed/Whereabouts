@@ -189,7 +189,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     };
     let mut last_retention = Instant::now();
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
-    let mut detector = crate::alerts::Detector::load(&crate::updates::lists_dir());
+    let mut detector = crate::alerts::load_detector();
     let mut blocking = crate::blocking::Blocking::start(
         whereabouts_win_firewall::Firewall::open,
         store.as_ref(),
@@ -333,7 +333,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                 }
                 crate::server::EngineCommand::ReloadDrop => {
-                    detector = crate::alerts::Detector::load(&crate::updates::lists_dir());
+                    detector = crate::alerts::load_detector();
                 }
                 crate::server::EngineCommand::Rules { command, reply } => {
                     // A new domain rule (or resuming) also applies to names
@@ -407,6 +407,9 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     store,
                     now,
                 ));
+                for error in detector.take_errors() {
+                    report!("warning: {error}");
+                }
                 if !raised.is_empty() {
                     let mut state = live.lock().unwrap_or_else(PoisonError::into_inner);
                     for alert in &raised {

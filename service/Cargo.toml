@@ -14,6 +14,7 @@ ureq.workspace = true
 whereabouts-client.workspace = true
 whereabouts-core.workspace = true
 whereabouts-data-bundle.workspace = true
+whereabouts-detect.workspace = true
 whereabouts-enrich.workspace = true
 whereabouts-ipc.workspace = true
 whereabouts-store.workspace = true

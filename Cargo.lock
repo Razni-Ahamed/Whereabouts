@@ -5054,6 +5054,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "whereabouts-detect"
+version = "0.2.0"
+dependencies = [
+ "whereabouts-core",
+ "whereabouts-enrich",
+ "whereabouts-store",
+]
+
+[[package]]
 name = "whereabouts-enrich"
 version = "0.2.0"
 dependencies = [
@@ -5078,6 +5087,7 @@ dependencies = [
  "whereabouts-client",
  "whereabouts-core",
  "whereabouts-data-bundle",
+ "whereabouts-detect",
  "whereabouts-enrich",
  "whereabouts-ipc",
  "whereabouts-store",
