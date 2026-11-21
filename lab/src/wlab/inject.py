@@ -68,9 +68,12 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
     labels = list(labels)
     end_of_test = T0 + 14 * DAY
     users = sorted({r["user"] for r in out if r["type"] == "flow"})
+    # Apps used by live scenarios are left alone, so their genuine alerts
+    # never look like detections of a synthetic scenario.
+    staged = {label.get("app_name") for label in labels if label.get("live")}
     for user in users:
         flows = [r for r in out if r["type"] == "flow" and r["user"] == user]
-        learned = sorted({r["app_name"] for r in flows if r["day"] <= 7})
+        learned = sorted({r["app_name"] for r in flows if r["day"] <= 7} - staged)
         active = [r for r in flows if r["day"] >= 8 and not r.get("scenario")]
         if not learned or not active:
             continue

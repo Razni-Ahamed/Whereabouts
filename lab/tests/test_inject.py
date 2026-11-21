@@ -111,3 +111,15 @@ def test_deterministic_for_seed(tmp_path):
 def test_parse_counts():
     assert inject.parse_counts("upload=2, beacon=1") == {"upload": 2, "beacon": 1}
     assert inject.parse_counts("") == {}
+
+
+def test_never_targets_apps_of_live_scenarios(tmp_path):
+    live = [{"scenario": "kb", "type": "known_bad", "app_name": "curl.exe", "app_path": r"C:\curl.exe",
+             "start": 1050, "end": 1060, "addresses": ["192.0.2.77"]}]
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i, live=live,
+                      flows=[flow(app="chrome.exe", at=1010 + i), flow(app="curl.exe", at=1055 + i)])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"upload": 3, "beacon": 3})
+    targets = {label["app_name"] for label in labels if not label["live"]}
+    assert targets == {"chrome.exe"}

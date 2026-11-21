@@ -61,6 +61,13 @@ def cmd_report(args: argparse.Namespace) -> None:
     print((args.out / "summary.md").read_text(encoding="utf-8"))
 
 
+def cmd_droplist(args: argparse.Namespace) -> None:
+    from . import droplist
+
+    added = droplist.build(read_jsonl(args.labels), args.real, args.out)
+    print(f"lab DROP list: {added} test entries" + ("" if args.real else " (no Spamhaus list given)"))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="lab", description="Whereabouts lab (never shipped)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -78,6 +85,12 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--alerts", action="append", required=True, help='"Layer 1=alerts.jsonl" (repeatable)')
     r.add_argument("--out", type=Path, required=True)
     r.set_defaults(func=cmd_report)
+
+    d = sub.add_parser("droplist", help="Spamhaus DROP + the lab's test entries -> a lists folder")
+    d.add_argument("--labels", type=Path, required=True)
+    d.add_argument("--real", type=Path, default=None, help="folder with Spamhaus' drop_v4.json / drop_v6.json")
+    d.add_argument("--out", type=Path, required=True)
+    d.set_defaults(func=cmd_droplist)
 
     args = parser.parse_args(argv)
     args.func(args)
