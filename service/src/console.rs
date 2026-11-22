@@ -525,6 +525,31 @@ struct ProcessInfo {
 /// The program file every WebView2 app's web content runs in.
 const WEBVIEW2: &str = "msedgewebview2.exe";
 
+/// Whether `path` is the installed WebView2 runtime's program, in its
+/// folder under Program Files, which only administrators can change. Any
+/// program can call itself `msedgewebview2.exe`; only the real runtime may
+/// be credited to the app that started it, or a program could borrow that
+/// app's name and publisher (and get the app blocked instead of itself).
+fn is_webview2_runtime(path: &str) -> bool {
+    use std::sync::OnceLock;
+    use whereabouts_win_secrets::{KnownFolder, known_folder};
+    static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        [KnownFolder::ProgramFilesX86, KnownFolder::ProgramFiles]
+            .into_iter()
+            .filter_map(|folder| known_folder(folder).ok())
+            .map(|dir| {
+                let root = dir.join(r"Microsoft\EdgeWebView\Application");
+                format!("{}\\", root.to_string_lossy().to_lowercase())
+            })
+            .collect()
+    });
+    let path = path.to_lowercase();
+    file_name(&path) == WEBVIEW2
+        && !path.contains(r"\..\")
+        && roots.iter().any(|root| path.starts_with(root.as_str()))
+}
+
 /// What the console knows about each process, plus each process's program
 /// identity (signature, hash), worked out by a background worker.
 ///
@@ -584,7 +609,7 @@ impl ProcessNames {
         if info.requested {
             return;
         }
-        if info.name.eq_ignore_ascii_case(WEBVIEW2)
+        if info.path.as_deref().is_some_and(is_webview2_runtime)
             && let Some((host, _)) = process::ancestor_not_named(pid, WEBVIEW2)
         {
             self.note_traffic(host);
@@ -1571,6 +1596,29 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(150 * 1024 * 1024), "150.0 MB");
         assert_eq!(format_bytes(u64::MAX), "16.0 EB");
+    }
+
+    #[test]
+    fn only_the_installed_webview2_runtime_is_credited_to_its_app() {
+        let x86 = whereabouts_win_secrets::known_folder(
+            whereabouts_win_secrets::KnownFolder::ProgramFilesX86,
+        )
+        .unwrap();
+        let runtime =
+            x86.join(r"Microsoft\EdgeWebView\Application\157.0.4341.60\msedgewebview2.exe");
+        assert!(is_webview2_runtime(&runtime.to_string_lossy()));
+        assert!(is_webview2_runtime(
+            &runtime.to_string_lossy().to_uppercase()
+        ));
+        // Anything can be called msedgewebview2.exe.
+        assert!(!is_webview2_runtime(
+            r"C:\Users\x\AppData\Local\Temp\msedgewebview2.exe"
+        ));
+        let other = x86.join(r"Microsoft\EdgeWebView\Application\157.0.4341.60\other.exe");
+        assert!(!is_webview2_runtime(&other.to_string_lossy()));
+        let sneaky =
+            x86.join(r"Microsoft\EdgeWebView\Application\..\..\..\..\Users\x\msedgewebview2.exe");
+        assert!(!is_webview2_runtime(&sneaky.to_string_lossy()));
     }
 
     #[test]

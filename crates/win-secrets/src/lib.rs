@@ -51,7 +51,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KNOWN_FOLDER_FLAG,
+    SHGetKnownFolderPath,
 };
 use windows::core::{BOOL, GUID, HRESULT, HSTRING, w};
 
@@ -229,6 +230,8 @@ pub fn load_or_create_key(path: &Path, legacy: &Path) -> io::Result<[u8; KEY_LEN
 pub enum KnownFolder {
     /// `C:\Program Files` (the 64-bit one on 64-bit Windows).
     ProgramFiles,
+    /// `C:\Program Files (x86)` (32-bit programs on 64-bit Windows).
+    ProgramFilesX86,
     /// `C:\ProgramData`.
     ProgramData,
 }
@@ -238,6 +241,7 @@ pub enum KnownFolder {
 pub fn known_folder(folder: KnownFolder) -> io::Result<std::path::PathBuf> {
     let id: &GUID = match folder {
         KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
+        KnownFolder::ProgramFilesX86 => &FOLDERID_ProgramFilesX86,
         KnownFolder::ProgramData => &FOLDERID_ProgramData,
     };
     // SAFETY: `id` is a valid folder ID; the returned string is allocated
