@@ -20,6 +20,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - **Copies of a blocked app are blocked too.** Blocks match a program's location, so a copy or link of a blocked program in another folder could connect freely. When a byte-identical copy connects, Whereabouts now blocks it with a rule of its own (on the Rules screen, where you can lift it) and tells you. Its first connection may still get through. Only exact copies of the program as it was when you blocked it count, and Whereabouts never uses up your rule slots this way.
 - **The service takes its connection to the app back.** While Whereabouts' service was stopped (during an update, or after a crash), any program could take the name of its private connection to the app, and the service then could not answer the app until it restarted. It now keeps trying, and answers as soon as the name is free.
 - **Warnings that cannot be undone default to Cancel.** In "Delete everything Whereabouts saved?" and "Stop these warnings?", pressing Enter deleted everything or silenced the warning; Cancel is now the default button.
+- **Rules are checked more strictly.** An app rule must name a real program, and a domain rule cannot be a shared ending such as `co.uk` or `github.io`, which would block countless sites.
 
 ### Fixed
 

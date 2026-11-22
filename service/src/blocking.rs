@@ -59,6 +59,12 @@ pub fn checked_target(spec: RuleSpec) -> Result<RuleTarget, String> {
         }
         let normal =
             normalize_path(Path::new(path)).map_err(|e| format!("{}: {e}", display_safe(path)))?;
+        if !is_program(&normal) {
+            return Err(format!(
+                "{} is not a program, so it cannot be blocked",
+                display_safe(path)
+            ));
+        }
         check_guard(&Block::App {
             path: normal.clone(),
         })
@@ -514,6 +520,17 @@ fn unix_secs(time: SystemTime) -> u64 {
 
 /// A domain name in its one accepted spelling: lowercase ASCII letters,
 /// digits, `-`, `_` and dots, with at least one dot and no empty labels.
+/// Whether the file at `path` is a Windows program: it starts with the
+/// executable header `MZ`. A document or a key file is not something that
+/// connects, and checking it would only tell whether it exists.
+fn is_program(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| &header == b"MZ")
+}
+
 pub fn clean_domain(name: &str) -> Result<String, String> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     let valid = !name.is_empty()
@@ -525,13 +542,20 @@ pub fn clean_domain(name: &str) -> Result<String, String> {
         && name
             .split('.')
             .all(|label| !label.is_empty() && label.len() <= 63);
-    if valid {
-        Ok(name)
-    } else {
-        Err(format!(
+    if !valid {
+        return Err(format!(
             "{name:?} is not a domain name like tracker.example.com"
-        ))
+        ));
     }
+    // `co.uk` or `github.io` is shared by countless unrelated sites (a
+    // public suffix): blocking it would block all of them.
+    if whereabouts_enrich::registrable_domain(&name).is_none() {
+        return Err(format!(
+            "{name} is shared by many unrelated sites, so it cannot be blocked as one; block \
+             one site under it instead, like example.{name}"
+        ));
+    }
+    Ok(name)
 }
 
 /// Whether `name` is `domain` or one of its subdomains.
@@ -1124,6 +1148,13 @@ mod tests {
             clean_domain(" Tracker.Example.COM. ").unwrap(),
             "tracker.example.com"
         );
+        // Public suffixes are shared by countless sites.
+        for shared in ["co.uk", "github.io", "com.au", "blogspot.com"] {
+            let error = clean_domain(shared).unwrap_err();
+            assert!(error.contains("shared by many"), "{shared}: {error}");
+        }
+        assert_eq!(clean_domain("bbc.co.uk").unwrap(), "bbc.co.uk");
+        assert_eq!(clean_domain("me.github.io").unwrap(), "me.github.io");
         for bad in ["", "localhost", "a..b", "exa mple.com", "bad/x.com", ".com"] {
             assert!(clean_domain(bad).is_err(), "{bad:?}");
         }
@@ -1253,9 +1284,11 @@ mod tests {
             };
             let _ = blocking.answer(
                 Some(&mut store),
+                // (The test binary: blocked.exe now holds the swapped-in
+                // non-program, which app rules refuse.)
                 RuleCommand::Add(RuleSpec::Address {
                     ip,
-                    app: Some(blocked.clone()),
+                    app: Some(this_exe()),
                 }),
                 at(T0 + 7400),
             );
@@ -1368,6 +1401,17 @@ mod tests {
             },
             RuleSpec::App {
                 path: "x".repeat(MAX_RULE_PATH + 1),
+            },
+            // Not a program (a text file Windows ships).
+            RuleSpec::App {
+                path: system32
+                    .join(r"drivers\etc\hosts")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+            RuleSpec::Domain {
+                name: String::from("co.uk"),
+                app: None,
             },
         ];
         for spec in refused {
