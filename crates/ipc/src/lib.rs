@@ -244,6 +244,16 @@ pub enum NoticeKind {
         /// Executable file name, if it concerns one app.
         app: Option<String>,
     },
+    /// A byte-identical copy (or link) of a blocked program connected from
+    /// another place, so Whereabouts blocked it too, with a rule of its own.
+    BlockedCopy {
+        /// The copy's file name.
+        app: String,
+        /// The copy's full path.
+        path: String,
+        /// The blocked program it is a copy of (full path).
+        of: String,
+    },
 }
 
 /// What a blocking rule blocks.

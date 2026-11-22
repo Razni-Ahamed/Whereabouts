@@ -301,7 +301,9 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        names.poll();
+        for identity in names.poll() {
+            block_if_copy(&identity, &mut blocking, store.as_mut(), &live);
+        }
         while let Ok(command) = commands.try_recv() {
             match command {
                 crate::server::EngineCommand::DeleteAll { reply } => {
@@ -665,14 +667,18 @@ impl ProcessNames {
         self.identities.get(&token)
     }
 
-    /// Collects identities the background worker has finished.
-    fn poll(&mut self) {
+    /// Collects identities the background worker has finished, and returns
+    /// them.
+    fn poll(&mut self) -> Vec<AppIdentity> {
+        let mut finished = Vec::new();
         for (token, identity) in self.resolver.finished() {
             if self.identities.len() >= MAX_IDENTITIES {
                 self.identities.clear();
             }
+            finished.push(identity.clone());
             self.identities.insert(token, identity);
         }
+        finished
     }
 
     fn forget(&mut self, pid: u32) {
@@ -729,6 +735,53 @@ impl ProcessNames {
             None => (String::from("…"), true),
             Some(identity) => (identity.publisher_text(), identity.confirmed_running),
         }
+    }
+}
+
+/// Blocks the program `identity` describes if it is a byte-identical copy
+/// (or a link) of a blocked program in another place, with a rule of its own
+/// that shows on the Rules screen, and tells the app.
+///
+/// Unconfirmed checks count too (the process exited before its file could be
+/// locked, as a short download does): what is blocked is the path, and the
+/// file now at that path is the blocked program, whichever file ran.
+fn block_if_copy(
+    identity: &AppIdentity,
+    blocking: &mut crate::blocking::Blocking<whereabouts_win_firewall::Firewall>,
+    store: Option<&mut Store>,
+    live: &Mutex<crate::server::LiveState>,
+) {
+    let Some(sha256) = identity.sha256.as_deref() else {
+        return;
+    };
+    let Some(original) = blocking.copy_of(&identity.path, sha256) else {
+        return;
+    };
+    let rule = whereabouts_ipc::RuleSpec::App {
+        path: identity.path.clone(),
+    };
+    let now = SystemTime::now();
+    match blocking.answer(store, crate::blocking::RuleCommand::Add(rule), now) {
+        whereabouts_ipc::Response::RuleAdded { already: false, .. } => {
+            println!("Blocked {}: a copy of blocked {original}", identity.path);
+            live.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_notice(
+                    whereabouts_ipc::NoticeKind::BlockedCopy {
+                        app: truncate(file_name(&identity.path), CLIENT_TEXT),
+                        path: truncate(&identity.path, CLIENT_TEXT * 2),
+                        of: truncate(&original, CLIENT_TEXT * 2),
+                    },
+                    now,
+                );
+        }
+        whereabouts_ipc::Response::Error { message } => {
+            report!(
+                "warning: could not block {}, a copy of blocked {original}: {message}",
+                identity.path
+            );
+        }
+        _ => {}
     }
 }
 

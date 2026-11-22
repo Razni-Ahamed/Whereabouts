@@ -125,6 +125,9 @@ pub enum RuleCommand {
 pub struct Blocking<F: Firewalls> {
     blocker: Option<Blocker<F>>,
     open: fn() -> io::Result<F>,
+    /// SHA-256 of each blocked program's file, with the size and time it
+    /// was hashed at (hashed again when either changes).
+    hashes: HashMap<String, (u64, SystemTime, String)>,
 }
 
 impl<F: Firewalls> std::fmt::Debug for Blocking<F> {
@@ -142,6 +145,7 @@ impl<F: Firewalls> Blocking<F> {
         let mut blocking = Self {
             blocker: None,
             open,
+            hashes: HashMap::new(),
         };
         if let Some(store) = store {
             match store.rules() {
@@ -184,6 +188,59 @@ impl<F: Firewalls> Blocking<F> {
         if let Some(blocker) = self.blocker.as_mut() {
             blocker.on_confirmed_chain(name, aliases, addresses, now);
         }
+    }
+
+    /// If the program at `path`, whose file's SHA-256 is `sha256`, is a
+    /// byte-identical copy (or a link) of a program an app rule blocks, the
+    /// blocked program's path. App rules match a path, so a copy elsewhere
+    /// was not blocked (a blocked app could even copy itself). `None` while
+    /// blocking is paused, or if `path` itself is blocked.
+    pub fn copy_of(&mut self, path: &str, sha256: &str) -> Option<String> {
+        let blocker = self.blocker.as_ref()?;
+        if blocker.paused {
+            return None;
+        }
+        let blocked: Vec<String> = blocker
+            .rules
+            .iter()
+            .filter_map(|rule| match &rule.target {
+                RuleTarget::App { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        if blocked
+            .iter()
+            .any(|program| same_path(Path::new(program), Path::new(path)))
+        {
+            return None;
+        }
+        blocked
+            .into_iter()
+            .find(|program| self.hash_of(program).as_deref() == Some(sha256))
+    }
+
+    /// The SHA-256 of the file at `path`, hashed again only when its size
+    /// or modification time changed. `None` if it cannot be read or is too
+    /// large to hash (as for program identities).
+    fn hash_of(&mut self, path: &str) -> Option<String> {
+        use whereabouts_win_capture::identity::{MAX_HASH_SIZE, sha256_of};
+        let metadata = std::fs::metadata(path).ok()?;
+        let (size, modified) = (metadata.len(), metadata.modified().ok()?);
+        if let Some((cached_size, cached_time, hash)) = self.hashes.get(path)
+            && (*cached_size, *cached_time) == (size, modified)
+        {
+            return Some(hash.clone());
+        }
+        if size > MAX_HASH_SIZE {
+            return None;
+        }
+        let hash = sha256_of(&std::fs::File::open(path).ok()?).ok()?;
+        if self.hashes.len() >= MAX_RULES {
+            self.hashes.clear();
+        }
+        self.hashes
+            .insert(path.to_owned(), (size, modified, hash.clone()));
+        Some(hash)
     }
 
     /// Called on each refresh.
@@ -995,6 +1052,51 @@ mod tests {
 
     fn open_fake() -> io::Result<Fake> {
         Ok(Fake::default())
+    }
+
+    #[test]
+    fn copies_of_a_blocked_program_are_recognised_by_their_content() {
+        use whereabouts_win_capture::identity::sha256_of;
+        let (mut store, dir) = store("copies");
+        let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
+        let blocked = this_exe();
+        let added = blocking.answer(
+            Some(&mut store),
+            RuleCommand::Add(RuleSpec::App {
+                path: blocked.clone(),
+            }),
+            at(T0),
+        );
+        assert!(matches!(added, Response::RuleAdded { .. }), "{added:?}");
+        // A copy in another folder, and a different program.
+        let copy = dir.join("renamed.exe");
+        std::fs::copy(&blocked, &copy).unwrap();
+        let other = dir.join("other.exe");
+        std::fs::write(&other, b"not the same program").unwrap();
+        let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
+        let copy_path = copy.to_string_lossy().into_owned();
+        assert_eq!(
+            blocking.copy_of(&copy_path, &hash(&copy)),
+            Some(blocked.clone()),
+            "the copy is recognised"
+        );
+        assert_eq!(
+            blocking.copy_of(&other.to_string_lossy(), &hash(&other)),
+            None,
+            "a different program is not"
+        );
+        assert_eq!(
+            blocking.copy_of(&blocked.to_uppercase(), &hash(Path::new(&blocked))),
+            None,
+            "the blocked program itself is not a copy"
+        );
+        blocking.answer(Some(&mut store), RuleCommand::SetPaused(true), at(T0));
+        assert_eq!(
+            blocking.copy_of(&copy_path, &hash(&copy)),
+            None,
+            "nothing is added while blocking is paused"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

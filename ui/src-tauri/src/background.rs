@@ -224,6 +224,9 @@ struct AlertNotice {
 struct Snapshot {
     status: Status,
     new_apps: Vec<String>,
+    /// Copies of blocked programs the service blocked too: (copy's name,
+    /// copy's path).
+    blocked_copies: Vec<(String, String)>,
     alerts: Vec<AlertNotice>,
     last_notice: u64,
 }
@@ -261,10 +264,14 @@ impl Checker {
             other => return Err(unexpected(&other)),
         };
         let mut new_apps = Vec::new();
+        let mut blocked_copies = Vec::new();
         let mut alerts = Vec::new();
         for notice in notices {
             match notice.kind {
                 NoticeKind::NewApp { app, .. } => new_apps.push(display_safe(&app)),
+                NoticeKind::BlockedCopy { app, path, .. } => {
+                    blocked_copies.push((display_safe(&app), display_safe(&path)));
+                }
                 NoticeKind::Alert {
                     alert,
                     severity,
@@ -280,6 +287,7 @@ impl Checker {
         Ok(Snapshot {
             status,
             new_apps,
+            blocked_copies,
             alerts,
             last_notice,
         })
@@ -445,6 +453,16 @@ impl Checker {
 
         // Only notices that arrive while the app runs are announced.
         if self.last_notice.is_some() {
+            if !snapshot.blocked_copies.is_empty() {
+                let show_names = app
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .show_names;
+                let (title, body) = blocked_copies_text(&snapshot.blocked_copies, show_names);
+                notify(app, &title, &body);
+            }
             self.new_apps.extend(snapshot.new_apps);
             self.announce_alerts(app, snapshot.alerts, now);
         }
@@ -464,6 +482,29 @@ impl Checker {
             self.new_apps.clear();
             self.last_new_apps = Some(now);
         }
+    }
+}
+
+/// The notification for copies of blocked programs that were blocked too:
+/// without names unless allowed.
+fn blocked_copies_text(copies: &[(String, String)], show_names: bool) -> (String, String) {
+    let lift = "It is on the Rules screen, where you can lift it.";
+    match (copies, show_names) {
+        ([(app, path)], true) => (
+            format!("Whereabouts blocked a copy of {app}"),
+            format!("{path} is the same program as one you blocked. {lift}"),
+        ),
+        ([_], false) => (
+            String::from("Whereabouts blocked a copy of a blocked app"),
+            format!("The same program ran from another folder. {lift}"),
+        ),
+        (many, _) => (
+            format!("Whereabouts blocked {} copies of blocked apps", many.len()),
+            String::from(
+                "The same programs ran from other folders. They are on the Rules screen, \
+                 where you can lift them.",
+            ),
+        ),
     }
 }
 
