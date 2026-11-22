@@ -127,7 +127,7 @@ An automated security review of the pushed Medium fixes found two weaknesses in 
 - **Copy-blocking could be steered (medium).** Copies were compared with the file *now* at the blocked
   path. uTorrent Web's folder is user-writable, so swapping another program's file in there would have
   got that other program blocked, and many copies could fill all 256 rule slots. Each app rule now
-  keeps the SHA-256 pinned when it was made (saved; older rules pinned on first use), copies are added
+  keeps the SHA-256 pinned when it was made (saved and removed with the rule; older rules pinned once at service start, never lazily; an unreadable file is pinned as "none", which never matches; a second review round found the lazy pinning and the stale pins), copies are added
   only while 64 slots stay free, and at most 5 an hour.
 
 ## Medium
