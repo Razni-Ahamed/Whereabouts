@@ -548,6 +548,7 @@ Implementation notes (v0.2, N6 list updates, 2026-11-20):
 - UI renders domain names as text only (no HTML injection); strict Content Security Policy in Tauri; Tauri capabilities limited to what the UI needs.
 - CI: `cargo fmt`, `clippy -D warnings`, tests, `cargo-audit`, `cargo-deny` (licences + advisories), secret scanning.
 - Releases: code-signed installer (MSI), checksums, and a public changelog.
+  - Signing is built in but needs a certificate (decision D7): `scripts/build-release.ps1 -SignThumbprint <SHA-1>` (or `WHEREABOUTS_SIGN_THUMBPRINT`) signs the service with signtool, Tauri signs the app, uninstaller and installer, and the build fails unless all are signed by that certificate (RFC 3161 timestamps). Until then releases are unsigned: SmartScreen warns, and Whereabouts lists its own service as UNSIGNED (security test, 2026-11-22).
 - `SECURITY.md` with a private vulnerability reporting route (GitHub private advisories).
 
 ---

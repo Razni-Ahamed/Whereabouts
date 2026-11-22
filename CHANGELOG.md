@@ -11,6 +11,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - CI runs the UI's own tests (Node's built-in test runner; no new packages).
 - **For developers: a detection lab** (`lab/`, never shipped, never real user data). Scripted sessions of real apps, started logged out, are recorded on GitHub's disposable Windows runners, stitched into simulated user-weeks with staged problems and replayed through the shipped detection code, which moved into the `whereabouts-detect` crate (no change in behaviour). It reports false alarms per user-week, detection rate and time to detect. `whereabouts-service --status --json` prints the status for scripts.
 - **Web content is credited to the app that shows it.** Pages and ads that apps such as uTorrent Web show in their window (through Microsoft Edge WebView2) appeared as "msedgewebview2", by Microsoft. They now appear under the app itself, marked "web content", and blocking from them blocks that app.
+- **Release builds can be code-signed.** `scripts/build-release.ps1 -SignThumbprint <thumbprint>` signs the service, the app, its uninstaller and the installer, and checks every signature; without a certificate the build says it is unsigned.
 
 ### Security
 
