@@ -131,7 +131,7 @@
 
   <main>
     {#key screen}
-      <div class="fade-in">
+      <div class="screen-in">
         {#if screen === 'overview'}
           <Overview onpickapp={openApp} ongo={(s: Screen) => (screen = s)} />
         {:else if screen === 'apps'}

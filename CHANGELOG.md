@@ -13,7 +13,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ### Fixed
 
-- The frosted-glass cards now blur what is behind them. A screen's fade-in animation stayed in effect after it ended, which switched the blur off for every card on that screen.
+- The frosted-glass cards now blur what is behind them. A screen's fade-in animation stayed in effect after it ended, which switched the blur off for every card on that screen. Switching screens also showed the cards unblurred for half a second while the screen faded in; the cards are now frosted from the first frame and only their contents fade in.
 
 ## [0.2.0] - 2026-11-20
 

@@ -221,6 +221,27 @@ button {
 .fade-in {
   animation: fade-in 0.5s var(--ease) backwards;
 }
+/* A new screen's cards are frosted from the first frame: each card only rises,
+   and what is inside it fades in. Nothing that holds a card may fade, because an
+   element with opacity below 1 is a backdrop root: fading the screen's wrapper
+   left every card unblurred until the fade ended, and fading a card itself lets
+   the sharp background show through it. Everything a screen shows sits inside a card. */
+.screen-in .glass:not(.glass .glass) {
+  animation: rise 0.5s var(--ease) backwards;
+}
+.screen-in .glass:not(.glass .glass) > * {
+  animation: appear 0.5s var(--ease) backwards;
+}
+@keyframes rise {
+  from {
+    transform: translateY(6px);
+  }
+}
+@keyframes appear {
+  from {
+    opacity: 0;
+  }
+}
 @keyframes fade-in {
   from {
     opacity: 0;
