@@ -18,9 +18,10 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB,
-    FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_OVERLAPPING,
-    FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0,
-    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0,
+    FWP_BYTE_BLOB_TYPE, FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_CONDITION_VALUE0,
+    FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_OVERLAPPING, FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_NONE_SET,
+    FWP_UINT8, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID,
+    FWPM_CONDITION_FLAGS, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0,
     FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
     FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0,
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
@@ -60,6 +61,8 @@ pub struct FilterSpec<'a> {
     pub data: &'a [u8],
     pub app: Option<&'a Path>,
     pub remote: Option<IpAddr>,
+    /// Leave loopback connections (this computer to itself) alone.
+    pub except_loopback: bool,
     /// Allow instead of block. Allows outrank our blocks (they have a
     /// higher weight in our sublayer); they never affect other sublayers.
     pub permit: bool,
@@ -276,6 +279,18 @@ impl Engine {
                 io::ErrorKind::InvalidInput,
                 "a block needs a program or an address",
             ));
+        }
+        if spec.except_loopback {
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_FLAGS,
+                matchType: FWP_MATCH_FLAGS_NONE_SET,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint32: FWP_CONDITION_FLAG_IS_LOOPBACK,
+                    },
+                },
+            });
         }
         let mut name = Wide::new(spec.name);
         let mut description = Wide::new(spec.description);

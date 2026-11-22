@@ -461,9 +461,12 @@ impl<F: Firewalls> Blocker<F> {
             }
         }
         for block in &wanted {
-            if !current.iter().any(|c| same_rule(c, block))
-                && let Err(error) = self.firewall.block(block)
-            {
+            // App blocks are always added again (harmless when complete):
+            // those made by 0.2.0 have no filters for incoming connections,
+            // and listing finds them by their outgoing ones.
+            let missing =
+                matches!(block, Block::App { .. }) || !current.iter().any(|c| same_rule(c, block));
+            if missing && let Err(error) = self.firewall.block(block) {
                 warnings.push(format!("could not block {}: {error}", block.describe()));
             }
         }

@@ -280,12 +280,17 @@ fn describe(rule: &RuleSpec) -> (String, String) {
     const EVERY_APP_NOTE: &str = "This applies to every app on this computer. Whereabouts never \
                                   blocks addresses that other, unblocked sites also use, nor what \
                                   Windows needs to stay online.";
+    const WEB_PAGES_NOTE: &str = "If the app shows web pages inside its window (some apps use \
+                                  Microsoft Edge WebView2 for this, often for ads), those are \
+                                  blocked from the next time the app starts. Its own local pages \
+                                  keep working.";
     let undo = "You can unblock it at any time on the Rules screen.";
     match rule {
         RuleSpec::App { path } => (
             format!("Block {}?", program_name(path)),
             format!(
-                "Every connection {} makes will be blocked, until you unblock it.\n\n{}\n\n{undo}",
+                "Every connection {} makes or accepts will be blocked, until you unblock \
+                 it.\n\n{}\n\n{WEB_PAGES_NOTE}\n\n{undo}",
                 program_name(path),
                 display_safe(path)
             ),
@@ -722,6 +727,8 @@ mod tests {
         let (title, text) = describe(&RuleSpec::App { path: app.clone() });
         assert_eq!(title, "Block chat.exe?");
         assert!(text.contains(&app));
+        assert!(text.contains("makes or accepts"), "both directions");
+        assert!(text.contains("next time the app starts"), "WebView2 pages");
 
         let (title, text) = describe(&RuleSpec::Domain {
             name: String::from("ads.example.com"),
