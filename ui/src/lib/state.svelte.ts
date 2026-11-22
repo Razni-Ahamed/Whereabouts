@@ -1,5 +1,6 @@
 // App-wide state, refreshed from the service.
 
+import { groupByApp } from './apps';
 import {
   addRule,
   alerts,
@@ -19,7 +20,6 @@ import type {
   AlertView,
   AppSettings,
   AppTotals,
-  FlowView,
   Live,
   Problem,
   Rules,
@@ -59,7 +59,7 @@ class Store {
   #lastTotal: { bytes: number; at: number } | null = null;
   readonly demo = isDemo;
 
-  /** Current flows grouped by app, largest first. */
+  /** Current flows grouped by program (full path), largest first. */
   apps = $derived.by(() => groupByApp(this.live?.flows ?? []));
 
   async refreshLive(): Promise<void> {
@@ -212,58 +212,7 @@ class Store {
   }
 }
 
-export interface AppGroup {
-  app: string;
-  /** The program's full path, if the service knows it. */
-  path: string | null;
-  publisher: string;
-  publisherConfirmed: boolean;
-  flows: FlowView[];
-  sent: number;
-  received: number;
-  destinations: number;
-  countries: string[];
-  trackers: number;
-}
-
-const TRACKING_KINDS = ['analytics', 'advertising', 'tracking', 'attribution'];
-
-export function isTracking(owner: string | null): boolean {
-  const kind = owner?.split(' · ')[1];
-  return !!kind && (TRACKING_KINDS.includes(kind) || owner?.startsWith('tracker') === true);
-}
-
-function groupByApp(flows: FlowView[]): AppGroup[] {
-  const groups = new Map<string, AppGroup>();
-  for (const flow of flows) {
-    let group = groups.get(flow.app);
-    if (!group) {
-      group = {
-        app: flow.app,
-        path: null,
-        publisher: flow.publisher,
-        publisherConfirmed: flow.publisher_confirmed,
-        flows: [],
-        sent: 0,
-        received: 0,
-        destinations: 0,
-        countries: [],
-        trackers: 0,
-      };
-      groups.set(flow.app, group);
-    }
-    group.flows.push(flow);
-    group.path ??= flow.path;
-    group.sent += flow.bytes_sent;
-    group.received += flow.bytes_received;
-    if (flow.country && !group.countries.includes(flow.country)) group.countries.push(flow.country);
-    if (isTracking(flow.owner)) group.trackers += 1;
-  }
-  for (const group of groups.values()) {
-    group.destinations = new Set(group.flows.map((f) => f.domain ?? f.remote)).size;
-  }
-  return [...groups.values()].sort((a, b) => b.sent + b.received - (a.sent + a.received));
-}
+export { isTracking, type AppGroup } from './apps';
 
 /** The address part of "1.2.3.4:443" or "[2001:db8::1]:443". */
 export function remoteAddress(remote: string): string | null {

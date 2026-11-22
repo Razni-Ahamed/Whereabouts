@@ -2,6 +2,7 @@
   import { Ban, Check, EyeOff, Ghost, Radar, ShieldCheck, Siren } from '@lucide/svelte';
   import AppAvatar from '../lib/components/AppAvatar.svelte';
   import BlockMenu from '../lib/components/BlockMenu.svelte';
+  import { appKey } from '../lib/apps';
   import { appLabel } from '../lib/format';
   import { store } from '../lib/state.svelte';
   import type { AlertView, FlowView } from '../lib/types';
@@ -143,7 +144,7 @@
             </div>
             <p class="why">{text.why}</p>
             {#if alert.app}
-              <button class="who" type="button" title={alert.path ?? undefined} onclick={() => onpickapp(alert.app ?? '')}>
+              <button class="who" type="button" title={alert.path ?? undefined} onclick={() => onpickapp(alert.app ? appKey(alert.app, alert.path) : '')}>
                 <AppAvatar app={alert.app} size={20} />
                 {alert.path ?? alert.app}
               </button>

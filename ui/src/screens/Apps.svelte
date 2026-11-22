@@ -4,6 +4,7 @@
   import FlowTable from '../lib/components/FlowTable.svelte';
   import Trust from '../lib/components/Trust.svelte';
   import { appLabel, bytes, countryName } from '../lib/format';
+  import { findApp, folderOf } from '../lib/apps';
   import { appRule, store } from '../lib/state.svelte';
 
   let { selected = $bindable() }: { selected: string | null } = $props();
@@ -12,9 +13,8 @@
   const apps = $derived(
     store.apps.filter((a) => a.app.toLowerCase().includes(query.trim().toLowerCase())),
   );
-  const current = $derived(
-    store.apps.find((a) => a.app === selected) ?? store.apps[0] ?? null,
-  );
+  // `selected` is an app's key, or a plain name from screens that only know the name.
+  const current = $derived(findApp(store.apps, selected) ?? store.apps[0] ?? null);
   const saved = $derived(current ? store.history.find((h) => h.app === current.app) : undefined);
   const rule = $derived(appRule(store.rules, current?.path ?? null));
   let busy = $state(false);
@@ -41,17 +41,21 @@
       <input placeholder="Search apps" bind:value={query} />
     </label>
     <ul>
-      {#each apps as app (app.app)}
+      {#each apps as app (app.key)}
         <li>
           <button
             type="button"
-            class:active={current?.app === app.app}
-            onclick={() => (selected = app.app)}
+            class:active={current?.key === app.key}
+            onclick={() => (selected = app.key)}
+            title={app.path ?? undefined}
           >
             <AppAvatar app={app.app} size={36} />
             <span class="who">
               <span class="name">{appLabel(app.app)}</span>
               <span class="pub">{app.publisher === '-' ? 'no program file' : app.publisher}</span>
+              {#if app.sameName}
+                <span class="folder">{app.path ? folderOf(app.path) : 'program file unknown'}</span>
+              {/if}
             </span>
             <span class="total num">{bytes(app.sent + app.received)}</span>
           </button>
@@ -197,12 +201,17 @@
   .name {
     font-weight: 600;
   }
-  .who .pub {
+  .who .pub,
+  .who .folder {
     font-size: 12px;
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Two programs share a name: the folder tells them apart. */
+  .who .folder {
+    color: var(--warn);
   }
   .total {
     font-size: 12.5px;

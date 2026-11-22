@@ -14,6 +14,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 ### Security
 
 - **Only the Whereabouts app, or a command line run as administrator, can change your blocks.** Any program could run Whereabouts' command line to pause blocking or remove a rule without asking you, so a blocked app could unblock itself. The same goes for deleting history, silencing alerts and list-update settings. Reading (`--status`, `--rules`) still works without administrator rights.
+- **Programs that share a name are no longer merged.** The Apps screen grouped connections by file name, so a program called `chrome.exe` in any folder appeared inside real Chrome's card, with Google's name and "signed" badge. Each program file now has its own card, and programs with the same name show their folder.
 
 ### Fixed
 

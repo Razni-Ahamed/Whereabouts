@@ -4,6 +4,7 @@
   import BlockMenu from './BlockMenu.svelte';
   import Trust from './Trust.svelte';
   import { appLabel, bytes, countryName, ownerParts } from '../format';
+  import { appKey } from '../apps';
   import { isTracking } from '../state.svelte';
   import type { FlowView } from '../types';
 
@@ -36,7 +37,7 @@
     {@const owner = ownerParts(flow.owner)}
     <div class="row" role="row" class:noapp={!showApp} class:closed={!flow.active}>
       {#if showApp}
-        <button class="app" type="button" onclick={() => onpickapp?.(flow.app)} title="PID {flow.pid}">
+        <button class="app" type="button" onclick={() => onpickapp?.(appKey(flow.app, flow.path))} title="PID {flow.pid}">
           <AppAvatar app={flow.app} size={30} />
           <span class="stack">
             <span class="name">{appLabel(flow.app)}</span>
