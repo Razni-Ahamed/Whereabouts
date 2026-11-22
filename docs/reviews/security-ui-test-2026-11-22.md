@@ -20,15 +20,15 @@ Test rules and test programs were removed afterwards; no saved data was deleted.
 | M4 | Medium | WebView2 traffic is shown as `msedgewebview2`, not the app that owns it | **Fixed**, verified live |
 | M5 | Medium | "Delete everything" is the default button of an irreversible dialog | **Fixed**, verified live |
 | M6 | Medium | No file is code-signed; Whereabouts labels itself "UNSIGNED" | **Ready**: signing built in, needs a certificate |
-| L1 | Low | The service reveals whether a file exists in folders the user cannot read | Confirmed |
-| L2 | Low | The desktop app re-sends a request after any error, not only a lost connection | Code |
-| L3 | Low | No idle timeout on pipe clients (4 slots) | Code |
-| L4 | Low | Domain rules do not stop apps that resolve names themselves (DoH, fixed IPs) | Confirmed |
-| L5 | Low | Public suffixes (`co.uk`) and non-program files are accepted as rules | Confirmed |
-| L6 | Low | Rule IDs are reused | Confirmed |
-| L7 | Low | A user who creates `%ProgramData%\Whereabouts` first stops the service starting | Code |
-| L8 | Low | Tracker false positive: `lsass` → `geotrust.com` (certificate checks) | Seen |
-| L9 | Low | UI copy and layout nits | Confirmed |
+| L1 | Low | The service reveals whether a file exists in folders the user cannot read | **Fixed** (closed by H1), verified live |
+| L2 | Low | The desktop app re-sends a request after any error, not only a lost connection | **Fixed** |
+| L3 | Low | No idle timeout on pipe clients (4 slots) | **Fixed** |
+| L4 | Low | Domain rules do not stop apps that resolve names themselves (DoH, fixed IPs) | **Fixed** |
+| L5 | Low | Public suffixes (`co.uk`) and non-program files are accepted as rules | **Fixed**, verified live |
+| L6 | Low | Rule IDs are reused | **Fixed**, verified live |
+| L7 | Low | A user who creates `%ProgramData%\Whereabouts` first stops the service starting | **Fixed**, verified live |
+| L8 | Low | Tracker false positive: `lsass` → `geotrust.com` (certificate checks) | **Fixed** |
+| L9 | Low | UI copy and layout nits | **Fixed**, verified live |
 
 ## High
 
@@ -129,6 +129,27 @@ An automated security review of the pushed Medium fixes found two weaknesses in 
   got that other program blocked, and many copies could fill all 256 rule slots. Each app rule now
   keeps the SHA-256 pinned when it was made (saved and removed with the rule; older rules pinned once at service start, never lazily; an unreadable file is pinned as "none", which never matches; a second review round found the lazy pinning and the stale pins), copies are added
   only while 64 slots stay free, and at most 5 an hour.
+
+### Re-test of the Low findings (same day, installer rebuilt and installed)
+
+- **L1:** a normal user's `--block-app` on a file in a folder it cannot read is refused before any
+  path is looked at ("needs the Whereabouts app, or administrator rights").
+- **L2:** the app retries only a lost connection (`ProblemKind::Lost`), never an error answer.
+- **L3:** a client silent for 2 minutes is let go (a watchdog cancels its read with `CancelIoEx`);
+  test `a_silent_client_is_disconnected_and_frees_its_place` fills all 4 places with silent clients.
+- **L4:** the domain-block dialog and menu say that programs using their own DNS or fixed addresses
+  can get around a domain block.
+- **L5:** as administrator, `--block-domain co.uk` ("shared by many unrelated sites") and
+  `--block-app ...\drivers\etc\hosts` ("not a program") are refused.
+- **L6:** a rule with ID 2 was removed; the next rule got ID 3.
+- **L7:** an empty `%ProgramData%` folder made by the normal account was replaced by a new one owned
+  by Administrators; one holding a planted `whereabouts.db` was refused. A first version adopted the
+  folder in place; an automated review pointed out that a handle its maker opened earlier would keep
+  its access, so the folder is now removed and created anew, and a folder held open is refused.
+- **L8:** no tracker alerts for `lsass`, `svchost`, `services`, `wininit` and `winlogon` in System32
+  (copies with those names elsewhere still get them).
+- **L9:** "No connections match." for an empty search; the tab bar stays in view while scrolling;
+  "1 internet connection"; the installer removed the leftover `.before-wal` file.
 
 ## Medium
 
