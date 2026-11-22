@@ -176,10 +176,6 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     let mut store = match crate::storage::open() {
         Ok(mut store) => {
             crate::storage::apply_retention(&mut store);
-            println!(
-                "Saving finished flows, encrypted, to {}",
-                crate::storage::home_dir().display()
-            );
             Some(store)
         }
         Err(error) => {
@@ -187,6 +183,17 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             None
         }
     };
+    let mut history = crate::history::HistorySwitch::load(store.as_ref());
+    if store.is_some() {
+        if history.on() {
+            println!(
+                "Saving finished flows, encrypted, to {}",
+                crate::storage::home_dir().display()
+            );
+        } else {
+            println!("Not saving finished flows: history is turned off");
+        }
+    }
     let mut last_retention = Instant::now();
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
     let mut detector = crate::alerts::load_detector();
@@ -225,7 +232,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     let mut table = FlowTable::new();
     let mut names = ProcessNames::new();
     let mut closed = Closed {
-        keep_evicted: store.is_some(),
+        keep_evicted: store.is_some() && history.on(),
         ..Closed::default()
     };
     let mut exited = RecentlyExited::default();
@@ -315,6 +322,15 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                     let _ = reply.send(result);
                 }
+                crate::server::EngineCommand::SetSaveHistory {
+                    save,
+                    delete_saved,
+                    reply,
+                } => {
+                    let result =
+                        set_save_history(&mut store, &mut closed, &mut history, save, delete_saved);
+                    let _ = reply.send(result);
+                }
                 crate::server::EngineCommand::ReloadData => {
                     if options.data_dir.is_none() {
                         let (fresh, report) = Enricher::load(&data_dir());
@@ -368,7 +384,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 table.take_idle(SystemTime::now(), IDLE_AFTER),
             );
             if let Some(store) = store.as_mut() {
-                save_closed(store, &mut closed, &names, &enricher, false);
+                store_finished(store, &mut closed, &names, &enricher, history, false);
                 if last_retention.elapsed() >= RETENTION_EVERY {
                     crate::storage::apply_retention(store);
                     last_retention = Instant::now();
@@ -429,7 +445,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 unattributed: view.unattributed,
                 active_flows: u64::try_from(view.active).unwrap_or(u64::MAX),
                 kernel_events_protected: capture.kernel_events_protected(),
-                saving: store.is_some(),
+                saving: store.is_some() && history.on(),
+                save_history: history.choice(),
                 tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
                 block_rules,
                 blocking_paused,
@@ -465,7 +482,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     }
 
     names.settle(Duration::from_secs(5));
-    if let Some(store) = store.as_mut() {
+    if let Some(store) = store.as_mut().filter(|_| history.on()) {
         save_closed(store, &mut closed, &names, &enricher, true);
         let active: Vec<FlowRecord> = table
             .snapshot()
@@ -978,14 +995,64 @@ fn save_closed(
     }
 }
 
+/// Saves finished flows if history is on; otherwise forgets them, so they
+/// are only ever shown live.
+fn store_finished(
+    store: &mut Store,
+    closed: &mut Closed,
+    names: &ProcessNames,
+    enricher: &Enricher,
+    history: crate::history::HistorySwitch,
+    everything: bool,
+) {
+    if history.on() {
+        save_closed(store, closed, names, enricher, everything);
+    } else {
+        forget_unsaved(closed);
+    }
+}
+
+/// Marks every finished flow as dealt with and drops those waiting to be
+/// saved, so none of them is saved later. They stay on the live list.
+fn forget_unsaved(closed: &mut Closed) {
+    closed.unsaved_evicted.clear();
+    closed.lost = 0;
+    for row in &mut closed.rows {
+        row.saved = true;
+    }
+}
+
+/// Saves the user's choice whether to save history and applies it. Turning
+/// it off forgets finished flows not saved yet (nothing more is saved), and
+/// with `delete_saved` deletes the saved flows and hourly totals. Turning
+/// it on saves only flows that finish from then on.
+fn set_save_history(
+    store: &mut Option<Store>,
+    closed: &mut Closed,
+    history: &mut crate::history::HistorySwitch,
+    save: bool,
+    delete_saved: bool,
+) -> Result<(), String> {
+    let Some(store) = store.as_mut() else {
+        return Err(String::from(
+            "the database could not be opened, so nothing is saved anyway",
+        ));
+    };
+    // Flows that finished while history was off are never saved, even if
+    // it is turned on before they were forgotten.
+    if !(save && history.on()) {
+        forget_unsaved(closed);
+    }
+    let result = history.set(store, save, delete_saved);
+    closed.keep_evicted = history.on();
+    result
+}
+
 /// Deletes all saved data, and forgets finished flows that were waiting to
 /// be saved, so nothing from before reappears. Flows still open are saved
 /// as usual when they finish.
 fn delete_everything(store: &mut Option<Store>, closed: &mut Closed) -> Result<(), String> {
-    closed.unsaved_evicted.clear();
-    for row in &mut closed.rows {
-        row.saved = true;
-    }
+    forget_unsaved(closed);
     let result = match store.as_mut() {
         Some(store) => store.wipe().map_err(|e| e.to_string()),
         // Not saving now, but older data may exist.
@@ -1521,6 +1588,105 @@ mod tests {
         let _ = delete_everything(&mut None, &mut closed);
         assert!(closed.unsaved_evicted.is_empty());
         assert!(closed.rows.iter().all(|row| row.saved));
+    }
+
+    fn temp_store(name: &str) -> (Store, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("whereabouts-console-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = whereabouts_store::Key::from_bytes([8; 32]);
+        (Store::open(&dir.join("t.db"), &key).unwrap(), dir)
+    }
+
+    /// A flow that finished long enough ago to be saved.
+    fn finished(remote: &str) -> Row {
+        let mut row = row_to(remote, None);
+        row.closed_at = Instant::now().checked_sub(LATE_TRAFFIC_WINDOW * 2);
+        row
+    }
+
+    #[test]
+    fn no_flows_are_saved_while_history_is_off() {
+        let (store, dir) = temp_store("off");
+        let mut store = Some(store);
+        let names = ProcessNames::new();
+        let enricher = enricher();
+        let mut history = crate::history::HistorySwitch::load(store.as_ref());
+        let mut closed = Closed {
+            keep_evicted: history.on(),
+            ..Closed::default()
+        };
+
+        // On (the default): finished flows are saved.
+        closed.push(finished("203.0.113.1:443"));
+        let saved = store.as_mut().unwrap();
+        store_finished(saved, &mut closed, &names, &enricher, history, false);
+        assert_eq!(saved.flow_count().unwrap(), 1);
+
+        // Off: a flow waiting to be saved, and later ones, are forgotten,
+        // even at shutdown; they stay on the live list.
+        closed.push(finished("203.0.113.2:443"));
+        set_save_history(&mut store, &mut closed, &mut history, false, false).unwrap();
+        assert!(!closed.keep_evicted);
+        closed.push(finished("203.0.113.3:443"));
+        let saved = store.as_mut().unwrap();
+        store_finished(saved, &mut closed, &names, &enricher, history, false);
+        store_finished(saved, &mut closed, &names, &enricher, history, true);
+        assert_eq!(saved.flow_count().unwrap(), 1, "kept what was saved before");
+        assert_eq!(closed.rows.len(), 3);
+        // Evicted rows are not kept for saving either.
+        for _ in 0..MAX_CLOSED {
+            closed.push(finished("203.0.113.4:443"));
+        }
+        assert!(closed.unsaved_evicted.is_empty());
+
+        // The choice survives a restart.
+        assert!(!crate::history::HistorySwitch::load(store.as_ref()).on());
+
+        // On again: only flows that finish from now on are saved.
+        set_save_history(&mut store, &mut closed, &mut history, true, false).unwrap();
+        assert!(closed.keep_evicted);
+        closed.push(finished("203.0.113.5:443"));
+        let saved = store.as_mut().unwrap();
+        store_finished(saved, &mut closed, &names, &enricher, history, false);
+        assert_eq!(saved.flow_count().unwrap(), 2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn turning_history_off_can_delete_what_was_saved() {
+        let (store, dir) = temp_store("delete");
+        let mut store = Some(store);
+        let names = ProcessNames::new();
+        let mut history = crate::history::HistorySwitch::default();
+        let mut closed = Closed::default();
+        closed.push(finished("203.0.113.1:443"));
+        let saved = store.as_mut().unwrap();
+        store_finished(saved, &mut closed, &names, &enricher(), history, true);
+        saved
+            .add_rule(
+                &whereabouts_store::RuleTarget::App {
+                    path: String::from("C:/Apps/a.exe"),
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        set_save_history(&mut store, &mut closed, &mut history, false, true).unwrap();
+        let saved = store.as_ref().unwrap();
+        assert_eq!(saved.flow_count().unwrap(), 0);
+        assert_eq!(saved.rules().unwrap().len(), 1, "rules are kept");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_cannot_be_switched_without_a_database() {
+        let mut closed = Closed::default();
+        let mut history = crate::history::HistorySwitch::default();
+        assert!(set_save_history(&mut None, &mut closed, &mut history, false, true).is_err());
+        assert_eq!(history.choice(), None);
     }
 
     #[test]

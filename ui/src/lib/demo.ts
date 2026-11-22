@@ -14,6 +14,9 @@ export const demoLists: ListsView = {
   checking: false,
 };
 
+/** Demo choice to save history (null until chosen), kept while the page is open. */
+export const demoHistorySetting: { save: boolean | null } = { save: null };
+
 /** Where the demo apps live. */
 const PATHS: Record<string, string> = {
   'chrome.exe': 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -116,7 +119,8 @@ export function demoLive(): Live {
       unattributed: 0,
       active_flows: flows.filter((f) => f.active).length + 23,
       kernel_events_protected: true,
-      saving: true,
+      saving: demoHistorySetting.save !== false,
+      save_history: demoHistorySetting.save,
       tracker_domains: 47_359,
       block_rules: demo.rules.length,
       blocking_paused: demo.paused,

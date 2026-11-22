@@ -3,7 +3,9 @@
 //! Everything lives in one folder, by default `%ProgramData%\Whereabouts`,
 //! which is restricted to SYSTEM and Administrators:
 //!
-//! - `whereabouts.db`: the SQLCipher database;
+//! - `whereabouts.db`: the SQLCipher database, with its write-ahead log
+//!   `whereabouts.db-wal` (encrypted too) and its index `whereabouts.db-shm`
+//!   (page numbers only) while it is open;
 //! - `database.key`: the database key, encrypted with DPAPI for this
 //!   computer (older versions used `store.key`, encrypted for one account;
 //!   it is moved over automatically);
@@ -20,6 +22,13 @@ use whereabouts_win_secrets::{
 
 /// Database file name.
 const DATABASE_FILE: &str = "whereabouts.db";
+/// Files SQLite keeps next to the database: the write-ahead log, its index,
+/// and the rollback journal of older versions.
+const DATABASE_SIDE_FILES: [&str; 3] = [
+    "whereabouts.db-wal",
+    "whereabouts.db-shm",
+    "whereabouts.db-journal",
+];
 /// Protected key file name.
 const KEY_FILE: &str = "database.key";
 /// Key file of older versions (protected for one account only).
@@ -84,7 +93,10 @@ pub fn open() -> Result<Store, String> {
     let home = prepare_home()?;
     // Existing files must not be links and must belong to SYSTEM or
     // Administrators, or someone could have planted them.
-    for file in [KEY_FILE, LEGACY_KEY_FILE, DATABASE_FILE] {
+    for file in [KEY_FILE, LEGACY_KEY_FILE, DATABASE_FILE]
+        .into_iter()
+        .chain(DATABASE_SIDE_FILES)
+    {
         ensure_private_file(&home.join(file)).map_err(|e| e.to_string())?;
     }
     let key = load_or_create_key(&home.join(KEY_FILE), &home.join(LEGACY_KEY_FILE))

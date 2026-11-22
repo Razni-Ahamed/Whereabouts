@@ -252,9 +252,14 @@ fn print_status(version: &str, status: &Status) {
         status.events, status.dropped, status.unreadable, status.over_limit
     );
     println!(
-        "Active flows: {} · saving history: {} · tracker domains: {}",
+        "Active flows: {} · saving history: {}{} · tracker domains: {}",
         status.active_flows,
         yes_no(status.saving),
+        if status.save_history == Some(false) {
+            " (turned off)"
+        } else {
+            ""
+        },
         status.tracker_domains
     );
     println!(

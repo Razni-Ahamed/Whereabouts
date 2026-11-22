@@ -13,6 +13,7 @@ mod apps;
 mod blocking;
 mod client;
 mod console;
+mod history;
 mod install;
 mod server;
 mod service_mode;

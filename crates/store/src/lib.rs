@@ -3,7 +3,9 @@
 //! Flows are kept in an SQLCipher database: the whole file is encrypted with
 //! a 256-bit key, so not even the table layout is readable without it. The
 //! caller supplies the key (on Windows it is protected with DPAPI by the
-//! `win-secrets` crate). Deleted data is overwritten (`secure_delete`).
+//! `win-secrets` crate). Changes are first written to a write-ahead log
+//! (`<database>-wal`), encrypted the same way. Deleted data is overwritten
+//! (`secure_delete`), and deleting the history also empties the log.
 //!
 //! Retention (privacy principle P5): individual flows are kept for a limited
 //! time (default 30 days), then folded into hourly totals per app and domain,
@@ -66,6 +68,9 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     /// A file error.
     Io(io::Error),
+    /// The data was deleted, but a reader kept the old copy in the
+    /// write-ahead log from being cleared.
+    LogBusy,
 }
 
 impl fmt::Display for StoreError {
@@ -78,6 +83,10 @@ impl fmt::Display for StoreError {
             ),
             Self::Sqlite(error) => write!(f, "database error: {error}"),
             Self::Io(error) => write!(f, "file error: {error}"),
+            Self::LogBusy => f.write_str(
+                "the data was deleted, but its old copy in the database log could not be cleared \
+                 yet because the database was busy; please try again",
+            ),
         }
     }
 }
@@ -181,6 +190,18 @@ pub struct RetentionReport {
     pub hourly_deleted: u64,
 }
 
+/// How changes reach the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Journal {
+    /// Changes are appended to `<database>-wal` and copied into the
+    /// database now and then (what Whereabouts uses).
+    WriteAheadLog,
+    /// SQLite's default: the old pages are copied to `<database>-journal`,
+    /// which is created and deleted for every save (Whereabouts 0.2 and
+    /// earlier).
+    Rollback,
+}
+
 /// The encrypted database.
 #[derive(Debug)]
 pub struct Store {
@@ -189,8 +210,15 @@ pub struct Store {
 
 impl Store {
     /// Opens (or creates) the database at `path` with `key`, and brings its
-    /// layout up to date.
+    /// layout up to date. Changes go through a write-ahead log
+    /// ([`Journal::WriteAheadLog`]).
     pub fn open(path: &Path, key: &Key) -> Result<Self, StoreError> {
+        Self::open_with_journal(path, key, Journal::WriteAheadLog)
+    }
+
+    /// Like [`Store::open`], but choosing how changes reach the file (to
+    /// compare them; Whereabouts itself always uses the write-ahead log).
+    pub fn open_with_journal(path: &Path, key: &Key, journal: Journal) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", key.sqlcipher_literal())?;
         // SQLCipher only checks the key when the file is first read.
@@ -208,6 +236,24 @@ impl Store {
         // The service and its pipe clients' requests use separate
         // connections; wait for a moment rather than fail if one is writing.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Write-ahead log instead of a rollback journal: a save appends the
+        // changed pages to `<database>-wal` (encrypted like the database),
+        // and they are copied into the database now and then. That writes
+        // far less than creating, filling and deleting a journal for every
+        // save, and readers no longer wait for the writer. With
+        // `synchronous=NORMAL`, a crash of the service loses nothing; a power
+        // cut can lose the last few seconds of history, never the database.
+        // The setting is kept in the file, so this only changes a database
+        // still using the journal. If it cannot be changed (it needs a
+        // moment with no other connection reading), the journal keeps
+        // working and the next start tries again.
+        let (mode, synchronous) = match journal {
+            Journal::WriteAheadLog => ("WAL", "NORMAL"),
+            Journal::Rollback => ("DELETE", "FULL"),
+        };
+        let _mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", mode, |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", synchronous)?;
         conn.pragma_update(None, "secure_delete", true)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let store = Self { conn };
@@ -714,12 +760,36 @@ impl Store {
     }
 
     /// Deletes every stored flow and hourly total and compacts the file, so
-    /// the deleted data is not left behind in free pages.
+    /// the deleted data is not left behind in free pages or in the log.
     pub fn wipe(&mut self) -> Result<(), StoreError> {
         self.conn.execute_batch(
             "DELETE FROM flows; DELETE FROM hourly; DELETE FROM known_apps; DELETE FROM alerts; VACUUM;",
         )?;
-        Ok(())
+        self.empty_log()
+    }
+
+    /// Deletes every stored flow and hourly total, but keeps alerts, rules,
+    /// known apps and settings, and compacts the file (for turning history
+    /// off).
+    pub fn delete_history(&mut self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("DELETE FROM flows; DELETE FROM hourly; VACUUM;")?;
+        self.empty_log()
+    }
+
+    /// Copies everything in the write-ahead log into the database and cuts
+    /// the log to nothing, so older copies of deleted pages do not stay in
+    /// `<database>-wal`. Waits (up to the busy timeout) for readers of older
+    /// data to finish.
+    fn empty_log(&self) -> Result<(), StoreError> {
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy == 0 {
+            Ok(())
+        } else {
+            Err(StoreError::LogBusy)
+        }
     }
 }
 
@@ -1438,6 +1508,8 @@ mod tests {
             .unwrap();
         }
         let mut store = Store::open(&path, &key(9)).unwrap();
+        // Older versions used a rollback journal; it is switched over.
+        assert_eq!(journal_mode(&store), "wal");
         // The programs in the history are known apps from the start.
         assert_eq!(
             store.known_app_keys().unwrap(),
@@ -1568,6 +1640,185 @@ mod tests {
             .unwrap();
         store.wipe().unwrap();
         assert_eq!(store.flow_count().unwrap(), 0);
+    }
+
+    fn wal_of(path: &Path) -> PathBuf {
+        let mut name = path.file_name().unwrap().to_owned();
+        name.push("-wal");
+        path.with_file_name(name)
+    }
+
+    fn journal_mode(store: &Store) -> String {
+        store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn saves_go_to_an_encrypted_write_ahead_log() {
+        let path = temp_db("wal");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        assert_eq!(journal_mode(&store), "wal");
+        store
+            .insert_flows(&[record("secret-app.exe", "very-private.example", 1, 1)])
+            .unwrap();
+        // While the store is open, the save is (at least partly) only in
+        // the log, and the log is as unreadable as the database.
+        let log = std::fs::read(wal_of(&path)).unwrap();
+        assert!(!log.is_empty(), "the save went to the log");
+        for needle in [&b"secret-app"[..], b"very-private", b"CREATE TABLE"] {
+            assert!(
+                !log.windows(needle.len()).any(|w| w == needle),
+                "{} readable in the log",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_rollback_journal_can_still_be_chosen_for_comparisons() {
+        let path = temp_db("rollback");
+        let mut store = Store::open_with_journal(&path, &key(7), Journal::Rollback).unwrap();
+        assert_eq!(journal_mode(&store), "delete");
+        store
+            .insert_flows(&[record("a.exe", "x.example", 1, 1)])
+            .unwrap();
+        assert!(!wal_of(&path).exists());
+        drop(store);
+        // Opening normally switches it to the write-ahead log.
+        let store = Store::open(&path, &key(7)).unwrap();
+        assert_eq!(journal_mode(&store), "wal");
+        assert_eq!(store.flow_count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn readers_do_not_hold_up_saving() {
+        let path = temp_db("readers");
+        let mut writer = Store::open(&path, &key(7)).unwrap();
+        writer
+            .insert_flows(&[record("a.exe", "x.example", 1, 1)])
+            .unwrap();
+        // A pipe client's connection in the middle of reading.
+        let reader = Store::open(&path, &key(7)).unwrap();
+        reader.conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(reader.flow_count().unwrap(), 1);
+
+        // With a rollback journal this save would wait for the reader (and
+        // give up after the 5-second busy timeout).
+        let started = std::time::Instant::now();
+        writer
+            .insert_flows(&[record("b.exe", "y.example", 2, 1)])
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // The reader keeps its consistent view until it is done.
+        assert_eq!(reader.flow_count().unwrap(), 1);
+        reader.conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(reader.flow_count().unwrap(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn deleting_also_empties_the_log() {
+        let path = temp_db("wipe-log");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let reader = Store::open(&path, &key(7)).unwrap();
+        for delete in [Store::delete_history, Store::wipe] {
+            store
+                .insert_flows(&[record("a.exe", "x.example", 1, 1)])
+                .unwrap();
+            assert_eq!(reader.flow_count().unwrap(), 1, "another connection read");
+            assert!(std::fs::metadata(wal_of(&path)).unwrap().len() > 0);
+            delete(&mut store).unwrap();
+            // Still open, so the log file stays, but nothing is left in it.
+            assert_eq!(std::fs::metadata(wal_of(&path)).unwrap().len(), 0);
+            assert_eq!(store.flow_count().unwrap(), 0);
+            assert_eq!(reader.flow_count().unwrap(), 0);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn saved_flows_survive_a_crash_before_the_log_is_copied() {
+        let path = temp_db("crash");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        store
+            .insert_flows(&[record("a.exe", "x.example", 1, 1)])
+            .unwrap();
+        // The files as a crash would leave them: the save is still in the
+        // log, not yet copied into the database.
+        let copy = temp_db("crash-copy");
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::copy(wal_of(&path), wal_of(&copy)).unwrap();
+        drop(store);
+        let reopened = Store::open(&copy, &key(7)).unwrap();
+        assert_eq!(reopened.flow_count().unwrap(), 1);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(copy.parent().unwrap());
+    }
+
+    #[test]
+    fn closing_copies_the_log_into_the_database_and_removes_it() {
+        let path = temp_db("close");
+        {
+            let mut store = Store::open(&path, &key(7)).unwrap();
+            store
+                .insert_flows(&[record("a.exe", "x.example", 1, 1)])
+                .unwrap();
+        }
+        assert!(!wal_of(&path).exists());
+        let store = Store::open(&path, &key(7)).unwrap();
+        assert_eq!(store.flow_count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn deleting_history_keeps_alerts_rules_apps_and_settings() {
+        let path = temp_db("delete-history");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        store
+            .insert_flows(&[
+                record("a.exe", "x.example", 1, 1),
+                record("b.exe", "y.example", 100 * 24 * 3600, 2),
+            ])
+            .unwrap();
+        // Fold the older flow into an hourly total.
+        store
+            .apply_retention(at(100 * 24 * 3600), Retention::default())
+            .unwrap();
+        let hourly = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT count(*) FROM hourly", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(hourly(&store), 1);
+        store.add_alert(&tracker_alert("a.exe", 1), at(5)).unwrap();
+        store
+            .add_rule(
+                &RuleTarget::App {
+                    path: String::from("C:/Apps/a.exe"),
+                },
+                at(5),
+            )
+            .unwrap();
+        store.add_known_app("C:/Apps/a.exe", at(5)).unwrap();
+        store.set_setting("save_history", "false").unwrap();
+
+        store.delete_history().unwrap();
+        assert_eq!(store.flow_count().unwrap(), 0);
+        assert_eq!(hourly(&store), 0);
+        assert_eq!(store.alerts(at(0), 10).unwrap().len(), 1);
+        assert_eq!(store.rules().unwrap().len(), 1);
+        assert_eq!(store.known_app_keys().unwrap().len(), 1);
+        assert_eq!(
+            store.setting("save_history").unwrap().as_deref(),
+            Some("false")
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

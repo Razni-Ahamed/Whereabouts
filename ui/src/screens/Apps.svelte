@@ -116,6 +116,8 @@
           Last 24 hours: {saved.flows} connections to {saved.destinations} destinations ·
           {bytes(saved.bytes_sent)} sent · {bytes(saved.bytes_received)} received
         </p>
+      {:else if store.live?.status.save_history === false}
+        <p class="saved muted">History is off, so nothing is saved for this app. Turn it on under Privacy.</p>
       {/if}
 
       <div class="glass where">

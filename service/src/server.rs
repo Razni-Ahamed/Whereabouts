@@ -58,6 +58,17 @@ pub enum EngineCommand {
         /// Where to send the result.
         reply: Sender<Result<(), String>>,
     },
+    /// Save the user's choice whether to save history and apply it (with
+    /// `delete_saved`, also delete the saved history when turning it off),
+    /// and send back the result.
+    SetSaveHistory {
+        /// Whether to save finished connections.
+        save: bool,
+        /// Also delete the saved connections and hourly totals.
+        delete_saved: bool,
+        /// Where to send the result.
+        reply: Sender<Result<(), String>>,
+    },
     /// Load the offline data again (a data update was installed).
     ReloadData,
     /// Load Spamhaus DROP again (downloaded or removed).
@@ -379,7 +390,8 @@ fn changes_something(request: &Request) -> bool {
         | Request::SetBlockingPaused { .. }
         | Request::DeleteAll { .. }
         | Request::DismissAlert { .. }
-        | Request::SetListUpdates { .. } => true,
+        | Request::SetListUpdates { .. }
+        | Request::SetSaveHistory { .. } => true,
         Request::Hello { .. }
         | Request::Status {}
         | Request::CheckListsNow {}
@@ -457,6 +469,9 @@ fn answer(
             Err(response) => *response,
         },
         Request::DeleteAll { confirm } => delete_all(state, &confirm),
+        Request::SetSaveHistory { save, delete_saved } => {
+            set_save_history(state, save, delete_saved)
+        }
         Request::ListRules {} => rules(state, crate::blocking::RuleCommand::List),
         Request::AddRule { rule } => rules(state, crate::blocking::RuleCommand::Add(rule)),
         Request::RemoveRule { id } => rules(state, crate::blocking::RuleCommand::Remove(id)),
@@ -593,6 +608,44 @@ fn delete_all(state: &Mutex<LiveState>, confirm: &str) -> Response {
     }
 }
 
+/// Asks the engine to save and apply the choice whether to save history,
+/// and waits for the result.
+fn set_save_history(state: &Mutex<LiveState>, save: bool, delete_saved: bool) -> Response {
+    let Some(commands) = lock(state).commands.clone() else {
+        return Response::Error {
+            message: String::from("not changed: Whereabouts is still starting"),
+        };
+    };
+    let (reply, result) = mpsc::channel();
+    let command = EngineCommand::SetSaveHistory {
+        save,
+        delete_saved: delete_saved && !save,
+        reply,
+    };
+    if commands.send(command).is_err() {
+        return Response::Error {
+            message: String::from("not changed: Whereabouts is stopping"),
+        };
+    }
+    match result.recv_timeout(DELETE_TIMEOUT) {
+        Ok(Ok(())) => {
+            // Show the change before the engine's next refresh.
+            let mut state = lock(state);
+            state.status.save_history = Some(save);
+            state.status.saving = save;
+            Response::SaveHistory { save }
+        }
+        Ok(Err(error)) => Response::Error {
+            message: format!("could not change history saving: {error}"),
+        },
+        Err(_) => Response::Error {
+            message: String::from(
+                "could not change history saving: Whereabouts did not answer in time",
+            ),
+        },
+    }
+}
+
 fn history(store: &Store, hours: u32, limit: u32) -> Response {
     let since = SystemTime::now()
         .checked_sub(Duration::from_secs(u64::from(hours) * 60 * 60))
@@ -708,6 +761,10 @@ mod tests {
                 data: false,
                 drop: false,
             },
+            Request::SetSaveHistory {
+                save: false,
+                delete_saved: true,
+            },
         ] {
             let refused = answer(request, &state, &mut store, tool);
             assert!(!NEEDS_ADMIN.contains("  "), "one space between words");
@@ -821,6 +878,51 @@ mod tests {
                 paused: false
             }
         );
+    }
+
+    #[test]
+    fn history_choices_are_passed_to_the_engine() {
+        let state = shared(1);
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        let engine = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                match commands.recv().unwrap() {
+                    EngineCommand::SetSaveHistory {
+                        save,
+                        delete_saved,
+                        reply,
+                    } => {
+                        seen.push((save, delete_saved));
+                        reply.send(Ok(())).unwrap();
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            seen
+        });
+        let mut store = None;
+        let off = Request::SetSaveHistory {
+            save: false,
+            delete_saved: true,
+        };
+        assert_eq!(
+            answer(off, &state, &mut store, Client::App),
+            Response::SaveHistory { save: false }
+        );
+        assert_eq!(lock(&state).status.save_history, Some(false));
+        assert!(!lock(&state).status.saving);
+        // Deleting only goes with turning saving off.
+        let on = Request::SetSaveHistory {
+            save: true,
+            delete_saved: true,
+        };
+        assert_eq!(
+            answer(on, &state, &mut store, Client::App),
+            Response::SaveHistory { save: true }
+        );
+        assert_eq!(engine.join().unwrap(), vec![(false, true), (true, false)]);
     }
 
     #[test]

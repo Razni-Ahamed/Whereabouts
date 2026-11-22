@@ -10,7 +10,10 @@ export interface Status {
   unattributed: number;
   active_flows: number;
   kernel_events_protected: boolean;
+  /** Whether finished connections are being saved now. */
   saving: boolean;
+  /** The user's choice to save history; null until chosen (saved meanwhile). Missing from older services. */
+  save_history?: boolean | null;
   tracker_domains: number;
   /** Saved blocking rules (0 from a 0.1 service). */
   block_rules: number;

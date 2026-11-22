@@ -27,7 +27,9 @@ use tauri::{Manager, RunEvent, WindowEvent};
 use whereabouts_win_startup::BACKGROUND_ARG;
 
 use serde::Serialize;
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 use whereabouts_client::{Client, Problem, ProblemKind, unexpected};
 use whereabouts_core::text::display_safe;
 use whereabouts_ipc::{
@@ -526,6 +528,57 @@ async fn check_lists_now(
     .await
 }
 
+/// Turns saving connection history on or off. Turning it off first asks,
+/// in a native dialog, whether to keep or delete what is saved (or to
+/// cancel). The new choice, or `None` if the user cancelled.
+#[tauri::command]
+async fn set_save_history(
+    save: bool,
+    app: tauri::AppHandle,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Option<bool>, Problem> {
+    const KEEP: &str = "Keep it";
+    const DELETE: &str = "Delete it";
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        let mut delete_saved = false;
+        if !save {
+            let answer = app
+                .dialog()
+                .message(
+                    "Whereabouts will still show live connections, raise alerts and block what \
+                     you choose. But finished connections will no longer be saved, so the \
+                     History view and Export get nothing new, and per-app learning (coming in \
+                     version 0.3) has nothing to learn from.\n\nWhat should happen to the \
+                     history saved so far? If you keep it, it is deleted as it ages: each \
+                     connection after 30 days, hourly totals after 180 days.",
+                )
+                .title("Stop saving connection history?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::YesNoCancelCustom(
+                    String::from(KEEP),
+                    String::from(DELETE),
+                    String::from("Cancel"),
+                ))
+                .blocking_show_with_result();
+            match answer {
+                MessageDialogResult::Yes => {}
+                MessageDialogResult::No => delete_saved = true,
+                MessageDialogResult::Custom(label) if label == KEEP => {}
+                MessageDialogResult::Custom(label) if label == DELETE => delete_saved = true,
+                _ => return Ok(None),
+            }
+        }
+        connection.with(|client| {
+            match client.ask(&Request::SetSaveHistory { save, delete_saved })? {
+                Response::SaveHistory { save } => Ok(Some(save)),
+                other => Err(unexpected(&other)),
+            }
+        })
+    })
+    .await
+}
+
 /// The app's settings, as the window shows them.
 #[derive(Debug, Serialize)]
 struct SettingsView {
@@ -695,7 +748,8 @@ fn main() {
             alerts,
             dismiss_alert,
             set_list_updates,
-            check_lists_now
+            check_lists_now,
+            set_save_history
         ])
         .build(tauri::generate_context!())
         .expect("failed to start the Whereabouts app")
