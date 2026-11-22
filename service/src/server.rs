@@ -119,6 +119,55 @@ pub fn start(name: &str, client_sid: Option<&str>, state: SharedState) -> Result
     start_with(name, client_sid, state, peer::trusted_client)
 }
 
+/// How often the service tries again for a pipe name that was taken.
+const PIPE_RETRY_EVERY: Duration = Duration::from_secs(5);
+
+/// Like [`start`], but if the name is taken, keeps trying in the background
+/// instead of giving up. While the service is stopped (updating, or
+/// restarting after a failure) any program can create a pipe with our name;
+/// the service then could not answer clients until its next restart. Calls
+/// `ready` once the pipe is up.
+pub fn start_or_retry(
+    name: &'static str,
+    client_sid: Option<String>,
+    state: SharedState,
+    ready: impl FnOnce(&SharedState) + Send + 'static,
+) {
+    start_or_retry_every(name, client_sid, state, ready, PIPE_RETRY_EVERY);
+}
+
+fn start_or_retry_every(
+    name: &'static str,
+    client_sid: Option<String>,
+    state: SharedState,
+    ready: impl FnOnce(&SharedState) + Send + 'static,
+    every: Duration,
+) {
+    let error = match start(name, client_sid.as_deref(), Arc::clone(&state)) {
+        Ok(()) => {
+            ready(&state);
+            return;
+        }
+        Err(error) => error,
+    };
+    report!("warning: {error}; trying again every {} s", every.as_secs());
+    let retrying = std::thread::Builder::new()
+        .name(String::from("pipe-retry"))
+        .spawn(move || {
+            loop {
+                std::thread::sleep(every);
+                if start(name, client_sid.as_deref(), Arc::clone(&state)).is_ok() {
+                    report!("The pipe {name} is free again; answering clients");
+                    ready(&state);
+                    return;
+                }
+            }
+        });
+    if let Err(error) = retrying {
+        report!("warning: could not keep trying for the pipe ({error})");
+    }
+}
+
 /// Like [`start`], with tests treating every client as the desktop app.
 #[cfg(test)]
 pub fn start_trusting_app(name: &str, state: SharedState) -> Result<(), String> {
@@ -794,6 +843,45 @@ mod tests {
         .unwrap();
         assert!(matches!(answer, Response::Error { .. }), "{answer:?}");
         assert!(ask(&mut client, &Request::Status {}).is_err());
+    }
+
+    #[test]
+    fn a_taken_pipe_name_is_tried_again_until_it_is_free() {
+        use std::sync::atomic::AtomicBool;
+        // A static name, as the real one is; unique to this test process.
+        let name: &'static str = Box::leak(unique_name().into_boxed_str());
+        let sid = current_user_sid().unwrap();
+        // Another program took the name while the service was stopped.
+        let squatter = PipeListener::bind(name, &sid).unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ready);
+        start_or_retry_every(
+            name,
+            None,
+            shared(1),
+            move |_| flag.store(true, Ordering::SeqCst),
+            Duration::from_millis(100),
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!ready.load(Ordering::SeqCst), "the name is still taken");
+        drop(squatter);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "the service took the pipe back"
+        );
+        let mut client = whereabouts_win_pipe::connect(name).unwrap();
+        let greeting = ask(
+            &mut client,
+            &Request::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        assert!(matches!(greeting, Response::Hello { .. }), "{greeting:?}");
     }
 
     #[test]

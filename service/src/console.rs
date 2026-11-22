@@ -203,24 +203,20 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         commands: Some(command_sender),
         ..crate::server::LiveState::default()
     }));
-    let serving = match crate::server::start(
+    // If another program holds the pipe name, this keeps trying; status is
+    // published either way, so clients see it as soon as the pipe is up.
+    crate::server::start_or_retry(
         PIPE_NAME,
-        options.client_sid.as_deref(),
+        options.client_sid.clone(),
         Arc::clone(&live),
-    ) {
-        Ok(()) => {
+        |live| {
             println!(
                 "Answering Whereabouts clients on {PIPE_NAME} (try --status in another terminal)"
             );
-            let updates = crate::updates::start(Arc::clone(&live));
+            let updates = crate::updates::start(Arc::clone(live));
             live.lock().unwrap_or_else(PoisonError::into_inner).updates = Some(updates);
-            true
-        }
-        Err(error) => {
-            report!("warning: {error}");
-            false
-        }
-    };
+        },
+    );
 
     let started = Instant::now();
     let mut last_draw = Instant::now();
@@ -417,29 +413,27 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                 }
             }
-            if serving {
-                let counts = capture.counts();
-                let (block_rules, blocking_paused) = blocking.summary();
-                let status = Status {
-                    uptime_secs: started.elapsed().as_secs(),
-                    events: counts.events,
-                    dropped: counts.dropped,
-                    unreadable: counts.malformed,
-                    rejected: counts.rejected,
-                    over_limit: view.over_limit,
-                    unattributed: view.unattributed,
-                    active_flows: u64::try_from(view.active).unwrap_or(u64::MAX),
-                    kernel_events_protected: capture.kernel_events_protected(),
-                    saving: store.is_some(),
-                    tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
-                    block_rules,
-                    blocking_paused,
-                    drop_list: detector.has_drop(),
-                    // Filled in from the updater's state when answering.
-                    lists: whereabouts_ipc::ListsView::default(),
-                };
-                publish(&live, &view, &names, &enricher, status);
-            }
+            let counts = capture.counts();
+            let (block_rules, blocking_paused) = blocking.summary();
+            let status = Status {
+                uptime_secs: started.elapsed().as_secs(),
+                events: counts.events,
+                dropped: counts.dropped,
+                unreadable: counts.malformed,
+                rejected: counts.rejected,
+                over_limit: view.over_limit,
+                unattributed: view.unattributed,
+                active_flows: u64::try_from(view.active).unwrap_or(u64::MAX),
+                kernel_events_protected: capture.kernel_events_protected(),
+                saving: store.is_some(),
+                tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
+                block_rules,
+                blocking_paused,
+                drop_list: detector.has_drop(),
+                // Filled in from the updater's state when answering.
+                lists: whereabouts_ipc::ListsView::default(),
+            };
+            publish(&live, &view, &names, &enricher, status);
             if options.show_table {
                 draw(
                     &view,
