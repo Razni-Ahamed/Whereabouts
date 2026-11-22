@@ -213,19 +213,14 @@ async fn delete_history(
 ) -> Result<bool, Problem> {
     let connection = Arc::clone(&connection);
     blocking(move || {
-        let confirmed = app
-            .dialog()
-            .message(
-                "All saved connection history and hourly totals will be deleted and overwritten. \
-                 This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards.",
-            )
-            .title("Delete everything Whereabouts saved?")
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                String::from("Delete everything"),
-                String::from("Cancel"),
-            ))
-            .blocking_show();
+        // Cancel is the default: Enter must never delete everything.
+        let confirmed = whereabouts_win_dialog::confirm(
+            main_window(&app),
+            "Delete everything Whereabouts saved?",
+            "All saved connection history and hourly totals will be deleted and overwritten. \
+             This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards.",
+            "Delete everything",
+        );
         if !confirmed {
             return Ok(false);
         }
@@ -240,6 +235,12 @@ async fn delete_history(
         })
     })
     .await
+}
+
+/// The main window's handle, to own native dialogs.
+fn main_window(app: &tauri::AppHandle) -> Option<isize> {
+    let window = app.get_webview_window("main")?;
+    window.hwnd().ok().map(|hwnd| hwnd.0 as isize)
 }
 
 /// The blocking rules and whether blocking is paused.
@@ -458,19 +459,16 @@ async fn dismiss_alert(
                     .as_deref()
                     .or(alert.target.as_deref())
                     .map_or_else(|| String::from("this network"), display_safe);
-                let confirmed = app
-                    .dialog()
-                    .message(format!(
+                // Cancel is the default: Enter must not silence a warning.
+                let confirmed = whereabouts_win_dialog::confirm(
+                    main_window(&app),
+                    "Stop these warnings?",
+                    &format!(
                         "Whereabouts will no longer warn you when this program connects to this \
                          network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
-                    ))
-                    .title("Stop these warnings?")
-                    .kind(MessageDialogKind::Warning)
-                    .buttons(MessageDialogButtons::OkCancelCustom(
-                        String::from("Stop these warnings"),
-                        String::from("Cancel"),
-                    ))
-                    .blocking_show();
+                    ),
+                    "Stop these warnings",
+                );
                 if !confirmed {
                     return Ok(false);
                 }

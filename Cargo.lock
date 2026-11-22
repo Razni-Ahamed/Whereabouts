@@ -5022,6 +5022,7 @@ dependencies = [
  "whereabouts-core",
  "whereabouts-ipc",
  "whereabouts-win-capture",
+ "whereabouts-win-dialog",
  "whereabouts-win-startup",
 ]
 
@@ -5128,6 +5129,13 @@ dependencies = [
  "ferrisetw",
  "sha2 0.11.0",
  "whereabouts-core",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "whereabouts-win-dialog"
+version = "0.2.0"
+dependencies = [
  "windows 0.62.2",
 ]
 

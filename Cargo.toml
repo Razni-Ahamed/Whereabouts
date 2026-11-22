@@ -13,6 +13,7 @@ members = [
     "crates/win-firewall",
     "crates/win-pipe",
     "crates/win-secrets",
+    "crates/win-dialog",
     "crates/win-startup",
     "service",
     "ui/src-tauri",
@@ -39,6 +40,7 @@ whereabouts-win-capture = { path = "crates/win-capture" }
 whereabouts-win-firewall = { path = "crates/win-firewall" }
 whereabouts-win-pipe = { path = "crates/win-pipe" }
 whereabouts-win-secrets = { path = "crates/win-secrets" }
+whereabouts-win-dialog = { path = "crates/win-dialog" }
 whereabouts-win-startup = { path = "crates/win-startup" }
 
 # Third-party

@@ -24,6 +24,7 @@ whereabouts-client.workspace = true
 whereabouts-core.workspace = true
 whereabouts-ipc.workspace = true
 whereabouts-win-capture.workspace = true
+whereabouts-win-dialog.workspace = true
 whereabouts-win-startup.workspace = true
 
 [build-dependencies]
