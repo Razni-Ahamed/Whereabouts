@@ -41,8 +41,9 @@ Options:
   --export <FILE>      Write all saved flows to a CSV file
   --delete-all --yes   Delete all saved flows and totals (cannot be undone)
 
-Blocking (the service must be running; as administrator or as the user
-Whereabouts was installed for):
+Blocking (the service must be running; --rules as administrator or as the
+user Whereabouts was installed for, every change as administrator, so that
+other programs cannot lift your blocks; or use the Whereabouts app):
   --rules              List the blocking rules
   --block-app <PATH>   Block every connection of a program
   --block-domain <NAME>

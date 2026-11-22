@@ -10,12 +10,13 @@ use std::time::SystemTime;
 use std::collections::{HashMap, HashSet};
 
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -98,6 +99,32 @@ impl ProcessHandle {
             .ok()?;
         let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
         Some(filetime_to_system_time(i64::try_from(ticks).ok()?))
+    }
+
+    /// Whether the process runs with administrator rights (an elevated
+    /// token). `false` if that cannot be read.
+    pub fn is_elevated(&self) -> bool {
+        let mut token = HANDLE::default();
+        // SAFETY: the process handle is open; `token` is a valid out-pointer.
+        if unsafe { OpenProcessToken(self.0, TOKEN_QUERY, &mut token) }.is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        // SAFETY: `elevation` is writable and its exact size is passed.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&raw mut elevation).cast()),
+                u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(0),
+                &mut len,
+            )
+        }
+        .is_ok();
+        // SAFETY: `token` was opened above and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        read && elevation.TokenIsElevated != 0
     }
 }
 

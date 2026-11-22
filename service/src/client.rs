@@ -402,7 +402,9 @@ mod tests {
             commands: Some(sender),
             ..crate::server::LiveState::default()
         }));
-        crate::server::start(&name, None, state).unwrap();
+        // Answered as if this test were the desktop app (see the next test
+        // for an ordinary command line).
+        crate::server::start_trusting_app(&name, state).unwrap();
         // A stand-in engine: adds a rule, then lists it.
         let engine = std::thread::spawn(move || {
             for _ in 0..2 {
@@ -434,6 +436,28 @@ mod tests {
         )
         .unwrap();
         engine.join().unwrap();
+    }
+
+    #[test]
+    fn an_ordinary_command_line_cannot_change_rules() {
+        let name = format!(r"\\.\pipe\whereabouts-rules-refused-{}", std::process::id());
+        let (sender, commands) = std::sync::mpsc::channel();
+        let state = Arc::new(Mutex::new(crate::server::LiveState {
+            commands: Some(sender),
+            ..crate::server::LiveState::default()
+        }));
+        // The real check: this test program runs the service's own file, so
+        // it is the command line.
+        crate::server::start(&name, None, state).unwrap();
+        let elevated = whereabouts_win_capture::process::ProcessHandle::open(std::process::id())
+            .is_some_and(|process| process.is_elevated());
+        if elevated {
+            eprintln!("skipped: an administrator's command line may change rules");
+            return;
+        }
+        let error = run_rules(&name, RuleAction::Pause(true)).unwrap_err();
+        assert!(error.contains("administrator"), "{error}");
+        assert!(commands.try_recv().is_err(), "nothing reached the engine");
     }
 
     #[test]

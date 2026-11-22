@@ -11,6 +11,10 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - CI runs the UI's own tests (Node's built-in test runner; no new packages).
 - **For developers: a detection lab** (`lab/`, never shipped, never real user data). Scripted sessions of real apps, started logged out, are recorded on GitHub's disposable Windows runners, stitched into simulated user-weeks with staged problems and replayed through the shipped detection code, which moved into the `whereabouts-detect` crate (no change in behaviour). It reports false alarms per user-week, detection rate and time to detect. `whereabouts-service --status --json` prints the status for scripts.
 
+### Security
+
+- **Only the Whereabouts app, or a command line run as administrator, can change your blocks.** Any program could run Whereabouts' command line to pause blocking or remove a rule without asking you, so a blocked app could unblock itself. The same goes for deleting history, silencing alerts and list-update settings. Reading (`--status`, `--rules`) still works without administrator rights.
+
 ### Fixed
 
 - **A blocked app is now cut off both ways.** Blocking an app stopped only the connections it made, so a blocked torrent client could still trade with peers that connected to it (Windows Firewall usually lets them in). Incoming connections are now refused too, except from this computer itself, so the app's own window keeps working. Apps you already blocked get this when the service starts.

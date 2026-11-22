@@ -15,11 +15,12 @@ use whereabouts_win_capture::process::ProcessHandle;
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::{SERVICE_NAME, install_dir};
+use crate::{APP_PROGRAM, SERVICE_NAME, install_dir};
 
 /// Opens process `pid` (which connected at or before `connected_by`) and
-/// locks the file it runs. Returns its path and the locked file.
-fn locked_image(pid: u32, connected_by: SystemTime) -> Option<(String, File)> {
+/// locks the file it runs. Returns the process, its path and the locked
+/// file.
+fn locked_image(pid: u32, connected_by: SystemTime) -> Option<(ProcessHandle, String, File)> {
     let process = ProcessHandle::open(pid)?;
     if process
         .start_time()
@@ -27,7 +28,35 @@ fn locked_image(pid: u32, connected_by: SystemTime) -> Option<(String, File)> {
     {
         return None;
     }
-    lock_image_of(&process)
+    let (path, file) = lock_image_of(&process)?;
+    Some((process, path, file))
+}
+
+/// A client the service answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Client {
+    /// The installed desktop app, which asks the user in a native Windows
+    /// dialog before blocking or deleting anything.
+    App,
+    /// Another Whereabouts program: the command line (the service's own
+    /// file) or another program in the installation folder.
+    Tool {
+        /// Whether it runs with administrator rights.
+        elevated: bool,
+    },
+}
+
+impl Client {
+    /// Whether this client may change what Whereabouts blocks, deletes or
+    /// warns about. A command line that any program can start with any
+    /// arguments may not, unless it runs as administrator: otherwise a
+    /// blocked app could simply run it to unblock itself.
+    pub fn may_change(self) -> bool {
+        match self {
+            Self::App => true,
+            Self::Tool { elevated } => elevated,
+        }
+    }
 }
 
 /// Whether `file` is directly inside the installation folder (compared by
@@ -41,27 +70,34 @@ fn in_install_dir(file: &Path) -> bool {
 
 /// Whether process `pid` runs the same program file as this process.
 pub fn runs_same_file(pid: u32, connected_by: SystemTime) -> bool {
-    let Some((_, file)) = locked_image(pid, connected_by) else {
+    let Some((_, _, file)) = locked_image(pid, connected_by) else {
         return false;
     };
     std::env::current_exe().is_ok_and(|own| is_same_file(&file, &own))
 }
 
-/// Whether the service may answer client `pid`: it runs the service's own
-/// program file, or, when the service runs from the installation folder,
-/// another program in that same folder (such as the desktop app). Only
-/// administrators can put files there.
-pub fn is_trusted_client(pid: u32, connected_by: SystemTime) -> bool {
-    let Some((path, file)) = locked_image(pid, connected_by) else {
-        return false;
-    };
-    let Ok(own) = std::env::current_exe() else {
-        return false;
+/// Who client `pid` is, if the service may answer it: a program running the
+/// service's own file (the command line), or, when the service runs from the
+/// installation folder, another program in that same folder: the desktop
+/// app, or another tool. Only administrators can put files there. `None`
+/// for anything else.
+pub fn trusted_client(pid: u32, connected_by: SystemTime) -> Option<Client> {
+    let (process, path, file) = locked_image(pid, connected_by)?;
+    let own = std::env::current_exe().ok()?;
+    let tool = || Client::Tool {
+        elevated: process.is_elevated(),
     };
     if is_same_file(&file, &own) {
-        return true;
+        return Some(tool());
     }
-    in_install_dir(&own) && in_install_dir(Path::new(&path))
+    let path = Path::new(&path);
+    if !(in_install_dir(&own) && in_install_dir(path)) {
+        return None;
+    }
+    let is_app = path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(APP_PROGRAM));
+    Some(if is_app { Client::App } else { tool() })
 }
 
 /// Process ID of the running Whereabouts service, as the Service Control
@@ -100,9 +136,25 @@ mod tests {
     fn this_process_is_recognised_and_others_are_not() {
         let now = SystemTime::now();
         assert!(runs_same_file(std::process::id(), now));
-        assert!(is_trusted_client(std::process::id(), now));
+        // The same file is the command line: it may change rules only when
+        // it runs as administrator.
+        let client = trusted_client(std::process::id(), now).expect("trusted");
+        assert!(matches!(client, Client::Tool { .. }), "{client:?}");
+        assert_eq!(
+            client.may_change(),
+            ProcessHandle::open(std::process::id())
+                .unwrap()
+                .is_elevated()
+        );
         assert!(!runs_same_file(0, now));
         assert!(!runs_same_file(4, now));
+    }
+
+    #[test]
+    fn only_the_app_or_an_administrator_may_change_rules() {
+        assert!(Client::App.may_change());
+        assert!(Client::Tool { elevated: true }.may_change());
+        assert!(!Client::Tool { elevated: false }.may_change());
     }
 
     #[test]
@@ -111,7 +163,7 @@ mod tests {
         // this process: the connection predates our start.
         let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         assert!(!runs_same_file(std::process::id(), long_ago));
-        assert!(!is_trusted_client(std::process::id(), long_ago));
+        assert!(trusted_client(std::process::id(), long_ago).is_none());
     }
 
     #[test]
@@ -121,7 +173,8 @@ mod tests {
             .spawn()
             .unwrap();
         let now = SystemTime::now();
-        let rejected = !runs_same_file(child.id(), now) && !is_trusted_client(child.id(), now);
+        let rejected =
+            !runs_same_file(child.id(), now) && trusted_client(child.id(), now).is_none();
         let _ = child.kill();
         let _ = child.wait();
         assert!(rejected);
