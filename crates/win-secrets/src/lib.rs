@@ -404,6 +404,16 @@ fn check_trusted(handle: &OwnedHandle, path: &Path, directory: bool) -> io::Resu
     Ok(())
 }
 
+/// Whether the open object is a real folder: not a link or junction.
+fn is_plain_directory(handle: &OwnedHandle) -> io::Result<bool> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open; `info` is writable.
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
+        .map_err(|e| io::Error::other(format!("could not inspect a folder: {e}")))?;
+    Ok(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0)
+}
+
 /// Makes sure `path` is a private Whereabouts folder: creates it already
 /// secured if it does not exist; otherwise refuses it unless it is a real
 /// folder (not a link or junction) owned by SYSTEM or Administrators. Then
@@ -416,21 +426,41 @@ pub fn secure_directory(path: &Path) -> io::Result<()> {
         lpSecurityDescriptor: descriptor.0.0,
         bInheritHandle: false.into(),
     };
-    // SAFETY: the path string and `attributes` (pointing at `descriptor`)
-    // live for the call.
-    match unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attributes)) } {
-        Ok(()) => {}
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
-        Err(error) => {
-            return Err(io::Error::other(format!(
+    // Creates the folder already secured; `true` if it was created now.
+    let create = || -> io::Result<bool> {
+        // SAFETY: the path string and `attributes` (pointing at
+        // `descriptor`) live for the call.
+        match unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attributes)) } {
+            Ok(()) => Ok(true),
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => Ok(false),
+            Err(error) => Err(io::Error::other(format!(
                 "could not create {}: {error}",
                 path.display()
-            )));
+            ))),
         }
-    }
+    };
+    let created = create()?;
 
-    let handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
-    check_trusted(&handle, path, true)?;
+    let mut handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
+    if let Err(error) = check_trusted(&handle, path, true) {
+        // A normal account made the folder first (before installing, or
+        // after uninstalling), which would keep the service from starting.
+        // It is never adopted: Windows checks access when a handle is
+        // opened, so a handle its maker opened earlier would still reach
+        // into it after its permissions changed. A real, empty folder is
+        // removed instead (removing fails if anything is in it) and made
+        // anew, secured from the start, out of reach of any older handle.
+        // Links, folders with content, and anything else stay refused.
+        if created || !is_plain_directory(&handle)? {
+            return Err(error);
+        }
+        drop(handle);
+        if std::fs::remove_dir(path).is_err() || !create()? {
+            return Err(error);
+        }
+        handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
+        check_trusted(&handle, path, true)?;
+    }
     let owner = descriptor.owner()?;
     let dacl = descriptor.dacl()?;
     // SAFETY: `handle` is open with WRITE_DAC and WRITE_OWNER; `owner` and
@@ -562,8 +592,34 @@ mod tests {
             return;
         }
         drop(handle);
+        // With something in it, it is refused: it could hold planted files.
+        std::fs::write(planted.join("whereabouts.db"), b"planted").unwrap();
         let error = secure_directory(&planted).unwrap_err();
         assert!(error.to_string().contains("owned by an account"), "{error}");
+        std::fs::remove_file(planted.join("whereabouts.db")).unwrap();
+        // Empty, but its maker still holds it open (without letting it be
+        // deleted), as someone would to reach into it later: refused.
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+                .open(&planted)
+                .unwrap();
+            let error = secure_directory(&planted).unwrap_err();
+            assert!(error.to_string().contains("owned by an account"), "{error}");
+            drop(held);
+        }
+        // Empty and not held: removed and made anew. A normal account (this
+        // test) cannot make Administrators the new folder's owner, so the
+        // new folder is not made here; the old one is gone either way.
+        let error = secure_directory(&planted).unwrap_err();
+        assert!(
+            !error.to_string().contains("owned by an account"),
+            "{error}"
+        );
+        assert!(!planted.exists(), "the folder its maker made is gone");
         let _ = std::fs::remove_dir_all(dir);
     }
 
