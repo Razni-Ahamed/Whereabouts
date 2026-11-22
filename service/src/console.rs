@@ -776,17 +776,17 @@ fn block_if_copy(
     store: Option<&mut Store>,
     live: &Mutex<crate::server::LiveState>,
 ) {
-    let Some(sha256) = identity.sha256.as_deref() else {
+    let (Some(sha256), Some(store)) = (identity.sha256.as_deref(), store) else {
         return;
     };
-    let Some(original) = blocking.copy_of(&identity.path, sha256) else {
+    let now = SystemTime::now();
+    let Some(original) = blocking.copy_of(store, &identity.path, sha256, now) else {
         return;
     };
     let rule = whereabouts_ipc::RuleSpec::App {
         path: identity.path.clone(),
     };
-    let now = SystemTime::now();
-    match blocking.answer(store, crate::blocking::RuleCommand::Add(rule), now) {
+    match blocking.answer(Some(store), crate::blocking::RuleCommand::Add(rule), now) {
         whereabouts_ipc::Response::RuleAdded { already: false, .. } => {
             println!("Blocked {}: a copy of blocked {original}", identity.path);
             live.lock()

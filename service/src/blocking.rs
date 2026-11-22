@@ -125,10 +125,23 @@ pub enum RuleCommand {
 pub struct Blocking<F: Firewalls> {
     blocker: Option<Blocker<F>>,
     open: fn() -> io::Result<F>,
-    /// SHA-256 of each blocked program's file, with the size and time it
-    /// was hashed at (hashed again when either changes).
-    hashes: HashMap<String, (u64, SystemTime, String)>,
+    /// The SHA-256 each app rule's program had when the rule was made, by
+    /// lower-case path (also saved, see [`PIN_SETTING`]).
+    pins: HashMap<String, String>,
+    /// When copies of blocked programs were blocked lately (for the limit).
+    auto_added: Vec<SystemTime>,
 }
+
+/// Saved setting holding an app rule's pinned SHA-256, followed by the
+/// lower-case program path.
+const PIN_SETTING: &str = "app_rule_sha256:";
+
+/// Copies are blocked only while this many rule slots stay free, so that
+/// copies can never use up the user's own rules.
+const COPY_HEADROOM: usize = 64;
+
+/// At most this many copies are blocked per hour.
+const COPIES_PER_HOUR: usize = 5;
 
 impl<F: Firewalls> std::fmt::Debug for Blocking<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -145,7 +158,8 @@ impl<F: Firewalls> Blocking<F> {
         let mut blocking = Self {
             blocker: None,
             open,
-            hashes: HashMap::new(),
+            pins: HashMap::new(),
+            auto_added: Vec::new(),
         };
         if let Some(store) = store {
             match store.rules() {
@@ -191,13 +205,32 @@ impl<F: Firewalls> Blocking<F> {
     }
 
     /// If the program at `path`, whose file's SHA-256 is `sha256`, is a
-    /// byte-identical copy (or a link) of a program an app rule blocks, the
-    /// blocked program's path. App rules match a path, so a copy elsewhere
-    /// was not blocked (a blocked app could even copy itself). `None` while
-    /// blocking is paused, or if `path` itself is blocked.
-    pub fn copy_of(&mut self, path: &str, sha256: &str) -> Option<String> {
+    /// byte-identical copy (or a link) of a program an app rule blocks, and
+    /// may be blocked now, the blocked program's path. App rules match a
+    /// path, so a copy elsewhere was not blocked (a blocked app could even
+    /// copy itself).
+    ///
+    /// A blocked program is compared by the SHA-256 it had when its rule was
+    /// made (pinned), never by the file now at its path: that file may be in
+    /// a folder any program of the user can write to, and swapping in
+    /// another program's file must not get that other program blocked.
+    /// Copies are blocked only while [`COPY_HEADROOM`] rule slots stay free
+    /// and at most [`COPIES_PER_HOUR`] an hour, so programs cannot use up the
+    /// rules. `None` while paused, or if `path` itself is blocked.
+    pub fn copy_of(
+        &mut self,
+        store: &mut Store,
+        path: &str,
+        sha256: &str,
+        now: SystemTime,
+    ) -> Option<String> {
         let blocker = self.blocker.as_ref()?;
-        if blocker.paused {
+        if blocker.paused || blocker.rules.len() + COPY_HEADROOM > MAX_RULES {
+            return None;
+        }
+        let hour_ago = now.checked_sub(Duration::from_secs(60 * 60))?;
+        self.auto_added.retain(|&at| at > hour_ago);
+        if self.auto_added.len() >= COPIES_PER_HOUR {
             return None;
         }
         let blocked: Vec<String> = blocker
@@ -214,33 +247,38 @@ impl<F: Firewalls> Blocking<F> {
         {
             return None;
         }
-        blocked
+        let original = blocked
             .into_iter()
-            .find(|program| self.hash_of(program).as_deref() == Some(sha256))
+            .find(|program| self.pinned(store, program).as_deref() == Some(sha256))?;
+        self.auto_added.push(now);
+        Some(original)
     }
 
-    /// The SHA-256 of the file at `path`, hashed again only when its size
-    /// or modification time changed. `None` if it cannot be read or is too
-    /// large to hash (as for program identities).
-    fn hash_of(&mut self, path: &str) -> Option<String> {
-        use whereabouts_win_capture::identity::{MAX_HASH_SIZE, sha256_of};
-        let metadata = std::fs::metadata(path).ok()?;
-        let (size, modified) = (metadata.len(), metadata.modified().ok()?);
-        if let Some((cached_size, cached_time, hash)) = self.hashes.get(path)
-            && (*cached_size, *cached_time) == (size, modified)
-        {
+    /// Pins (and saves) the SHA-256 of the file now at `program`.
+    fn pin(&mut self, store: &mut Store, program: &str) {
+        let key = program.to_lowercase();
+        let Some(hash) = hash_file(program) else {
+            return;
+        };
+        if let Err(error) = store.set_setting(&format!("{PIN_SETTING}{key}"), &hash) {
+            report!("warning: could not save the fingerprint of {program}: {error}");
+        }
+        self.pins.insert(key, hash);
+    }
+
+    /// The pinned SHA-256 of an app rule's program. Rules made before
+    /// pinning existed are pinned the first time they are needed.
+    fn pinned(&mut self, store: &mut Store, program: &str) -> Option<String> {
+        let key = program.to_lowercase();
+        if let Some(hash) = self.pins.get(&key) {
             return Some(hash.clone());
         }
-        if size > MAX_HASH_SIZE {
-            return None;
+        if let Ok(Some(hash)) = store.setting(&format!("{PIN_SETTING}{key}")) {
+            self.pins.insert(key, hash.clone());
+            return Some(hash);
         }
-        let hash = sha256_of(&std::fs::File::open(path).ok()?).ok()?;
-        if self.hashes.len() >= MAX_RULES {
-            self.hashes.clear();
-        }
-        self.hashes
-            .insert(path.to_owned(), (size, modified, hash.clone()));
-        Some(hash)
+        self.pin(store, program);
+        self.pins.get(&key).cloned()
     }
 
     /// Called on each refresh.
@@ -300,11 +338,21 @@ impl<F: Firewalls> Blocking<F> {
                     Ok(target) => target,
                     Err(message) => return error(message),
                 };
+                let program = match &target {
+                    RuleTarget::App { path } => Some(path.clone()),
+                    _ => None,
+                };
                 match self
                     .ensure(store, now)
                     .and_then(|blocker| blocker.add(store, target, now))
                 {
-                    Ok((id, already)) => Response::RuleAdded { id, already },
+                    Ok((id, already)) => {
+                        // What the user blocked is this file as it is now.
+                        if let (Some(program), false) = (program, already) {
+                            self.pin(store, &program);
+                        }
+                        Response::RuleAdded { id, already }
+                    }
                     Err(message) => error(message),
                 }
             }
@@ -881,6 +929,16 @@ fn same_rule(a: &Block, b: &Block) -> bool {
     }
 }
 
+/// The SHA-256 of the file at `path`; `None` if it cannot be read or is too
+/// large to hash (as for program identities).
+fn hash_file(path: &str) -> Option<String> {
+    use whereabouts_win_capture::identity::{MAX_HASH_SIZE, sha256_of};
+    if std::fs::metadata(path).ok()?.len() > MAX_HASH_SIZE {
+        return None;
+    }
+    sha256_of(&std::fs::File::open(path).ok()?).ok()
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy()
         .eq_ignore_ascii_case(&b.to_string_lossy())
@@ -1059,7 +1117,14 @@ mod tests {
         use whereabouts_win_capture::identity::sha256_of;
         let (mut store, dir) = store("copies");
         let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
-        let blocked = this_exe();
+        // A blocked program in a folder its user can write to, as uTorrent
+        // Web's is.
+        let blocked = dir.join("blocked.exe");
+        std::fs::copy(this_exe(), &blocked).unwrap();
+        let blocked = normalize_path(&blocked)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let added = blocking.answer(
             Some(&mut store),
             RuleCommand::Add(RuleSpec::App {
@@ -1068,31 +1133,88 @@ mod tests {
             at(T0),
         );
         assert!(matches!(added, Response::RuleAdded { .. }), "{added:?}");
-        // A copy in another folder, and a different program.
+        let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
         let copy = dir.join("renamed.exe");
         std::fs::copy(&blocked, &copy).unwrap();
-        let other = dir.join("other.exe");
-        std::fs::write(&other, b"not the same program").unwrap();
-        let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
-        let copy_path = copy.to_string_lossy().into_owned();
+        let (copy_path, copy_hash) = (copy.to_string_lossy().into_owned(), hash(&copy));
         assert_eq!(
-            blocking.copy_of(&copy_path, &hash(&copy)),
+            blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0)),
             Some(blocked.clone()),
             "the copy is recognised"
         );
+        let other = dir.join("other.exe");
+        std::fs::write(&other, b"not the same program").unwrap();
+        let other_hash = hash(&other);
         assert_eq!(
-            blocking.copy_of(&other.to_string_lossy(), &hash(&other)),
+            blocking.copy_of(&mut store, &other.to_string_lossy(), &other_hash, at(T0)),
             None,
             "a different program is not"
         );
         assert_eq!(
-            blocking.copy_of(&blocked.to_uppercase(), &hash(Path::new(&blocked))),
+            blocking.copy_of(&mut store, &blocked.to_uppercase(), &copy_hash, at(T0)),
             None,
             "the blocked program itself is not a copy"
         );
+        // Someone swaps another program's file in at the blocked path: that
+        // other program must not now count as a copy. The rule's fingerprint
+        // is the one from when it was made, also after a restart.
+        std::fs::copy(&other, &blocked).unwrap();
+        assert_eq!(
+            blocking.copy_of(&mut store, &other.to_string_lossy(), &other_hash, at(T0)),
+            None,
+            "a swapped-in file is not what was blocked"
+        );
+        let mut restarted = Blocking::start(open_fake, Some(&store), at(T0));
+        assert_eq!(
+            restarted.copy_of(&mut store, &other.to_string_lossy(), &other_hash, at(T0)),
+            None,
+            "the fingerprint was saved"
+        );
+        // At most a few copies an hour.
+        let mut blocking = restarted;
+        for _ in 0..COPIES_PER_HOUR {
+            assert!(
+                blocking
+                    .copy_of(&mut store, &copy_path, &copy_hash, at(T0 + 1))
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0 + 2)),
+            None,
+            "the hourly limit"
+        );
+        assert!(
+            blocking
+                .copy_of(&mut store, &copy_path, &copy_hash, at(T0 + 3700))
+                .is_some(),
+            "an hour later"
+        );
+        // Copies never take the last free rule slots.
+        for i in 0..(MAX_RULES - COPY_HEADROOM) {
+            let ip = IpAddr::from([203, 0, 113, u8::try_from(i % 250).unwrap()]);
+            let ip = if i < 250 {
+                ip
+            } else {
+                IpAddr::from([198, 51, 100, 1])
+            };
+            let _ = blocking.answer(
+                Some(&mut store),
+                RuleCommand::Add(RuleSpec::Address {
+                    ip,
+                    app: Some(blocked.clone()),
+                }),
+                at(T0 + 7400),
+            );
+        }
+        assert_eq!(
+            blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0 + 7400)),
+            None,
+            "rule slots are kept free"
+        );
         blocking.answer(Some(&mut store), RuleCommand::SetPaused(true), at(T0));
         assert_eq!(
-            blocking.copy_of(&copy_path, &hash(&copy)),
+            blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0 + 7400)),
             None,
             "nothing is added while blocking is paused"
         );
