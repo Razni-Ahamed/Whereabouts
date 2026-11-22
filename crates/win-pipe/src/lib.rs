@@ -20,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use windows::Win32::Foundation::{
@@ -35,6 +36,7 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_ANONYMOUS,
 };
+use windows::Win32::System::IO::CancelIoEx;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
@@ -281,6 +283,7 @@ impl PipeListener {
             file,
             peer_pid: client_pid,
             connected_by,
+            open: Arc::new(Mutex::new(true)),
         })
     }
 }
@@ -291,9 +294,58 @@ pub struct PipeConnection {
     file: File,
     peer_pid: u32,
     connected_by: SystemTime,
+    /// Whether the handle is still open; [`Breaker`]s check it under the
+    /// lock, so they never use a closed handle.
+    open: Arc<Mutex<bool>>,
+}
+
+impl Drop for PipeConnection {
+    fn drop(&mut self) {
+        // Before `file` closes the handle (fields drop after this).
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+}
+
+/// Lets another thread break a connection, for example one that has been
+/// waiting too long for its peer to say something.
+#[derive(Debug, Clone)]
+pub struct Breaker {
+    handle: isize,
+    open: Arc<Mutex<bool>>,
+}
+
+// SAFETY: the handle is only used while `open` says it is open, under the
+// lock that the connection's Drop also takes before closing it.
+unsafe impl Send for Breaker {}
+// SAFETY: as above; `break_connection` takes the lock.
+unsafe impl Sync for Breaker {}
+
+impl Breaker {
+    /// Cancels a read or write the connection is blocked in, so it returns
+    /// an error, and disconnects the pipe. Does nothing if the connection
+    /// was already closed.
+    pub fn break_connection(&self) {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*open {
+            return;
+        }
+        let handle = HANDLE(self.handle as *mut core::ffi::c_void);
+        // SAFETY: the handle is open (checked under the lock, which Drop
+        // takes before closing it). Cancelling I/O issued by another thread
+        // is what CancelIoEx is for; failure (nothing pending) is harmless.
+        let _ = unsafe { CancelIoEx(handle, None) };
+    }
 }
 
 impl PipeConnection {
+    /// A [`Breaker`] for this connection.
+    pub fn breaker(&self) -> Breaker {
+        Breaker {
+            handle: self.file.as_raw_handle() as isize,
+            open: Arc::clone(&self.open),
+        }
+    }
+
     /// Process ID of the program on the other end.
     ///
     /// Windows may reuse a process ID once its process has exited, so check
@@ -357,6 +409,7 @@ pub fn connect(name: &str) -> io::Result<PipeConnection> {
         file,
         peer_pid: server_pid,
         connected_by,
+        open: Arc::new(Mutex::new(true)),
     })
 }
 
@@ -486,6 +539,35 @@ mod tests {
         }
         let error = result.expect_err("a normal user must not add pipe instances");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn a_waiting_connection_can_be_broken_from_another_thread() {
+        let name = unique_name();
+        let sid = current_user_sid().unwrap();
+        let mut listener = PipeListener::bind(&name, &sid).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut connection = listener.accept().unwrap();
+            let breaker = connection.breaker();
+            let started = std::time::Instant::now();
+            let waker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                breaker.break_connection();
+                breaker
+            });
+            // The client never writes: this read waits until broken.
+            let mut byte = [0u8; 1];
+            let result = connection.read(&mut byte);
+            let waited = started.elapsed();
+            let breaker = waker.join().unwrap();
+            drop(connection);
+            breaker.break_connection(); // after close: does nothing
+            (result.is_err() || matches!(result, Ok(0)), waited)
+        });
+        let _client = connect(&name).unwrap();
+        let (broken, waited) = server.join().unwrap();
+        assert!(broken, "the read ended without data");
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
     }
 
     #[test]

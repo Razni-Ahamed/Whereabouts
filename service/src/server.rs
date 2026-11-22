@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use whereabouts_client::peer::{self, Client};
 use whereabouts_ipc::{
@@ -116,7 +116,7 @@ pub type SharedState = Arc<Mutex<LiveState>>;
 /// the pipe already exists (for example, Whereabouts is already running, or
 /// another program took the name).
 pub fn start(name: &str, client_sid: Option<&str>, state: SharedState) -> Result<(), String> {
-    start_with(name, client_sid, state, peer::trusted_client)
+    start_with(name, client_sid, state, peer::trusted_client, IDLE_LIMIT)
 }
 
 /// How often the service tries again for a pipe name that was taken.
@@ -171,7 +171,7 @@ fn start_or_retry_every(
 /// Like [`start`], with tests treating every client as the desktop app.
 #[cfg(test)]
 pub fn start_trusting_app(name: &str, state: SharedState) -> Result<(), String> {
-    start_with(name, None, state, |_, _| Some(Client::App))
+    start_with(name, None, state, |_, _| Some(Client::App), IDLE_LIMIT)
 }
 
 fn start_with(
@@ -179,6 +179,7 @@ fn start_with(
     client_sid: Option<&str>,
     state: SharedState,
     trust: Trust,
+    idle_limit: Duration,
 ) -> Result<(), String> {
     let sid = match client_sid {
         Some(sid) => sid.to_owned(),
@@ -191,7 +192,7 @@ fn start_with(
     })?;
     std::thread::Builder::new()
         .name(String::from("pipe-server"))
-        .spawn(move || accept_loop(listener, &state, trust))
+        .spawn(move || accept_loop(listener, &state, trust, idle_limit))
         .map_err(|e| format!("could not start the pipe server ({e})"))?;
     Ok(())
 }
@@ -205,7 +206,12 @@ impl Drop for Slot {
     }
 }
 
-fn accept_loop(mut listener: PipeListener, state: &SharedState, trust: Trust) {
+fn accept_loop(
+    mut listener: PipeListener,
+    state: &SharedState,
+    trust: Trust,
+    idle_limit: Duration,
+) {
     let active = Arc::new(AtomicUsize::new(0));
     loop {
         let connection = match listener.accept() {
@@ -232,15 +238,85 @@ fn accept_loop(mut listener: PipeListener, state: &SharedState, trust: Trust) {
             .name(String::from("pipe-client"))
             .spawn(move || {
                 let _slot = slot;
-                serve(connection, &state, client);
+                serve(connection, &state, client, idle_limit);
             });
     }
 }
 
-/// Answers one client until it disconnects or sends something invalid.
-fn serve(mut connection: PipeConnection, state: &Mutex<LiveState>, client: Client) {
+/// How long a client may stay connected without asking anything. Only a
+/// few clients are served at once ([`MAX_CLIENTS`]), so one that connects
+/// and then says nothing must not hold its place forever. The app asks every
+/// few seconds and reconnects if it was disconnected.
+const IDLE_LIMIT: Duration = Duration::from_secs(120);
+
+/// Breaks a connection that waits too long for its client's next request.
+/// Time spent answering does not count.
+struct Watchdog {
+    waiting_since: Arc<Mutex<Option<Instant>>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Watchdog {
+    fn start(breaker: whereabouts_win_pipe::Breaker, limit: Duration) -> Self {
+        let waiting_since = Arc::new(Mutex::new(None::<Instant>));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (waiting, finished) = (Arc::clone(&waiting_since), Arc::clone(&done));
+        let tick = (limit / 10).max(Duration::from_millis(20));
+        let _ = std::thread::Builder::new()
+            .name(String::from("pipe-watchdog"))
+            .spawn(move || {
+                while !finished.load(Ordering::Acquire) {
+                    std::thread::sleep(tick);
+                    let since = *waiting.lock().unwrap_or_else(PoisonError::into_inner);
+                    if since.is_some_and(|since| since.elapsed() >= limit) {
+                        breaker.break_connection();
+                        return;
+                    }
+                }
+            });
+        Self {
+            waiting_since,
+            done,
+        }
+    }
+
+    /// The connection now waits for the client.
+    fn waiting(&self) {
+        *self
+            .waiting_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// The connection is busy answering.
+    fn working(&self) {
+        *self
+            .waiting_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+/// Answers one client until it disconnects, sends something invalid or
+/// stays silent longer than `idle_limit`.
+fn serve(
+    mut connection: PipeConnection,
+    state: &Mutex<LiveState>,
+    client: Client,
+    idle_limit: Duration,
+) {
+    let watchdog = Watchdog::start(connection.breaker(), idle_limit);
     // The first message must be a Hello in our protocol version.
-    match read_message::<Request>(&mut connection) {
+    watchdog.waiting();
+    let first = read_message::<Request>(&mut connection);
+    watchdog.working();
+    match first {
         Ok(Request::Hello { protocol }) if protocol == PROTOCOL_VERSION => {}
         Ok(Request::Hello { protocol }) => {
             let _ = write_message(
@@ -260,7 +336,12 @@ fn serve(mut connection: PipeConnection, state: &Mutex<LiveState>, client: Clien
         return;
     }
     let mut store = None;
-    while let Ok(request) = read_message::<Request>(&mut connection) {
+    loop {
+        watchdog.waiting();
+        let Ok(request) = read_message::<Request>(&mut connection) else {
+            return;
+        };
+        watchdog.working();
         let response = answer(request.clamped(), state, &mut store, client);
         if write_message(&mut connection, &response).is_err() {
             return;
@@ -844,6 +925,41 @@ mod tests {
         .unwrap();
         assert!(matches!(answer, Response::Error { .. }), "{answer:?}");
         assert!(ask(&mut client, &Request::Status {}).is_err());
+    }
+
+    #[test]
+    fn a_silent_client_is_disconnected_and_frees_its_place() {
+        let name = unique_name();
+        let limit = Duration::from_millis(300);
+        start_with(&name, None, shared(1), |_, _| Some(Client::App), limit).unwrap();
+        let hello = Request::Hello {
+            protocol: PROTOCOL_VERSION,
+        };
+        // Every place taken by clients that say hello and then nothing.
+        let mut silent: Vec<_> = (0..MAX_CLIENTS)
+            .map(|_| {
+                let mut client = whereabouts_win_pipe::connect(&name).unwrap();
+                ask(&mut client, &hello).unwrap();
+                client
+            })
+            .collect();
+        // A client that keeps asking more often than the limit stays.
+        std::thread::sleep(Duration::from_millis(900));
+        for client in &mut silent {
+            assert!(
+                ask(client, &Request::Status {}).is_err(),
+                "a silent client was let go"
+            );
+        }
+        let mut busy = whereabouts_win_pipe::connect(&name).unwrap();
+        ask(&mut busy, &hello).expect("its place is free again");
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(matches!(
+                ask(&mut busy, &Request::Status {}),
+                Ok(Response::Status(_))
+            ));
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - **The service takes its connection to the app back.** While Whereabouts' service was stopped (during an update, or after a crash), any program could take the name of its private connection to the app, and the service then could not answer the app until it restarted. It now keeps trying, and answers as soon as the name is free.
 - **Warnings that cannot be undone default to Cancel.** In "Delete everything Whereabouts saved?" and "Stop these warnings?", pressing Enter deleted everything or silenced the warning; Cancel is now the default button.
 - **Rules are checked more strictly.** An app rule must name a real program, and a domain rule cannot be a shared ending such as `co.uk` or `github.io`, which would block countless sites.
+- **A connection that says nothing no longer holds a place.** The service answers a few clients at a time; one that connected and then stayed silent kept its place forever. It is now let go after two minutes.
 
 ### Fixed
 
