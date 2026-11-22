@@ -115,6 +115,21 @@ the screen's top level or `App.svelte`.
   throw-away self-signed certificate (removed afterwards). Releases stay unsigned until there is a
   certificate (SignPath Foundation, Azure Trusted Signing or a commercial one).
 
+### Follow-up: automated review of the Medium fixes
+
+An automated security review of the pushed Medium fixes found two weaknesses in them, both fixed:
+
+- **WebView2 crediting could be spoofed (high).** Any program can be called `msedgewebview2.exe`; such a
+  copy was credited to whatever started it (for example Explorer), with that program's name and
+  publisher, and "Block app" on it would have blocked Explorer. Only the installed runtime under
+  `Program Files (x86)\Microsoft\EdgeWebView\Application\` (or `Program Files`), which only
+  administrators can change, is now credited to its app.
+- **Copy-blocking could be steered (medium).** Copies were compared with the file *now* at the blocked
+  path. uTorrent Web's folder is user-writable, so swapping another program's file in there would have
+  got that other program blocked, and many copies could fill all 256 rule slots. Each app rule now
+  keeps the SHA-256 pinned when it was made (saved; older rules pinned on first use), copies are added
+  only while 64 slots stay free, and at most 5 an hour.
+
 ## Medium
 
 ### M1. Pipe squatting during a restart
