@@ -18,7 +18,7 @@
 //! same app and tracker, or the same app and listed range.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,6 +49,38 @@ pub struct FlowFacts<'a> {
 pub struct Raised {
     pub id: i64,
     pub alert: NewAlert,
+}
+
+/// Windows' own core network programs, which contact certificate
+/// authorities and Microsoft to check certificates and update Windows (for
+/// example `lsass.exe` reaching `geotrust.com`): no tracker alerts for them.
+/// Blocklisted networks are still reported.
+const WINDOWS_CORE: [&str; 5] = [
+    "lsass.exe",
+    "svchost.exe",
+    "services.exe",
+    "wininit.exe",
+    "winlogon.exe",
+];
+
+/// Whether `path` is one of [`WINDOWS_CORE`] in System32 itself (a program
+/// elsewhere with the same name does not count).
+fn is_windows_core(path: Option<&str>) -> bool {
+    let Some(path) = path.map(Path::new) else {
+        return false;
+    };
+    let system32 = std::env::var_os("SystemRoot")
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+        .join("System32");
+    let in_system32 = path.parent().is_some_and(|parent| {
+        parent
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&system32.to_string_lossy())
+    });
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase());
+    in_system32 && name.is_some_and(|name| WINDOWS_CORE.contains(&name.as_str()))
 }
 
 fn unix_secs(time: SystemTime) -> u64 {
@@ -138,7 +170,7 @@ impl Detector {
             }
         }
 
-        if let Some(domain) = flow.domain {
+        if let Some(domain) = flow.domain.filter(|_| !is_windows_core(flow.path)) {
             // The domain itself, or a tracker hidden behind it (a CNAME
             // alias of a site's own name).
             let direct = enricher.domain(domain);
@@ -390,6 +422,34 @@ mod tests {
             .unwrap();
         assert_eq!(raised.alert.allow_key, None);
         assert!(!store.alerts(at(0), 10).unwrap()[0].can_allow);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_certificate_checks_are_not_tracker_alerts() {
+        let (mut store, dir) = store("core");
+        let mut detector = Detector::default();
+        let lsass = PathBuf::from(std::env::var("SystemRoot").unwrap())
+            .join(r"System32\lsass.exe")
+            .to_string_lossy()
+            .into_owned();
+        let core = FlowFacts {
+            key: key("198.51.100.1:443"),
+            app: "lsass.exe",
+            path: Some(&lsass),
+            domain: Some("cdn.ads.example"),
+            aliases: &[],
+        };
+        detector.check_flow(&core, &enricher(), &mut store, at(T0));
+        assert!(store.alerts(at(0), 10).unwrap().is_empty());
+        // The same name anywhere else is just a program.
+        let impostor = FlowFacts {
+            key: key("198.51.100.2:443"),
+            path: Some(r"C:\Users\x\lsass.exe"),
+            ..core
+        };
+        detector.check_flow(&impostor, &enricher(), &mut store, at(T0));
+        assert_eq!(store.alerts(at(0), 10).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
