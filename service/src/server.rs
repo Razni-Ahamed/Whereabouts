@@ -249,20 +249,24 @@ fn accept_loop(
 /// few seconds and reconnects if it was disconnected.
 const IDLE_LIMIT: Duration = Duration::from_secs(120);
 
-/// Breaks a connection that waits too long for its client's next request.
-/// Time spent answering does not count.
+/// Breaks a connection that waits too long on its client: for its next
+/// request, or to take an answer (a client that stops reading would leave
+/// the write blocked once the pipe buffer is full). Time spent working out
+/// an answer does not count.
 struct Watchdog {
     waiting_since: Arc<Mutex<Option<Instant>>>,
     done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Watchdog {
-    fn start(breaker: whereabouts_win_pipe::Breaker, limit: Duration) -> Self {
+    /// `None` if its thread cannot start: the connection is then not served,
+    /// rather than served without a limit.
+    fn start(breaker: whereabouts_win_pipe::Breaker, limit: Duration) -> Option<Self> {
         let waiting_since = Arc::new(Mutex::new(None::<Instant>));
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (waiting, finished) = (Arc::clone(&waiting_since), Arc::clone(&done));
         let tick = (limit / 10).max(Duration::from_millis(20));
-        let _ = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(String::from("pipe-watchdog"))
             .spawn(move || {
                 while !finished.load(Ordering::Acquire) {
@@ -273,23 +277,25 @@ impl Watchdog {
                         return;
                     }
                 }
-            });
-        Self {
+            })
+            .ok()?;
+        Some(Self {
             waiting_since,
             done,
-        }
+        })
     }
 
-    /// The connection now waits for the client.
-    fn waiting(&self) {
+    /// The connection now waits on the client (reading its request, or
+    /// writing an answer it has to take).
+    fn on_client(&self) {
         *self
             .waiting_since
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
     }
 
-    /// The connection is busy answering.
-    fn working(&self) {
+    /// The connection is busy working out an answer.
+    fn answering(&self) {
         *self
             .waiting_since
             .lock()
@@ -311,11 +317,13 @@ fn serve(
     client: Client,
     idle_limit: Duration,
 ) {
-    let watchdog = Watchdog::start(connection.breaker(), idle_limit);
-    // The first message must be a Hello in our protocol version.
-    watchdog.waiting();
+    let Some(watchdog) = Watchdog::start(connection.breaker(), idle_limit) else {
+        return;
+    };
+    // The first message must be a Hello in our protocol version. Every
+    // read and write below waits on the client, under the time limit.
+    watchdog.on_client();
     let first = read_message::<Request>(&mut connection);
-    watchdog.working();
     match first {
         Ok(Request::Hello { protocol }) if protocol == PROTOCOL_VERSION => {}
         Ok(Request::Hello { protocol }) => {
@@ -337,12 +345,13 @@ fn serve(
     }
     let mut store = None;
     loop {
-        watchdog.waiting();
+        watchdog.on_client();
         let Ok(request) = read_message::<Request>(&mut connection) else {
             return;
         };
-        watchdog.working();
+        watchdog.answering();
         let response = answer(request.clamped(), state, &mut store, client);
+        watchdog.on_client();
         if write_message(&mut connection, &response).is_err() {
             return;
         }
@@ -960,6 +969,33 @@ mod tests {
                 Ok(Response::Status(_))
             ));
         }
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_answers_is_let_go_too() {
+        let name = unique_name();
+        let limit = Duration::from_millis(300);
+        // Enough flows that the answer does not fit the pipe's buffer.
+        start_with(&name, None, shared(500), |_, _| Some(Client::App), limit).unwrap();
+        let hello = Request::Hello {
+            protocol: PROTOCOL_VERSION,
+        };
+        let stuck: Vec<_> = (0..MAX_CLIENTS)
+            .map(|_| {
+                let mut client = whereabouts_win_pipe::connect(&name).unwrap();
+                ask(&mut client, &hello).unwrap();
+                // Asks for a large answer and never reads it.
+                write_message(&mut client, &Request::LiveFlows { limit: 500 }).unwrap();
+                client
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(1200));
+        let mut next = whereabouts_win_pipe::connect(&name).unwrap();
+        assert!(
+            matches!(ask(&mut next, &hello), Ok(Response::Hello { .. })),
+            "the places of clients that stopped reading are free again"
+        );
+        drop(stuck);
     }
 
     #[test]
