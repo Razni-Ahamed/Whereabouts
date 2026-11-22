@@ -496,6 +496,14 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes a setting. Returns `false` if it was not set.
+    pub fn remove_setting(&mut self, key: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM settings WHERE key = ?1", [key])?
+            > 0)
+    }
+
     /// Stores finished flows in one transaction.
     pub fn insert_flows(&mut self, records: &[FlowRecord]) -> Result<(), StoreError> {
         let transaction = self.conn.transaction()?;
@@ -1257,6 +1265,9 @@ mod tests {
             store.setting("blocking_paused").unwrap().as_deref(),
             Some("false")
         );
+        assert!(store.remove_setting("blocking_paused").unwrap());
+        assert_eq!(store.setting("blocking_paused").unwrap(), None);
+        assert!(!store.remove_setting("blocking_paused").unwrap());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

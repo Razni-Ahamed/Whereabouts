@@ -195,6 +195,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         store.as_ref(),
         SystemTime::now(),
     );
+    // App rules from before fingerprints existed are pinned now, once.
+    blocking.pin_existing(store.as_mut());
 
     // Clients ask the engine for work only it can do (deleting everything)
     // through this channel.

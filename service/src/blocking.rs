@@ -136,6 +136,9 @@ pub struct Blocking<F: Firewalls> {
 /// lower-case program path.
 const PIN_SETTING: &str = "app_rule_sha256:";
 
+/// The pin of a program whose file could not be read: never matches.
+const NO_PIN: &str = "-";
+
 /// Copies are blocked only while this many rule slots stay free, so that
 /// copies can never use up the user's own rules.
 const COPY_HEADROOM: usize = 64;
@@ -254,31 +257,66 @@ impl<F: Firewalls> Blocking<F> {
         Some(original)
     }
 
-    /// Pins (and saves) the SHA-256 of the file now at `program`.
+    /// Pins (and saves) the SHA-256 of the file now at `program`: called
+    /// when its rule is made, the moment the user chose to block it. A file
+    /// that cannot be read is pinned as [`NO_PIN`], which never matches, so
+    /// no later file at that path can be pinned in its place.
     fn pin(&mut self, store: &mut Store, program: &str) {
         let key = program.to_lowercase();
-        let Some(hash) = hash_file(program) else {
-            return;
-        };
+        let hash = hash_file(program).unwrap_or_else(|| String::from(NO_PIN));
         if let Err(error) = store.set_setting(&format!("{PIN_SETTING}{key}"), &hash) {
             report!("warning: could not save the fingerprint of {program}: {error}");
         }
         self.pins.insert(key, hash);
     }
 
-    /// The pinned SHA-256 of an app rule's program. Rules made before
-    /// pinning existed are pinned the first time they are needed.
-    fn pinned(&mut self, store: &mut Store, program: &str) -> Option<String> {
+    /// Forgets the fingerprint of a program whose rule was removed.
+    fn unpin(&mut self, store: &mut Store, program: &str) {
         let key = program.to_lowercase();
-        if let Some(hash) = self.pins.get(&key) {
-            return Some(hash.clone());
+        self.pins.remove(&key);
+        if let Err(error) = store.remove_setting(&format!("{PIN_SETTING}{key}")) {
+            report!("warning: could not forget the fingerprint of {program}: {error}");
         }
-        if let Ok(Some(hash)) = store.setting(&format!("{PIN_SETTING}{key}")) {
-            self.pins.insert(key, hash.clone());
-            return Some(hash);
+    }
+
+    /// The pinned SHA-256 of an app rule's program, if it has one. Never
+    /// pinned here, from whatever file is at the path when a copy shows up:
+    /// rules without a pin get no copy matching.
+    fn pinned(&mut self, store: &Store, program: &str) -> Option<String> {
+        let key = program.to_lowercase();
+        let hash = match self.pins.get(&key) {
+            Some(hash) => hash.clone(),
+            None => {
+                let hash = store.setting(&format!("{PIN_SETTING}{key}")).ok()??;
+                self.pins.insert(key, hash.clone());
+                hash
+            }
+        };
+        (hash != NO_PIN).then_some(hash)
+    }
+
+    /// Pins the app rules saved before fingerprints existed, once, when the
+    /// service starts (after an update), rather than whenever a copy shows
+    /// up, a moment another program could choose.
+    pub fn pin_existing(&mut self, store: Option<&mut Store>) {
+        let (Some(store), Some(blocker)) = (store, self.blocker.as_ref()) else {
+            return;
+        };
+        let unpinned: Vec<String> = blocker
+            .rules
+            .iter()
+            .filter_map(|rule| match &rule.target {
+                RuleTarget::App { path } => Some(path.clone()),
+                _ => None,
+            })
+            .filter(|path| {
+                let key = format!("{PIN_SETTING}{}", path.to_lowercase());
+                matches!(store.setting(&key), Ok(None))
+            })
+            .collect();
+        for program in unpinned {
+            self.pin(store, &program);
         }
-        self.pin(store, program);
-        self.pins.get(&key).cloned()
     }
 
     /// Called on each refresh.
@@ -357,11 +395,26 @@ impl<F: Firewalls> Blocking<F> {
                 }
             }
             RuleCommand::Remove(id) => {
+                let program = self.blocker.as_ref().and_then(|blocker| {
+                    blocker
+                        .rules
+                        .iter()
+                        .find(|r| r.id == id)
+                        .and_then(|r| match &r.target {
+                            RuleTarget::App { path } => Some(path.clone()),
+                            _ => None,
+                        })
+                });
                 match self
                     .ensure(store, now)
                     .and_then(|blocker| blocker.remove(store, id, now))
                 {
-                    Ok(true) => listed(self.blocker.as_ref(), store),
+                    Ok(true) => {
+                        if let Some(program) = program {
+                            self.unpin(store, &program);
+                        }
+                        listed(self.blocker.as_ref(), store)
+                    }
                     Ok(false) => error(format!("there is no rule {id}")),
                     Err(message) => error(message),
                 }
@@ -1217,6 +1270,74 @@ mod tests {
             blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0 + 7400)),
             None,
             "nothing is added while blocking is paused"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fingerprints_are_taken_only_when_a_rule_is_made_and_go_with_it() {
+        use whereabouts_win_capture::identity::sha256_of;
+        let (mut store, dir) = store("pins");
+        let blocked = dir.join("old.exe");
+        std::fs::copy(this_exe(), &blocked).unwrap();
+        let blocked = normalize_path(&blocked)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // A rule saved by a version without fingerprints.
+        store
+            .add_rule(
+                &RuleTarget::App {
+                    path: blocked.clone(),
+                },
+                at(T0),
+            )
+            .unwrap();
+        let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
+        let copy = dir.join("copy.exe");
+        std::fs::copy(&blocked, &copy).unwrap();
+        let (copy_path, copy_hash) = (copy.to_string_lossy().into_owned(), hash(&copy));
+        let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
+        assert_eq!(
+            blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0)),
+            None,
+            "no fingerprint yet: never taken when a copy shows up"
+        );
+        // Pinned once at start-up instead.
+        blocking.pin_existing(Some(&mut store));
+        assert_eq!(
+            blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0)),
+            Some(blocked.clone())
+        );
+        // Removing the rule forgets its fingerprint, also in the store.
+        let id = store.rules().unwrap()[0].id;
+        blocking.answer(Some(&mut store), RuleCommand::Remove(id), at(T0));
+        let key = format!("{PIN_SETTING}{}", blocked.to_lowercase());
+        assert_eq!(store.setting(&key).unwrap(), None);
+        // A file that cannot be read gets a pin that never matches, so a
+        // later file at that path cannot be pinned in its place.
+        let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
+        let _ = blocking.answer(
+            Some(&mut store),
+            RuleCommand::Add(RuleSpec::App {
+                path: blocked.clone(),
+            }),
+            at(T0),
+        );
+        blocking.pin(&mut store, &dir.join("missing.exe").to_string_lossy());
+        assert_eq!(
+            store
+                .setting(&format!(
+                    "{PIN_SETTING}{}",
+                    dir.join("missing.exe").to_string_lossy().to_lowercase()
+                ))
+                .unwrap()
+                .as_deref(),
+            Some(NO_PIN)
+        );
+        assert_eq!(
+            blocking.pinned(&store, &dir.join("missing.exe").to_string_lossy()),
+            None
         );
         let _ = std::fs::remove_dir_all(dir);
     }
