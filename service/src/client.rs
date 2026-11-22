@@ -189,8 +189,12 @@ fn run_rules(name: &str, action: RuleAction) -> Result<(), String> {
     };
     let mut client = Client::connect(name).map_err(|problem| explain(&problem))?;
     let mut response = ask(&mut client, &request)?;
-    if let Response::RuleAdded { id } = response {
-        println!("Added rule {id}.");
+    if let Response::RuleAdded { id, already } = response {
+        if already {
+            println!("Already blocked by rule {id}.");
+        } else {
+            println!("Added rule {id}.");
+        }
         response = ask(&mut client, &Request::ListRules {})?;
     }
     match response {
@@ -416,7 +420,10 @@ mod tests {
                                 app: None,
                             }) => {
                                 assert_eq!(ip, "203.0.113.5".parse::<IpAddr>().unwrap());
-                                Response::RuleAdded { id: 1 }
+                                Response::RuleAdded {
+                                    id: 1,
+                                    already: false,
+                                }
                             }
                             crate::blocking::RuleCommand::List => Response::Rules {
                                 rules: Vec::new(),

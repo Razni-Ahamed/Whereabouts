@@ -335,15 +335,24 @@ fn describe(rule: &RuleSpec) -> (String, String) {
     }
 }
 
+/// A rule the service saved (or already had).
+#[derive(Debug, Serialize)]
+struct Added {
+    id: i64,
+    /// It was already there: nothing new was blocked, and undoing must not
+    /// remove it.
+    already: bool,
+}
+
 /// Shows exactly what will be blocked in a native Windows dialog and, if
 /// the user agrees, asks the service to block it. `None` if the user said
-/// no; otherwise the rule's ID.
+/// no.
 #[tauri::command]
 async fn add_rule(
     rule: RuleSpec,
     app: tauri::AppHandle,
     connection: tauri::State<'_, Arc<Connection>>,
-) -> Result<Option<i64>, Problem> {
+) -> Result<Option<Added>, Problem> {
     let connection = Arc::clone(&connection);
     blocking(move || {
         let (title, message) = describe(&rule);
@@ -362,7 +371,7 @@ async fn add_rule(
         }
         let request = Request::AddRule { rule };
         connection.with(|client| match client.ask(&request)? {
-            Response::RuleAdded { id } => Ok(Some(id)),
+            Response::RuleAdded { id, already } => Ok(Some(Added { id, already })),
             other => Err(unexpected(&other)),
         })
     })

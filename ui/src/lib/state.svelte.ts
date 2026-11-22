@@ -162,7 +162,12 @@ class Store {
       return false;
     }
     if (result.value === null) return false;
-    this.showNote({ text: `Blocked ${what}.`, tone: 'good', undo: result.value });
+    if (result.value.already) {
+      // Nothing new was blocked: no Undo, which would lift the existing rule.
+      this.showNote({ text: `${what} was already blocked.`, tone: 'good' });
+    } else {
+      this.showNote({ text: `Blocked ${what}.`, tone: 'good', undo: result.value.id });
+    }
     await this.refreshRules();
     return true;
   }

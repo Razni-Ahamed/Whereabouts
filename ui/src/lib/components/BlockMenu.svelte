@@ -4,7 +4,7 @@
   import { AppWindow, Globe, MapPin, Users, X } from '@lucide/svelte';
   import { appLabel } from '../format';
   import { portal } from '../portal';
-  import { remoteAddress, store } from '../state.svelte';
+  import { appRule, remoteAddress, store } from '../state.svelte';
   import type { FlowView, RuleSpec } from '../types';
 
   let { flow, onclose }: { flow: FlowView; onclose: () => void } = $props();
@@ -20,10 +20,13 @@
 
   const name = $derived(appLabel(flow.app));
   const ip = $derived(remoteAddress(flow.remote));
+  /** The rule that already blocks this whole program, if any. */
+  const blockedApp = $derived(appRule(store.rules, flow.path));
 
   const choices = $derived.by(() => {
     const list: Choice[] = [];
-    const path = flow.path;
+    // Rules for this program alone add nothing when it is blocked completely.
+    const path = blockedApp ? null : flow.path;
     if (flow.domain && path) {
       list.push({
         icon: Globe,
@@ -101,6 +104,9 @@
       <button class="close" type="button" aria-label="Close" onclick={onclose}><X size={18} /></button>
     </header>
 
+    {#if blockedApp}
+      <p class="muted already">{name} is already blocked completely. You can lift that on the Rules screen.</p>
+    {/if}
     {#if choices.length}
       <ul>
         {#each choices as choice (choice.title)}
@@ -120,7 +126,7 @@
         Windows asks you to confirm. Blocks stay when Whereabouts is closed, and you can lift them on the
         Rules screen. Core Windows programs, DNS servers and your local network are never blocked.
       </p>
-    {:else}
+    {:else if !blockedApp}
       <p class="muted">
         Whereabouts doesn't know which program file made this connection (it may be part of Windows, or it
         ended before it was checked), so it can't be blocked from here.
@@ -235,5 +241,9 @@
   .foot {
     margin: 14px 2px 0;
     font-size: 12px;
+  }
+  .already {
+    margin: 0 2px 12px;
+    font-size: 13px;
   }
 </style>

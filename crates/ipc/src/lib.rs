@@ -377,6 +377,10 @@ pub enum Response {
         /// The new rule's ID (or the existing one's, if it was already
         /// saved).
         id: i64,
+        /// Whether the rule was already saved, so nothing new was blocked
+        /// (and undoing must not remove the existing rule).
+        #[serde(default)]
+        already: bool,
     },
     /// The request could not be answered.
     Error {

@@ -85,6 +85,12 @@ export interface RuleView {
   blocked_addresses: number;
 }
 
+/** A rule the service saved, or already had (then nothing new was blocked). */
+export interface Added {
+  id: number;
+  already: boolean;
+}
+
 export interface Rules {
   rules: RuleView[];
   paused: boolean;

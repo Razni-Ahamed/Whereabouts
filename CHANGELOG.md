@@ -19,6 +19,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ### Fixed
 
+- **"Undo" no longer removes a block you already had.** Blocking something that was already blocked showed "Blocked · Undo", and Undo removed the original rule. It now says it was already blocked. The Block menu no longer offers to block an app that is already blocked.
 - **The Block menu opens in view on every screen.** Opened from a long list of connections, it appeared far down the page, so "Block…" seemed to do nothing.
 - **A blocked app is now cut off both ways.** Blocking an app stopped only the connections it made, so a blocked torrent client could still trade with peers that connected to it (Windows Firewall usually lets them in). Incoming connections are now refused too, except from this computer itself, so the app's own window keeps working. Apps you already blocked get this when the service starts.
 - **Blocked apps no longer show web pages from the internet, ads included.** Apps such as uTorrent Web show web pages in their window through Microsoft Edge WebView2, a part of Windows shared by many apps, which fetched them even while the app was blocked. Blocking an app now also sets WebView2's per-app setting for it so those pages cannot load, from the next time the app starts; the app's own local pages keep working. Unblocking, pausing and uninstalling remove the setting again. The setting is keyed by file name, so another program with the same file name also loses pages shown through WebView2.

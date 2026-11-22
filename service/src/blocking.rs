@@ -247,7 +247,7 @@ impl<F: Firewalls> Blocking<F> {
                     .ensure(store, now)
                     .and_then(|blocker| blocker.add(store, target, now))
                 {
-                    Ok(id) => Response::RuleAdded { id },
+                    Ok((id, already)) => Response::RuleAdded { id, already },
                     Err(message) => error(message),
                 }
             }
@@ -704,8 +704,11 @@ impl<F: Firewalls> Blocker<F> {
         store: &mut Store,
         target: RuleTarget,
         now: SystemTime,
-    ) -> Result<i64, String> {
-        if self.rules.len() >= MAX_RULES && !self.rules.iter().any(|r| r.target == target) {
+    ) -> Result<(i64, bool), String> {
+        // Saved rules are in their one spelling (checked_target), so equal
+        // targets are the same rule.
+        let already = self.rules.iter().any(|r| r.target == target);
+        if self.rules.len() >= MAX_RULES && !already {
             return Err(format!(
                 "there are already {MAX_RULES} rules; remove some first"
             ));
@@ -742,7 +745,7 @@ impl<F: Firewalls> Blocker<F> {
                 created: now,
             });
         }
-        Ok(id)
+        Ok((id, already))
     }
 
     /// Deletes a rule and unblocks what it blocked. `false` if there was no
@@ -971,10 +974,18 @@ mod tests {
         let (mut store, dir) = store("app");
         let (mut blocker, warnings) = Blocker::start(Fake::default(), &store, at(T0)).unwrap();
         assert!(warnings.is_empty());
-        let id = blocker
+        let (id, already) = blocker
             .add(&mut store, RuleTarget::App { path: this_exe() }, at(T0))
             .unwrap();
+        assert!(!already);
         assert_eq!(blocker.firewall.blocks.len(), 1);
+        assert_eq!(store.rules().unwrap().len(), 1);
+        // Blocking it again is the same rule, reported as already there, so
+        // the app offers no Undo that would remove the original.
+        let again = blocker
+            .add(&mut store, RuleTarget::App { path: this_exe() }, at(T0))
+            .unwrap();
+        assert_eq!(again, (id, true));
         assert_eq!(store.rules().unwrap().len(), 1);
         assert!(blocker.remove(&mut store, id, at(T0)).unwrap());
         assert!(blocker.firewall.blocks.is_empty());
@@ -1070,7 +1081,7 @@ mod tests {
     fn domain_rules_block_confirmed_addresses_and_they_expire() {
         let (mut store, dir) = store("domain");
         let (mut blocker, _) = Blocker::start(Fake::default(), &store, at(T0)).unwrap();
-        let id = blocker
+        let (id, _) = blocker
             .add(
                 &mut store,
                 RuleTarget::Domain {
