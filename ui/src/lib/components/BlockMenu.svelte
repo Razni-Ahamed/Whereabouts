@@ -3,6 +3,7 @@
   // will be blocked in its own dialog; nothing is blocked from here alone.
   import { AppWindow, Globe, MapPin, Users, X } from '@lucide/svelte';
   import { appLabel } from '../format';
+  import { portal } from '../portal';
   import { remoteAddress, store } from '../state.svelte';
   import type { FlowView, RuleSpec } from '../types';
 
@@ -80,8 +81,9 @@
 
 <svelte:window {onkeydown} />
 
+<!-- Moved to <body> so it covers the window wherever it is opened from (see portal.ts). -->
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-<div class="scrim" onclick={onclose}>
+<div class="scrim" onclick={onclose} use:portal>
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div
     class="glass sheet fade-in"
