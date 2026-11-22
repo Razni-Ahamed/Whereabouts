@@ -515,7 +515,13 @@ struct ProcessInfo {
     requested: bool,
     /// Whether its first use of the network has been handled.
     noted: bool,
+    /// A WebView2 process showing another app's web content: `name`,
+    /// `path` and `token` are that app's (see [`ProcessNames::note_traffic`]).
+    web_content: bool,
 }
+
+/// The program file every WebView2 app's web content runs in.
+const WEBVIEW2: &str = "msedgewebview2.exe";
 
 /// What the console knows about each process, plus each process's program
 /// identity (signature, hash), worked out by a background worker.
@@ -550,6 +556,13 @@ impl ProcessNames {
 
     /// Called for each network event of `pid`: looks the process up if it
     /// is not known yet, and asks for its program's identity once.
+    ///
+    /// A WebView2 process (`msedgewebview2.exe`, one file shared by every
+    /// WebView2 app) is credited to the app that started it: it fetches that
+    /// app's web pages and ads, and "msedgewebview2 contacted Google" named
+    /// no app at all. It takes the app's name, path and identity, so the
+    /// app's publisher is shown and blocking blocks the app (whose web
+    /// content Whereabouts then keeps offline too).
     fn note_traffic(&mut self, pid: u32) {
         if !self.processes.contains_key(&pid) {
             let token = self.new_token();
@@ -559,15 +572,36 @@ impl ProcessNames {
                 token,
                 requested: false,
                 noted: false,
+                web_content: false,
             });
             self.processes.insert(pid, info);
         }
-        let Some(Some(info)) = self.processes.get_mut(&pid) else {
+        let Some(Some(info)) = self.processes.get(&pid) else {
             return;
         };
         if info.requested {
             return;
         }
+        if info.name.eq_ignore_ascii_case(WEBVIEW2)
+            && let Some((host, _)) = process::ancestor_not_named(pid, WEBVIEW2)
+        {
+            self.note_traffic(host);
+            if let Some(Some(host_info)) = self.processes.get(&host) {
+                let shown = ProcessInfo {
+                    name: host_info.name.clone(),
+                    path: host_info.path.clone(),
+                    token: host_info.token,
+                    requested: true,
+                    noted: false,
+                    web_content: true,
+                };
+                self.processes.insert(pid, Some(shown));
+                return;
+            }
+        }
+        let Some(Some(info)) = self.processes.get_mut(&pid) else {
+            return;
+        };
         // Check the file the process is actually running, per the kernel's
         // record (which follows renames), locked while the process is alive
         // so it cannot be swapped before the check. If that cannot be
@@ -610,6 +644,7 @@ impl ProcessNames {
             token: self.new_token(),
             requested: false,
             noted: false,
+            web_content: false,
         };
         self.processes.insert(pid, Some(info));
     }
@@ -649,6 +684,15 @@ impl ProcessNames {
             .get(&pid)
             .and_then(Option::as_ref)
             .map_or("(unknown)", |info| info.name.as_str())
+    }
+
+    /// Whether `pid` is a WebView2 process showing another app's web content
+    /// (its name and path are that app's).
+    fn is_web_content(&self, pid: u32) -> bool {
+        self.processes
+            .get(&pid)
+            .and_then(Option::as_ref)
+            .is_some_and(|info| info.web_content)
     }
 
     /// Token of `pid`'s current process instance, if it has a program file
@@ -1036,6 +1080,7 @@ fn flow_view(row: &Row, names: &ProcessNames, enricher: &Enricher) -> FlowView {
         bytes_sent: row.stats.bytes_sent,
         bytes_received: row.stats.bytes_received,
         active: row.closed_at.is_none(),
+        web_content: names.is_web_content(row.key.pid),
     }
 }
 

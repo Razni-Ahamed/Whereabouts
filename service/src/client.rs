@@ -374,6 +374,7 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
             active: true,
+            web_content: false,
         };
         let publisher = publisher_text(&flow);
         assert!(publisher.ends_with("…?"), "{publisher}");

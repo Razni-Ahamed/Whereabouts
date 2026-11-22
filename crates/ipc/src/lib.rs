@@ -519,6 +519,10 @@ pub struct FlowView {
     pub bytes_received: u64,
     /// Whether the flow is still open.
     pub active: bool,
+    /// Made by the app's web content (a WebView2 process the app started):
+    /// `app`, `path` and `publisher` are the app's.
+    #[serde(default)]
+    pub web_content: bool,
 }
 
 /// Saved totals for one app.
@@ -613,6 +617,7 @@ mod tests {
                 bytes_sent: 659,
                 bytes_received: 5800,
                 active: false,
+                web_content: true,
             }],
         });
     }

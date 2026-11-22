@@ -51,6 +51,8 @@ export interface FlowView {
   bytes_sent: number;
   bytes_received: number;
   active: boolean;
+  /** Made by the app's web content (its WebView2); app, path and publisher are the app's. */
+  web_content?: boolean;
 }
 
 export interface AppTotals {

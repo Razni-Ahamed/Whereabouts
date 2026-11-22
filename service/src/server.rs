@@ -558,6 +558,7 @@ mod tests {
             bytes_sent: 100,
             bytes_received: 1000,
             active: true,
+            web_content: false,
         }
     }
 

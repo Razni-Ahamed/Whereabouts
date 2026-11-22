@@ -44,6 +44,14 @@
             <span class="minor">
               {flow.publisher === '-' ? 'no program file' : flow.publisher}
             </span>
+            {#if flow.web_content}
+              <span
+                class="minor web"
+                title="Fetched by the web pages this app shows in its window (Microsoft Edge WebView2)"
+              >
+                web content
+              </span>
+            {/if}
           </span>
         </button>
       {/if}
@@ -52,6 +60,11 @@
           {flow.domain ?? flow.remote}
           <Trust kind="domain" trust={flow.domain_trust} />
         </span>
+        {#if flow.web_content && !showApp}
+          <span class="minor web" title="Fetched by the web pages this app shows in its window (Microsoft Edge WebView2)">
+            web content
+          </span>
+        {/if}
         {#if flow.via}
           <span class="minor mono via" title="{flow.domain} points to {flow.via}, which is what shows who is behind it">
             via {flow.via}
@@ -147,6 +160,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .web {
+    color: var(--info);
   }
   .minor {
     font-size: 11.5px;
