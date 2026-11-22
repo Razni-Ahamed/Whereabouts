@@ -187,6 +187,18 @@ pub struct RetentionReport {
     pub hourly_deleted: u64,
 }
 
+/// How changes reach the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Journal {
+    /// Changes are appended to `<database>-wal` and copied into the
+    /// database now and then (what Whereabouts uses).
+    WriteAheadLog,
+    /// SQLite's default: the old pages are copied to `<database>-journal`,
+    /// which is created and deleted for every save (Whereabouts 0.2 and
+    /// earlier).
+    Rollback,
+}
+
 /// The encrypted database.
 #[derive(Debug)]
 pub struct Store {
@@ -195,8 +207,15 @@ pub struct Store {
 
 impl Store {
     /// Opens (or creates) the database at `path` with `key`, and brings its
-    /// layout up to date.
+    /// layout up to date. Changes go through a write-ahead log
+    /// ([`Journal::WriteAheadLog`]).
     pub fn open(path: &Path, key: &Key) -> Result<Self, StoreError> {
+        Self::open_with_journal(path, key, Journal::WriteAheadLog)
+    }
+
+    /// Like [`Store::open`], but choosing how changes reach the file (to
+    /// compare them; Whereabouts itself always uses the write-ahead log).
+    pub fn open_with_journal(path: &Path, key: &Key, journal: Journal) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", key.sqlcipher_literal())?;
         // SQLCipher only checks the key when the file is first read.
@@ -225,9 +244,13 @@ impl Store {
         // still using the journal. If it cannot be changed (it needs a
         // moment with no other connection reading), the journal keeps
         // working and the next start tries again.
+        let (mode, synchronous) = match journal {
+            Journal::WriteAheadLog => ("WAL", "NORMAL"),
+            Journal::Rollback => ("DELETE", "FULL"),
+        };
         let _mode: String =
-            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.pragma_update_and_check(None, "journal_mode", mode, |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", synchronous)?;
         conn.pragma_update(None, "secure_delete", true)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let store = Self { conn };
@@ -1593,6 +1616,23 @@ mod tests {
                 String::from_utf8_lossy(needle)
             );
         }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_rollback_journal_can_still_be_chosen_for_comparisons() {
+        let path = temp_db("rollback");
+        let mut store = Store::open_with_journal(&path, &key(7), Journal::Rollback).unwrap();
+        assert_eq!(journal_mode(&store), "delete");
+        store
+            .insert_flows(&[record("a.exe", "x.example", 1, 1)])
+            .unwrap();
+        assert!(!wal_of(&path).exists());
+        drop(store);
+        // Opening normally switches it to the write-ahead log.
+        let store = Store::open(&path, &key(7)).unwrap();
+        assert_eq!(journal_mode(&store), "wal");
+        assert_eq!(store.flow_count().unwrap(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
