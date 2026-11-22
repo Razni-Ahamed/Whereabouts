@@ -25,6 +25,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ### Fixed
 
+- **Requests are not sent twice.** When Whereabouts answered with an error, the app asked again on a new connection, so Delete everything or a new rule could be requested twice. Only a lost connection is retried now.
 - **Rule numbers are never reused**, so an old number (in an Undo, or a script's `--unblock 3`) cannot remove a different rule.
 - **"Undo" no longer removes a block you already had.** Blocking something that was already blocked showed "Blocked · Undo", and Undo removed the original rule. It now says it was already blocked. The Block menu no longer offers to block an app that is already blocked.
 - **The Block menu opens in view on every screen.** Opened from a long list of connections, it appeared far down the page, so "Block…" seemed to do nothing.

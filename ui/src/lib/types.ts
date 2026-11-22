@@ -65,7 +65,7 @@ export interface AppTotals {
 }
 
 /** Why the service could not be reached. */
-export type ProblemKind = 'not_running' | 'access_denied' | 'untrusted' | 'refused' | 'other';
+export type ProblemKind = 'not_running' | 'access_denied' | 'untrusted' | 'refused' | 'lost' | 'other';
 
 export interface Problem {
   kind: ProblemKind;

@@ -28,7 +28,7 @@ use whereabouts_win_startup::BACKGROUND_ARG;
 
 use serde::Serialize;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-use whereabouts_client::{Client, Problem, unexpected};
+use whereabouts_client::{Client, Problem, ProblemKind, unexpected};
 use whereabouts_core::text::display_safe;
 use whereabouts_ipc::{
     AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, MAX_HOURS, MAX_ROWS, PIPE_NAME,
@@ -54,16 +54,20 @@ struct Connection(Mutex<Option<Client>>);
 impl Connection {
     /// Runs `ask` with a connected client: the open one if it still works,
     /// otherwise a newly connected one.
+    ///
+    /// Only a lost connection is asked again: an error *answer* (the
+    /// service refused, or timed out) is returned as it is, since repeating
+    /// Delete everything or a new rule would do it twice.
     fn with<T>(
         &self,
         mut ask: impl FnMut(&mut Client) -> Result<T, Problem>,
     ) -> Result<T, Problem> {
         let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(client) = slot.as_mut() {
-            if let Ok(value) = ask(client) {
-                return Ok(value);
+            match ask(client) {
+                Err(problem) if problem.kind == ProblemKind::Lost => *slot = None,
+                answered => return answered,
             }
-            *slot = None;
         }
         let mut client = Client::connect(PIPE_NAME)?;
         let value = ask(&mut client)?;
