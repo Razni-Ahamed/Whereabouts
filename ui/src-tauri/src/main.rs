@@ -281,7 +281,10 @@ fn program_name(path: &str) -> String {
 fn describe(rule: &RuleSpec) -> (String, String) {
     const DOMAIN_NOTE: &str = "Whereabouts blocks the addresses Windows' DNS service confirms \
                                for it, so a connection that is already starting may still get \
-                               through once.";
+                               through once. A program that looks names up on its own (for \
+                               example with DNS over HTTPS) or uses fixed addresses can get \
+                               around a domain block; to stop a program completely, block the \
+                               program.";
     const EVERY_APP_NOTE: &str = "This applies to every app on this computer. Whereabouts never \
                                   blocks addresses that other, unblocked sites also use, nor what \
                                   Windows needs to stay online.";
@@ -306,8 +309,8 @@ fn describe(rule: &RuleSpec) -> (String, String) {
         } => (
             format!("Block {} for {}?", display_safe(name), program_name(app)),
             format!(
-                "{} will not be able to connect to {} or its subdomains.\n\n{}\n\n{DOMAIN_NOTE}\n\n\
-                 {undo}",
+                "Whereabouts will block {} from reaching {} and its subdomains.\n\n{}\n\n\
+                 {DOMAIN_NOTE}\n\n{undo}",
                 program_name(app),
                 display_safe(name),
                 display_safe(app)
@@ -316,8 +319,8 @@ fn describe(rule: &RuleSpec) -> (String, String) {
         RuleSpec::Domain { name, app: None } => (
             format!("Block {} for every app?", display_safe(name)),
             format!(
-                "No app will be able to connect to {} or its subdomains.\n\n{EVERY_APP_NOTE}\n\n\
-                 {DOMAIN_NOTE}\n\n{undo}",
+                "Whereabouts will block every app from reaching {} and its subdomains.\n\n\
+                 {EVERY_APP_NOTE}\n\n{DOMAIN_NOTE}\n\n{undo}",
                 display_safe(name)
             ),
         ),
@@ -747,6 +750,8 @@ mod tests {
         });
         assert_eq!(title, "Block ads.example.com for every app?");
         assert!(text.contains("every app on this computer"));
+        // Honest about what a domain block cannot stop.
+        assert!(text.contains("DNS over HTTPS"), "{text}");
 
         // Rules for one app always show that app's full path, so two
         // programs with the same name cannot be confused.

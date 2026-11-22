@@ -53,7 +53,11 @@
       </button>
     {/each}
   </div>
-  <FlowTable {flows} {onpickapp} />
+  <FlowTable
+    {flows}
+    {onpickapp}
+    empty={query.trim() || filter !== 'all' ? 'No connections match.' : 'No connections yet.'}
+  />
 </section>
 
 <style>

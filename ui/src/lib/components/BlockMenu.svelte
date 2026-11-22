@@ -31,7 +31,7 @@
       list.push({
         icon: Globe,
         title: `${flow.domain} for ${name}`,
-        detail: `${name} can't reach this site or its subdomains. Other apps still can.`,
+        detail: `Blocks this site and its subdomains for ${name}, by the addresses Windows looks up. Other apps still can.`,
         rule: { kind: 'domain', name: flow.domain, app: path },
         what: `${flow.domain} for ${name}`,
       });
@@ -41,7 +41,7 @@
         icon: Users,
         title: `${flow.domain} for every app`,
         detail:
-          'No app can reach this site. Addresses that other, unblocked sites share are never blocked.',
+          'Blocks this site for every app, by the addresses Windows looks up. Addresses that other, unblocked sites share are never blocked.',
         rule: { kind: 'domain', name: flow.domain, app: null },
         what: `${flow.domain} for every app`,
         warn: true,

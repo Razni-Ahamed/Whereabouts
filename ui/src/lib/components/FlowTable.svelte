@@ -12,7 +12,14 @@
     flows,
     showApp = true,
     onpickapp,
-  }: { flows: FlowView[]; showApp?: boolean; onpickapp?: (app: string) => void } = $props();
+    empty = 'No connections yet.',
+  }: {
+    flows: FlowView[];
+    showApp?: boolean;
+    onpickapp?: (app: string) => void;
+    /** What to say when there are no rows (a search may have found none). */
+    empty?: string;
+  } = $props();
 
   let blocking = $state<FlowView | null>(null);
 </script>
@@ -98,7 +105,7 @@
       </span>
     </div>
   {:else}
-    <p class="muted empty">No connections yet.</p>
+    <p class="muted empty">{empty}</p>
   {/each}
 </div>
 

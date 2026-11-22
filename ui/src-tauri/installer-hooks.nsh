@@ -22,6 +22,8 @@
     nsExec::ExecToLog '"$INSTDIR\whereabouts-service.exe" --unregister'
     Pop $0
   ${EndIf}
+  ; A copy an earlier development build left behind; nothing uses it.
+  Delete "$INSTDIR\whereabouts-service.exe.before-wal"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

@@ -29,6 +29,8 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - **Rule numbers are never reused**, so an old number (in an Undo, or a script's `--unblock 3`) cannot remove a different rule.
 - **The service starts even if its data folder was made by someone else first**, as long as that folder is empty (one with anything in it is still refused).
 - **Windows' own certificate checks are no longer tracker alerts** (for example `lsass` reaching `geotrust.com`).
+- **The block dialog says what a domain block cannot stop**: programs that look names up on their own (DNS over HTTPS) or use fixed addresses.
+- Small things: the tab bar stays in view while a long list scrolls, a search with no results says so, "1 internet connection", and the installer removes a leftover development file.
 - **"Undo" no longer removes a block you already had.** Blocking something that was already blocked showed "Blocked · Undo", and Undo removed the original rule. It now says it was already blocked. The Block menu no longer offers to block an app that is already blocked.
 - **The Block menu opens in view on every screen.** Opened from a long list of connections, it appeared far down the page, so "Block…" seemed to do nothing.
 - **A blocked app is now cut off both ways.** Blocking an app stopped only the connections it made, so a blocked torrent client could still trade with peers that connected to it (Windows Firewall usually lets them in). Incoming connections are now refused too, except from this computer itself, so the app's own window keeps working. Apps you already blocked get this when the service starts.
