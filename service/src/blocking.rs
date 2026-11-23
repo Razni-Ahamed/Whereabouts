@@ -1326,11 +1326,6 @@ mod tests {
         let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
         let copy = dir.join("renamed.exe");
         std::fs::copy(&blocked, &copy).unwrap();
-        if whereabouts_win_secrets::installed_by_administrators(&copy).unwrap() {
-            eprintln!("skipped: running elevated, so copies are owned by Administrators");
-            let _ = std::fs::remove_dir_all(dir);
-            return;
-        }
         let (copy_path, copy_hash) = (copy.to_string_lossy().into_owned(), hash(&copy));
         assert_eq!(
             blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0)),
@@ -1454,11 +1449,6 @@ mod tests {
         // A copy elsewhere is blocked, tied to the user's rule.
         let copy = dir.join("elsewhere.exe");
         std::fs::copy(&blocked, &copy).unwrap();
-        if whereabouts_win_secrets::installed_by_administrators(&copy).unwrap() {
-            eprintln!("skipped: running elevated, so copies are owned by Administrators");
-            let _ = std::fs::remove_dir_all(dir);
-            return;
-        }
         let copy = copy.to_string_lossy().into_owned();
         let original = blocking.copy_of(&mut store, &copy, &hash, at(T0)).unwrap();
         assert_eq!(original, blocked);
@@ -1512,11 +1502,6 @@ mod tests {
         let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
         let copy = dir.join("copy.exe");
         std::fs::copy(&blocked, &copy).unwrap();
-        if whereabouts_win_secrets::installed_by_administrators(&copy).unwrap() {
-            eprintln!("skipped: running elevated, so copies are owned by Administrators");
-            let _ = std::fs::remove_dir_all(dir);
-            return;
-        }
         let (copy_path, copy_hash) = (copy.to_string_lossy().into_owned(), hash(&copy));
         let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
         assert_eq!(

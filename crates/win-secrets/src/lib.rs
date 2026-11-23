@@ -735,15 +735,13 @@ mod tests {
             installed_by_administrators(&curl).unwrap(),
             "TrustedInstaller"
         );
-        // A copy is owned by whoever made it (unless that is an elevated
-        // administrator, as it can be when tests run as one).
+        // A copy in a user's folder never counts: it is owned by whoever made
+        // it, and even when an elevated administrator made it (as when tests
+        // run as one, on CI) the folder's permissions let the user change it.
         let dir = temp("owned-copy");
         let copy = dir.join("curl.exe");
         std::fs::copy(&curl, &copy).unwrap();
-        let elevated_test =
-            owned_by_system_or_administrators(&open_no_follow(&dir, READ_CONTROL.0).unwrap())
-                .unwrap();
-        assert_eq!(installed_by_administrators(&copy).unwrap(), elevated_test);
+        assert!(!installed_by_administrators(&copy).unwrap());
         assert!(installed_by_administrators(&dir.join("missing.exe")).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
