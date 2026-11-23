@@ -247,10 +247,12 @@ impl<F: Firewalls> Blocking<F> {
         if self.auto_added.len() >= COPIES_PER_HOUR {
             return None;
         }
-        // A copy where only administrators can put files (Windows, Program
-        // Files) is not a way around a block: it is, for example, Windows'
-        // own curl.exe, of which the user blocked a copy.
-        if in_protected_folder(path) {
+        // A copy that Windows or an administrator put there (owned by
+        // TrustedInstaller, SYSTEM or Administrators) is not a way around a
+        // block: it is, for example, Windows' own curl.exe, of which the user
+        // blocked a copy. Checked by owner, not by folder: normal accounts
+        // can write to some folders under Windows (Temp, Tasks...).
+        if whereabouts_win_secrets::owned_by_administrators(Path::new(path)).unwrap_or(false) {
             return None;
         }
         let blocked: Vec<String> = blocker
@@ -1102,28 +1104,6 @@ fn is_copy_rule(store: &Store, program: &str) -> bool {
     matches!(store.setting(&key), Ok(Some(_)))
 }
 
-/// Whether `path` is in a folder only administrators can put programs in:
-/// Windows, or Program Files.
-fn in_protected_folder(path: &str) -> bool {
-    use std::sync::OnceLock;
-    use whereabouts_win_secrets::{KnownFolder, known_folder};
-    static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
-    let roots = ROOTS.get_or_init(|| {
-        let mut dirs: Vec<PathBuf> = [KnownFolder::ProgramFiles, KnownFolder::ProgramFilesX86]
-            .into_iter()
-            .filter_map(|folder| known_folder(folder).ok())
-            .collect();
-        if let Some(windows) = std::env::var_os("SystemRoot") {
-            dirs.push(PathBuf::from(windows));
-        }
-        dirs.into_iter()
-            .map(|dir| format!("{}\\", dir.to_string_lossy().to_lowercase()))
-            .collect()
-    });
-    let path = path.to_lowercase();
-    !path.contains("\\..\\") && roots.iter().any(|root| path.starts_with(root.as_str()))
-}
-
 /// The SHA-256 of the file at `path`; `None` if it cannot be read or is too
 /// large to hash (as for program identities).
 fn hash_file(path: &str) -> Option<String> {
@@ -1338,6 +1318,11 @@ mod tests {
         let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
         let copy = dir.join("renamed.exe");
         std::fs::copy(&blocked, &copy).unwrap();
+        if whereabouts_win_secrets::owned_by_administrators(&copy).unwrap() {
+            eprintln!("skipped: running elevated, so copies are owned by Administrators");
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
         let (copy_path, copy_hash) = (copy.to_string_lossy().into_owned(), hash(&copy));
         assert_eq!(
             blocking.copy_of(&mut store, &copy_path, &copy_hash, at(T0)),
@@ -1461,6 +1446,11 @@ mod tests {
         // A copy elsewhere is blocked, tied to the user's rule.
         let copy = dir.join("elsewhere.exe");
         std::fs::copy(&blocked, &copy).unwrap();
+        if whereabouts_win_secrets::owned_by_administrators(&copy).unwrap() {
+            eprintln!("skipped: running elevated, so copies are owned by Administrators");
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
         let copy = copy.to_string_lossy().into_owned();
         let original = blocking.copy_of(&mut store, &copy, &hash, at(T0)).unwrap();
         assert_eq!(original, blocked);
@@ -1505,6 +1495,11 @@ mod tests {
         let hash = |path: &Path| sha256_of(&std::fs::File::open(path).unwrap()).unwrap();
         let copy = dir.join("copy.exe");
         std::fs::copy(&blocked, &copy).unwrap();
+        if whereabouts_win_secrets::owned_by_administrators(&copy).unwrap() {
+            eprintln!("skipped: running elevated, so copies are owned by Administrators");
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
         let (copy_path, copy_hash) = (copy.to_string_lossy().into_owned(), hash(&copy));
         let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
         assert_eq!(

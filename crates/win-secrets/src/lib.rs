@@ -30,18 +30,18 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SetSecurityInfo,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom, CRYPT_INTEGER_BLOB,
     CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid,
-    WinLocalSystemSid,
+    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorOwner, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
@@ -365,6 +365,59 @@ fn owned_by_system_or_administrators(handle: &OwnedHandle) -> io::Result<bool> {
     Ok(trusted)
 }
 
+/// The account that owns Windows' own files.
+const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Whether the file at `path` (not followed if it is a link) is owned by
+/// TrustedInstaller, SYSTEM or Administrators: Windows' own files and what
+/// an administrator installed. A program of a normal account cannot make a
+/// file owned by them (a copy it makes is its own), whichever folder the
+/// file is in, so this says who put the file there; a folder name does not.
+pub fn owned_by_administrators(path: &Path) -> io::Result<bool> {
+    let handle = open_no_follow(path, READ_CONTROL.0)?;
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `handle` is open with READ_CONTROL; `descriptor` receives a
+    // LocalAlloc'd buffer that `owner` points into, freed below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "reading the owner of {} failed: {status:?}",
+            path.display()
+        )));
+    }
+    let mut installer = PSID::default();
+    // SAFETY: the constant is a valid SID string; `installer` receives a
+    // LocalAlloc'd SID freed below.
+    let converted =
+        unsafe { ConvertStringSidToSidW(&HSTRING::from(TRUSTED_INSTALLER), &mut installer) };
+    // SAFETY: `owner` points into `descriptor`, still alive; `installer` is
+    // valid when the conversion succeeded.
+    let trusted = unsafe {
+        IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
+            || (converted.is_ok() && EqualSid(owner, installer).is_ok())
+    };
+    if converted.is_ok() {
+        // SAFETY: allocated by ConvertStringSidToSidW; freed once.
+        let _ = unsafe { LocalFree(Some(HLOCAL(installer.0))) };
+    }
+    // SAFETY: allocated by GetSecurityInfo above; freed exactly once.
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    Ok(trusted)
+}
+
 /// Refuses an object that is a link/junction, of the wrong kind, or not
 /// owned by SYSTEM or Administrators.
 fn check_trusted(handle: &OwnedHandle, path: &Path, directory: bool) -> io::Result<()> {
@@ -620,6 +673,24 @@ mod tests {
             "{error}"
         );
         assert!(!planted.exists(), "the folder its maker made is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_own_files_are_owned_by_administrators_and_copies_are_not() {
+        let curl = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap())
+            .join(r"System32\curl.exe");
+        assert!(owned_by_administrators(&curl).unwrap(), "TrustedInstaller");
+        // A copy is owned by whoever made it (unless that is an elevated
+        // administrator, as it can be when tests run as one).
+        let dir = temp("owned-copy");
+        let copy = dir.join("curl.exe");
+        std::fs::copy(&curl, &copy).unwrap();
+        let elevated_test =
+            owned_by_system_or_administrators(&open_no_follow(&dir, READ_CONTROL.0).unwrap())
+                .unwrap();
+        assert_eq!(owned_by_administrators(&copy).unwrap(), elevated_test);
+        assert!(owned_by_administrators(&dir.join("missing.exe")).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
