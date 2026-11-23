@@ -38,10 +38,10 @@ use windows::Win32::Security::Cryptography::{
     CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, INHERIT_ONLY_ACE, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
@@ -368,32 +368,43 @@ fn owned_by_system_or_administrators(handle: &OwnedHandle) -> io::Result<bool> {
 /// The account that owns Windows' own files.
 const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
-/// Whether the file at `path` (not followed if it is a link) is owned by
-/// TrustedInstaller, SYSTEM or Administrators: Windows' own files and what
-/// an administrator installed. A program of a normal account cannot make a
-/// file owned by them (a copy it makes is its own), whichever folder the
-/// file is in, so this says who put the file there; a folder name does not.
-pub fn owned_by_administrators(path: &Path) -> io::Result<bool> {
+/// Access that lets an account change a file's content or who may: write
+/// or append data, change its permissions or owner, or the generic rights
+/// that include them.
+const CHANGE_ACCESS: u32 =
+    0x0000_0002 | 0x0000_0004 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
+
+/// ACE type of a plain "access allowed" entry.
+const ACCESS_ALLOWED: u8 = 0;
+
+/// Whether the file at `path` (not followed if it is a link) was put there
+/// by Windows or an administrator and only they can change it: it is owned
+/// by TrustedInstaller, SYSTEM or Administrators, and its permissions let
+/// no one else change its content or permissions. A program of a normal
+/// account cannot make such a file (a copy it makes is its own), whichever
+/// folder it is in; a folder name says nothing about that.
+pub fn installed_by_administrators(path: &Path) -> io::Result<bool> {
     let handle = open_no_follow(path, READ_CONTROL.0)?;
     let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `handle` is open with READ_CONTROL; `descriptor` receives a
-    // LocalAlloc'd buffer that `owner` points into, freed below.
+    // LocalAlloc'd buffer that `owner` and `dacl` point into, freed below.
     let status = unsafe {
         GetSecurityInfo(
             handle.0,
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             Some(&mut owner),
             None,
-            None,
+            Some(&mut dacl),
             None,
             Some(&mut descriptor),
         )
     };
     if status.is_err() {
         return Err(io::Error::other(format!(
-            "reading the owner of {} failed: {status:?}",
+            "reading the permissions of {} failed: {status:?}",
             path.display()
         )));
     }
@@ -402,13 +413,53 @@ pub fn owned_by_administrators(path: &Path) -> io::Result<bool> {
     // LocalAlloc'd SID freed below.
     let converted =
         unsafe { ConvertStringSidToSidW(&HSTRING::from(TRUSTED_INSTALLER), &mut installer) };
-    // SAFETY: `owner` points into `descriptor`, still alive; `installer` is
-    // valid when the conversion succeeded.
-    let trusted = unsafe {
-        IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
-            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
-            || (converted.is_ok() && EqualSid(owner, installer).is_ok())
+    // SAFETY: `sid` points into `descriptor` (alive until freed below);
+    // `installer` is valid when the conversion succeeded.
+    let administrator = |sid: PSID| unsafe {
+        IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+            || (converted.is_ok() && EqualSid(sid, installer).is_ok())
     };
+    // No permissions at all (a NULL DACL) lets everyone change the file.
+    let mut trusted = administrator(owner) && !dacl.is_null();
+    if trusted {
+        // SAFETY: `dacl` is a valid ACL inside `descriptor`.
+        let count = unsafe { (*dacl).AceCount };
+        for index in 0..u32::from(count) {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `index` is below the ACL's entry count; `ace` receives
+            // a pointer into the ACL.
+            if unsafe { GetAce(dacl, index, &mut ace) }.is_err() {
+                trusted = false;
+                break;
+            }
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if header.AceFlags & INHERIT_ONLY_ACE.0 as u8 != 0 {
+                continue; // applies to children only, not to this file
+            }
+            match header.AceType {
+                ACCESS_ALLOWED => {
+                    // SAFETY: an ACCESS_ALLOWED ACE; its SID starts at
+                    // `SidStart`, inside the ACE.
+                    let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+                    let sid = PSID((&raw const allowed.SidStart).cast_mut().cast());
+                    if allowed.Mask & CHANGE_ACCESS != 0 && !administrator(sid) {
+                        trusted = false;
+                        break;
+                    }
+                }
+                // Other "allow" kinds (object, callback): not expected on a
+                // program file; to be safe, not trusted.
+                5 | 9 | 11 => {
+                    trusted = false;
+                    break;
+                }
+                // Deny and audit entries only take access away.
+                _ => {}
+            }
+        }
+    }
     if converted.is_ok() {
         // SAFETY: allocated by ConvertStringSidToSidW; freed once.
         let _ = unsafe { LocalFree(Some(HLOCAL(installer.0))) };
@@ -677,10 +728,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_own_files_are_owned_by_administrators_and_copies_are_not() {
+    fn windows_own_files_count_as_installed_and_copies_do_not() {
         let curl = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap())
             .join(r"System32\curl.exe");
-        assert!(owned_by_administrators(&curl).unwrap(), "TrustedInstaller");
+        assert!(
+            installed_by_administrators(&curl).unwrap(),
+            "TrustedInstaller"
+        );
         // A copy is owned by whoever made it (unless that is an elevated
         // administrator, as it can be when tests run as one).
         let dir = temp("owned-copy");
@@ -689,8 +743,8 @@ mod tests {
         let elevated_test =
             owned_by_system_or_administrators(&open_no_follow(&dir, READ_CONTROL.0).unwrap())
                 .unwrap();
-        assert_eq!(owned_by_administrators(&copy).unwrap(), elevated_test);
-        assert!(owned_by_administrators(&dir.join("missing.exe")).is_err());
+        assert_eq!(installed_by_administrators(&copy).unwrap(), elevated_test);
+        assert!(installed_by_administrators(&dir.join("missing.exe")).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
