@@ -802,10 +802,7 @@ fn block_if_copy(
     let Some(original) = blocking.copy_of(store, &identity.path, sha256, now) else {
         return;
     };
-    let rule = whereabouts_ipc::RuleSpec::App {
-        path: identity.path.clone(),
-    };
-    match blocking.answer(Some(store), crate::blocking::RuleCommand::Add(rule), now) {
+    match blocking.block_copy(store, &identity.path, &original, now) {
         whereabouts_ipc::Response::RuleAdded { already: false, .. } => {
             println!("Blocked {}: a copy of blocked {original}", identity.path);
             live.lock()

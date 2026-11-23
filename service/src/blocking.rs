@@ -145,6 +145,11 @@ const PIN_SETTING: &str = "app_rule_sha256:";
 /// The pin of a program whose file could not be read: never matches.
 const NO_PIN: &str = "-";
 
+/// Saved setting marking an app rule as one Whereabouts added for a copy:
+/// followed by the copy's lower-case path, it holds the blocked program the
+/// copy was found to match.
+const COPY_SETTING: &str = "app_rule_copy_of:";
+
 /// Copies are blocked only while this many rule slots stay free, so that
 /// copies can never use up the user's own rules.
 const COPY_HEADROOM: usize = 64;
@@ -242,6 +247,12 @@ impl<F: Firewalls> Blocking<F> {
         if self.auto_added.len() >= COPIES_PER_HOUR {
             return None;
         }
+        // A copy where only administrators can put files (Windows, Program
+        // Files) is not a way around a block: it is, for example, Windows'
+        // own curl.exe, of which the user blocked a copy.
+        if in_protected_folder(path) {
+            return None;
+        }
         let blocked: Vec<String> = blocker
             .rules
             .iter()
@@ -256,11 +267,51 @@ impl<F: Firewalls> Blocking<F> {
         {
             return None;
         }
-        let original = blocked
-            .into_iter()
-            .find(|program| self.pinned(store, program).as_deref() == Some(sha256))?;
+        // Only programs the user blocked count, never copies Whereabouts
+        // added, so that one copy cannot lead to the next.
+        let original = blocked.into_iter().find(|program| {
+            !is_copy_rule(store, program) && self.pinned(store, program).as_deref() == Some(sha256)
+        })?;
         self.auto_added.push(now);
         Some(original)
+    }
+
+    /// Blocks `copy`, a copy of the blocked program `original`, with a rule
+    /// of its own that is removed again with the original's rule.
+    pub fn block_copy(
+        &mut self,
+        store: &mut Store,
+        copy: &str,
+        original: &str,
+        now: SystemTime,
+    ) -> Response {
+        let answer = self.answer(
+            Some(store),
+            RuleCommand::Add(RuleSpec::App {
+                path: copy.to_owned(),
+            }),
+            now,
+        );
+        if let Response::RuleAdded { already: false, id } = answer {
+            // The rule's own spelling of the path (checked_target).
+            let saved = self.blocker.as_ref().and_then(|blocker| {
+                blocker
+                    .rules
+                    .iter()
+                    .find(|r| r.id == id)
+                    .and_then(|r| match &r.target {
+                        RuleTarget::App { path } => Some(path.clone()),
+                        _ => None,
+                    })
+            });
+            if let Some(saved) = saved {
+                let key = format!("{COPY_SETTING}{}", saved.to_lowercase());
+                if let Err(error) = store.set_setting(&key, original) {
+                    report!("warning: could not save that {saved} is a copy: {error}");
+                }
+            }
+        }
+        answer
     }
 
     /// Pins (and saves) the SHA-256 of the file now at `program`: called
@@ -299,6 +350,40 @@ impl<F: Firewalls> Blocking<F> {
             }
         };
         (hash != NO_PIN).then_some(hash)
+    }
+
+    /// Removes the rules Whereabouts added for copies of `original`, whose
+    /// own rule was just removed: lifting a block lifts it for its copies.
+    fn remove_copies_of(&mut self, store: &mut Store, original: &str, now: SystemTime) {
+        let Some(blocker) = self.blocker.as_ref() else {
+            return;
+        };
+        let copies: Vec<(i64, String)> = blocker
+            .rules
+            .iter()
+            .filter_map(|rule| match &rule.target {
+                RuleTarget::App { path } => Some((rule.id, path.clone())),
+                _ => None,
+            })
+            .filter(|(_, path)| {
+                let key = format!("{COPY_SETTING}{}", path.to_lowercase());
+                store
+                    .setting(&key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|of| same_path(Path::new(&of), Path::new(original)))
+            })
+            .collect();
+        for (id, path) in copies {
+            if let Some(blocker) = self.blocker.as_mut()
+                && let Err(error) = blocker.remove(store, id, now)
+            {
+                report!("warning: could not lift the block of {path}, a copy: {error}");
+                continue;
+            }
+            self.unpin(store, &path);
+            let _ = store.remove_setting(&format!("{COPY_SETTING}{}", path.to_lowercase()));
+        }
     }
 
     /// Pins the app rules saved before fingerprints existed, once, when the
@@ -418,6 +503,11 @@ impl<F: Firewalls> Blocking<F> {
                     Ok(true) => {
                         if let Some(program) = program {
                             self.unpin(store, &program);
+                            let _ = store.remove_setting(&format!(
+                                "{COPY_SETTING}{}",
+                                program.to_lowercase()
+                            ));
+                            self.remove_copies_of(store, &program, now);
                         }
                         listed(self.blocker.as_ref(), store)
                     }
@@ -1006,6 +1096,34 @@ fn same_rule(a: &Block, b: &Block) -> bool {
     }
 }
 
+/// Whether the app rule for `program` is one Whereabouts added for a copy.
+fn is_copy_rule(store: &Store, program: &str) -> bool {
+    let key = format!("{COPY_SETTING}{}", program.to_lowercase());
+    matches!(store.setting(&key), Ok(Some(_)))
+}
+
+/// Whether `path` is in a folder only administrators can put programs in:
+/// Windows, or Program Files.
+fn in_protected_folder(path: &str) -> bool {
+    use std::sync::OnceLock;
+    use whereabouts_win_secrets::{KnownFolder, known_folder};
+    static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        let mut dirs: Vec<PathBuf> = [KnownFolder::ProgramFiles, KnownFolder::ProgramFilesX86]
+            .into_iter()
+            .filter_map(|folder| known_folder(folder).ok())
+            .collect();
+        if let Some(windows) = std::env::var_os("SystemRoot") {
+            dirs.push(PathBuf::from(windows));
+        }
+        dirs.into_iter()
+            .map(|dir| format!("{}\\", dir.to_string_lossy().to_lowercase()))
+            .collect()
+    });
+    let path = path.to_lowercase();
+    !path.contains("\\..\\") && roots.iter().any(|root| path.starts_with(root.as_str()))
+}
+
 /// The SHA-256 of the file at `path`; `None` if it cannot be read or is too
 /// large to hash (as for program identities).
 fn hash_file(path: &str) -> Option<String> {
@@ -1304,6 +1422,64 @@ mod tests {
             None,
             "nothing is added while blocking is paused"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copies_stay_tied_to_what_the_user_blocked() {
+        use whereabouts_win_capture::identity::sha256_of;
+        let (mut store, dir) = store("copy-links");
+        let mut blocking = Blocking::start(open_fake, Some(&store), at(T0));
+        // The user blocks a copy of Windows' curl, as the end-to-end test does.
+        let system_curl = PathBuf::from(std::env::var("SystemRoot").unwrap())
+            .join(r"System32\curl.exe")
+            .to_string_lossy()
+            .into_owned();
+        let blocked = dir.join("blocked-curl.exe");
+        std::fs::copy(&system_curl, &blocked).unwrap();
+        let blocked = normalize_path(&blocked)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let hash = sha256_of(&std::fs::File::open(&blocked).unwrap()).unwrap();
+        let added = blocking.answer(
+            Some(&mut store),
+            RuleCommand::Add(RuleSpec::App {
+                path: blocked.clone(),
+            }),
+            at(T0),
+        );
+        let Response::RuleAdded { id, .. } = added else {
+            panic!("{added:?}");
+        };
+        // Windows' own curl is the same file, but only administrators can
+        // put it there: it is not a way around the block.
+        assert_eq!(
+            blocking.copy_of(&mut store, &system_curl, &hash, at(T0)),
+            None
+        );
+        // A copy elsewhere is blocked, tied to the user's rule.
+        let copy = dir.join("elsewhere.exe");
+        std::fs::copy(&blocked, &copy).unwrap();
+        let copy = copy.to_string_lossy().into_owned();
+        let original = blocking.copy_of(&mut store, &copy, &hash, at(T0)).unwrap();
+        assert_eq!(original, blocked);
+        assert!(matches!(
+            blocking.block_copy(&mut store, &copy, &original, at(T0)),
+            Response::RuleAdded { already: false, .. }
+        ));
+        // A further copy still matches the user's rule, never the copy's.
+        let further = dir.join("further.exe");
+        std::fs::copy(&blocked, &further).unwrap();
+        assert_eq!(
+            blocking
+                .copy_of(&mut store, &further.to_string_lossy(), &hash, at(T0))
+                .as_deref(),
+            Some(blocked.as_str())
+        );
+        // Lifting the user's block lifts it for the copy too.
+        blocking.answer(Some(&mut store), RuleCommand::Remove(id), at(T0));
+        assert!(store.rules().unwrap().is_empty(), "{:?}", store.rules());
         let _ = std::fs::remove_dir_all(dir);
     }
 
