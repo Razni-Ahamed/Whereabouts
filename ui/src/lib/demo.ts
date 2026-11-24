@@ -2,6 +2,7 @@
 // design work). The desktop app always shows real data from the service.
 
 import type { Added, AlertView, AppTotals, FlowView, ListsView, Live, Problem, Rules, RuleSpec } from './types';
+import { appKey } from './apps';
 
 // Demo list updates, kept while the page is open.
 export const demoLists: ListsView = {
@@ -214,8 +215,10 @@ export function demoDismissAlert(id: number, allow: boolean): boolean {
 export function demoHistory(): AppTotals[] {
   const byApp = new Map<string, AppTotals>();
   for (const flow of demoLive().flows) {
-    const entry = byApp.get(flow.app) ?? {
+    const key = appKey(flow.app, flow.path);
+    const entry = byApp.get(key) ?? {
       app: flow.app,
+      path: flow.path,
       publisher: flow.publisher,
       flows: 0,
       destinations: 0,
@@ -226,7 +229,7 @@ export function demoHistory(): AppTotals[] {
     entry.destinations += 4;
     entry.bytes_sent += flow.bytes_sent * 6;
     entry.bytes_received += flow.bytes_received * 6;
-    byApp.set(flow.app, entry);
+    byApp.set(key, entry);
   }
   return [...byApp.values()].sort(
     (a, b) => b.bytes_sent + b.bytes_received - (a.bytes_sent + a.bytes_received),

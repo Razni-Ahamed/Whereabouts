@@ -4,7 +4,7 @@
   import FlowTable from '../lib/components/FlowTable.svelte';
   import Trust from '../lib/components/Trust.svelte';
   import { appLabel, bytes, countryName } from '../lib/format';
-  import { findApp, folderOf } from '../lib/apps';
+  import { findApp, folderOf, savedTotals } from '../lib/apps';
   import { appRule, store } from '../lib/state.svelte';
 
   let { selected = $bindable() }: { selected: string | null } = $props();
@@ -15,7 +15,7 @@
   );
   // `selected` is an app's key, or a plain name from screens that only know the name.
   const current = $derived(findApp(store.apps, selected) ?? store.apps[0] ?? null);
-  const saved = $derived(current ? store.history.find((h) => h.app === current.app) : undefined);
+  const saved = $derived(current ? savedTotals(store.history, current) : undefined);
   const rule = $derived(appRule(store.rules, current?.path ?? null));
   let busy = $state(false);
 
