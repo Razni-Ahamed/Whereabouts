@@ -39,7 +39,7 @@ const LATE_TRAFFIC_WINDOW: Duration = Duration::from_secs(10);
 const PUBLISHER_WIDTH: usize = 22;
 
 /// Most program identities kept for display.
-const MAX_IDENTITIES: usize = 20_000;
+pub(crate) const MAX_IDENTITIES: usize = 20_000;
 
 /// Longest text sent to clients per field, in characters.
 const CLIENT_TEXT: usize = 256;
@@ -58,6 +58,9 @@ struct Row {
     closed_at: Option<Instant>,
     /// Whether it has been saved to the store.
     saved: bool,
+    /// Whether the behaviour Learner has had it (each finished flow once,
+    /// whether history is saved or not).
+    learned: bool,
 }
 
 /// Recently finished flows, for display and for saving.
@@ -176,6 +179,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     let mut store = match crate::storage::open() {
         Ok(mut store) => {
             crate::storage::apply_retention(&mut store);
+            crate::storage::expire_profiles(&mut store);
             Some(store)
         }
         Err(error) => {
@@ -197,6 +201,8 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     let mut last_retention = Instant::now();
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
     let mut detector = crate::alerts::load_detector();
+    // Learns each app's usual behaviour (only while a store is open).
+    let mut learning = crate::learning::Learning::new(SystemTime::now());
     let mut blocking = crate::blocking::Blocking::start(
         whereabouts_win_firewall::Firewall::open,
         store.as_ref(),
@@ -316,7 +322,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         while let Ok(command) = commands.try_recv() {
             match command {
                 crate::server::EngineCommand::DeleteAll { reply } => {
-                    let result = delete_everything(&mut store, &mut closed);
+                    let result = delete_everything(&mut store, &mut closed, &mut learning);
                     if result.is_ok() {
                         new_apps.reset(store.as_mut(), SystemTime::now());
                     }
@@ -383,17 +389,27 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 &names,
                 table.take_idle(SystemTime::now(), IDLE_AFTER),
             );
+            let mut raised = Vec::new();
             if let Some(store) = store.as_mut() {
-                store_finished(store, &mut closed, &names, &enricher, history, false);
+                learning.tick(store, SystemTime::now());
+                raised.extend(store_finished(
+                    store,
+                    &mut closed,
+                    &names,
+                    &enricher,
+                    history,
+                    &mut learning,
+                    false,
+                ));
                 if last_retention.elapsed() >= RETENTION_EVERY {
                     crate::storage::apply_retention(store);
+                    crate::storage::expire_profiles(store);
                     last_retention = Instant::now();
                 }
             }
             let view = View::collect(&table, &closed, &names);
             if let Some(store) = store.as_mut() {
                 let now = SystemTime::now();
-                let mut raised = Vec::new();
                 for row in view.rows.iter().filter(|row| !row.key.is_overflow()) {
                     let facts = crate::alerts::FlowFacts {
                         key: row.key,
@@ -426,6 +442,14 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 for error in detector.take_errors() {
                     report!("warning: {error}");
                 }
+                raised.extend(learn_traffic(
+                    &mut learning,
+                    &view.rows,
+                    &names,
+                    &enricher,
+                    store,
+                    now,
+                ));
                 if !raised.is_empty() {
                     let mut state = live.lock().unwrap_or_else(PoisonError::into_inner);
                     for alert in &raised {
@@ -482,27 +506,45 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     }
 
     names.settle(Duration::from_secs(5));
-    if let Some(store) = store.as_mut().filter(|_| history.on()) {
-        save_closed(store, &mut closed, &names, &enricher, true);
-        let active: Vec<FlowRecord> = table
+    if let Some(store) = store.as_mut() {
+        // Alerts raised now are saved; there is no one left to notify.
+        let _ = store_finished(
+            store,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            true,
+        );
+        // Flows still open end here, so they are learned (and saved) too.
+        let active: Vec<Row> = table
             .snapshot()
             .into_iter()
-            .map(|(key, stats)| {
-                let row = Row {
-                    app: app_name(&key, &names),
-                    token: token_for(&key, &names),
-                    key,
-                    stats,
-                    closed_at: None,
-                    saved: false,
-                };
-                to_record(&row, &names, &enricher)
+            .map(|(key, stats)| Row {
+                app: app_name(&key, &names),
+                token: token_for(&key, &names),
+                key,
+                stats,
+                closed_at: None,
+                saved: false,
+                learned: false,
             })
             .collect();
-        let saved = active.len();
-        match store.insert_flows(&active) {
-            Ok(()) => println!("Saved {saved} active flows."),
-            Err(error) => report!("warning: could not save active flows: {error}"),
+        let now = SystemTime::now();
+        for row in &active {
+            let _ = learning.finished(&flow_input(row, &names), &enricher, store, now);
+        }
+        learning.shutdown(store, now);
+        if history.on() {
+            let records: Vec<FlowRecord> = active
+                .iter()
+                .map(|row| to_record(row, &names, &enricher))
+                .collect();
+            match store.insert_flows(&records) {
+                Ok(()) => println!("Saved {} active flows.", records.len()),
+                Err(error) => report!("warning: could not save active flows: {error}"),
+            }
         }
     }
     if options.show_table {
@@ -904,6 +946,7 @@ fn add_late_traffic(closed: &mut Closed, app: &str, token: Option<u64>, event: &
         stats,
         closed_at: Some(Instant::now()),
         saved: false,
+        learned: false,
     });
 }
 
@@ -917,6 +960,7 @@ fn close(closed: &mut Closed, names: &ProcessNames, flows: Vec<(FlowKey, FlowSta
             stats,
             closed_at: Some(Instant::now()),
             saved: false,
+            learned: false,
         });
     }
 }
@@ -992,20 +1036,83 @@ fn save_closed(
     }
 }
 
-/// Saves finished flows if history is on; otherwise forgets them, so they
-/// are only ever shown live.
+/// Hands finished flows to the behaviour Learner, then saves them if
+/// history is on; otherwise forgets them, so they are only ever shown live.
+/// Profiles are learned either way. Returns the behaviour alerts raised.
 fn store_finished(
     store: &mut Store,
     closed: &mut Closed,
     names: &ProcessNames,
     enricher: &Enricher,
     history: crate::history::HistorySwitch,
+    learning: &mut crate::learning::Learning,
     everything: bool,
-) {
+) -> Vec<crate::alerts::Raised> {
+    let raised = learn_finished(store, closed, names, enricher, learning, everything);
     if history.on() {
         save_closed(store, closed, names, enricher, everything);
     } else {
         forget_unsaved(closed);
+    }
+    raised
+}
+
+/// Gives each finished flow to the behaviour Learner once. Like saving, it
+/// waits [`LATE_TRAFFIC_WINDOW`] after a flow closed (late traffic and the
+/// program's identity may still arrive), except with `everything` and for
+/// rows pushed off the live list, which are saved now too. Flows that
+/// finish while saved history is still being turned into profiles are
+/// passed over: the saved ones are learned from the history instead.
+fn learn_finished(
+    store: &mut Store,
+    closed: &mut Closed,
+    names: &ProcessNames,
+    enricher: &Enricher,
+    learning: &mut crate::learning::Learning,
+    everything: bool,
+) -> Vec<crate::alerts::Raised> {
+    let now = SystemTime::now();
+    let due = |row: &Row| {
+        everything
+            || row
+                .closed_at
+                .is_some_and(|at| at.elapsed() >= LATE_TRAFFIC_WINDOW)
+    };
+    let evicted = closed.unsaved_evicted.iter_mut().map(|row| (row, true));
+    let shown = closed.rows.iter_mut().map(|row| (row, false));
+    let mut raised = Vec::new();
+    for (row, evicted) in evicted.chain(shown) {
+        if row.learned || !(evicted || due(row)) {
+            continue;
+        }
+        row.learned = true;
+        raised.extend(learning.finished(&flow_input(row, names), enricher, store, now));
+    }
+    raised
+}
+
+/// Adds what the shown rows did since the last tick to their apps'
+/// behaviour profiles. Returns the behaviour alerts raised.
+fn learn_traffic(
+    learning: &mut crate::learning::Learning,
+    rows: &[Row],
+    names: &ProcessNames,
+    enricher: &Enricher,
+    store: &mut Store,
+    now: SystemTime,
+) -> Vec<crate::alerts::Raised> {
+    let flows: Vec<crate::learning::FlowInput<'_>> =
+        rows.iter().map(|row| flow_input(row, names)).collect();
+    learning.traffic(&flows, enricher, store, now)
+}
+
+/// A row as the behaviour Learner sees it.
+fn flow_input<'a>(row: &'a Row, names: &'a ProcessNames) -> crate::learning::FlowInput<'a> {
+    crate::learning::FlowInput {
+        key: row.key,
+        app: &row.app,
+        identity: row.token.and_then(|token| names.identity(token)),
+        stats: &row.stats,
     }
 }
 
@@ -1045,11 +1152,20 @@ fn set_save_history(
     result
 }
 
-/// Deletes all saved data, and forgets finished flows that were waiting to
-/// be saved, so nothing from before reappears. Flows still open are saved
-/// as usual when they finish.
-fn delete_everything(store: &mut Option<Store>, closed: &mut Closed) -> Result<(), String> {
+/// Deletes all saved data, including behaviour profiles, and forgets
+/// finished flows that were waiting to be saved or learned, so nothing from
+/// before reappears. Flows still open are saved and learned as usual when
+/// they finish.
+fn delete_everything(
+    store: &mut Option<Store>,
+    closed: &mut Closed,
+    learning: &mut crate::learning::Learning,
+) -> Result<(), String> {
     forget_unsaved(closed);
+    for row in &mut closed.rows {
+        row.learned = true;
+    }
+    learning.reset();
     let result = match store.as_mut() {
         Some(store) => store.wipe().map_err(|e| e.to_string()),
         // Not saving now, but older data may exist.
@@ -1143,6 +1259,7 @@ impl View {
                 stats,
                 closed_at: None,
                 saved: false,
+                learned: false,
             })
             .collect();
         let active = rows.len();
@@ -1492,6 +1609,7 @@ mod tests {
             stats,
             closed_at: None,
             saved: false,
+            learned: false,
         }
     }
 
@@ -1605,9 +1723,10 @@ mod tests {
         assert!(!closed.unsaved_evicted.is_empty());
         // With no store, the deletion itself may fail in a test, but the
         // waiting flows must be forgotten either way.
-        let _ = delete_everything(&mut None, &mut closed);
+        let mut learning = crate::learning::Learning::new(SystemTime::now());
+        let _ = delete_everything(&mut None, &mut closed, &mut learning);
         assert!(closed.unsaved_evicted.is_empty());
-        assert!(closed.rows.iter().all(|row| row.saved));
+        assert!(closed.rows.iter().all(|row| row.saved && row.learned));
     }
 
     fn temp_store(name: &str) -> (Store, PathBuf) {
@@ -1633,6 +1752,7 @@ mod tests {
         let names = ProcessNames::new();
         let enricher = enricher();
         let mut history = crate::history::HistorySwitch::load(store.as_ref());
+        let mut learning = crate::learning::Learning::new(SystemTime::now());
         let mut closed = Closed {
             keep_evicted: history.on(),
             ..Closed::default()
@@ -1641,7 +1761,15 @@ mod tests {
         // On (the default): finished flows are saved.
         closed.push(finished("203.0.113.1:443"));
         let saved = store.as_mut().unwrap();
-        store_finished(saved, &mut closed, &names, &enricher, history, false);
+        store_finished(
+            saved,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            false,
+        );
         assert_eq!(saved.flow_count().unwrap(), 1);
 
         // Off: a flow waiting to be saved, and later ones, are forgotten,
@@ -1651,8 +1779,24 @@ mod tests {
         assert!(!closed.keep_evicted);
         closed.push(finished("203.0.113.3:443"));
         let saved = store.as_mut().unwrap();
-        store_finished(saved, &mut closed, &names, &enricher, history, false);
-        store_finished(saved, &mut closed, &names, &enricher, history, true);
+        store_finished(
+            saved,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            false,
+        );
+        store_finished(
+            saved,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            true,
+        );
         assert_eq!(saved.flow_count().unwrap(), 1, "kept what was saved before");
         assert_eq!(closed.rows.len(), 3);
         // Evicted rows are not kept for saving either.
@@ -1669,7 +1813,15 @@ mod tests {
         assert!(closed.keep_evicted);
         closed.push(finished("203.0.113.5:443"));
         let saved = store.as_mut().unwrap();
-        store_finished(saved, &mut closed, &names, &enricher, history, false);
+        store_finished(
+            saved,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            false,
+        );
         assert_eq!(saved.flow_count().unwrap(), 2);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
@@ -1681,10 +1833,19 @@ mod tests {
         let mut store = Some(store);
         let names = ProcessNames::new();
         let mut history = crate::history::HistorySwitch::default();
+        let mut learning = crate::learning::Learning::new(SystemTime::now());
         let mut closed = Closed::default();
         closed.push(finished("203.0.113.1:443"));
         let saved = store.as_mut().unwrap();
-        store_finished(saved, &mut closed, &names, &enricher(), history, true);
+        store_finished(
+            saved,
+            &mut closed,
+            &names,
+            &enricher(),
+            history,
+            &mut learning,
+            true,
+        );
         saved
             .add_rule(
                 &whereabouts_store::RuleTarget::App {
@@ -1697,6 +1858,133 @@ mod tests {
         let saved = store.as_ref().unwrap();
         assert_eq!(saved.flow_count().unwrap(), 0);
         assert_eq!(saved.rules().unwrap().len(), 1, "rules are kept");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A program identity, as the resolver would report it.
+    fn identity(path: &str) -> AppIdentity {
+        AppIdentity {
+            path: path.to_owned(),
+            signature: whereabouts_core::model::Signature::Signed {
+                publisher: String::from("Example Corp"),
+                via_catalog: false,
+            },
+            sha256: Some("ab".repeat(32)),
+            size: Some(1_000),
+            package_family_name: None,
+            confirmed_running: true,
+        }
+    }
+
+    /// Learning, with the (empty) saved history already turned into
+    /// profiles, so it learns from live flows.
+    fn learning(store: &mut Store) -> crate::learning::Learning {
+        let mut learning = crate::learning::Learning::new(SystemTime::now());
+        learning.tick(store, SystemTime::now());
+        learning
+    }
+
+    #[test]
+    fn history_off_still_learns() {
+        let (store, dir) = temp_store("learn-off");
+        let mut store = Some(store);
+        let mut names = ProcessNames::new();
+        names.identities.insert(1, identity(r"C:\Apps\chat.exe"));
+        let enricher = enricher();
+        let mut history = crate::history::HistorySwitch::load(store.as_ref());
+        let mut closed = Closed::default();
+        set_save_history(&mut store, &mut closed, &mut history, false, false).unwrap();
+        let saved = store.as_mut().unwrap();
+        let mut learning = learning(saved);
+
+        let mut row = finished("203.0.113.1:443");
+        row.token = Some(1);
+        row.stats.domain = Some(DomainLabel::new("api.chat.example", LabelSource::Verified));
+        closed.push(row);
+        store_finished(
+            saved,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            false,
+        );
+
+        assert_eq!(saved.flow_count().unwrap(), 0, "history is off");
+        assert!(closed.rows[0].learned);
+        let profile = saved
+            .profile(&whereabouts_store::known_app_key(r"C:\Apps\chat.exe"))
+            .unwrap()
+            .expect("the flow made a profile");
+        let has = |kind, value: &str| {
+            profile
+                .items
+                .iter()
+                .any(|item| item.kind == kind && item.value == value)
+        };
+        assert!(has(whereabouts_store::ItemKind::Domain, "chat.example"));
+        assert!(has(whereabouts_store::ItemKind::Port, "443"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rows_without_path_are_not_profiled() {
+        let (mut store, dir) = temp_store("learn-no-path");
+        let mut names = ProcessNames::new();
+        names.identities.insert(1, identity(r"C:\Apps\chat.exe"));
+        names.identities.insert(2, identity(r"C:\Apps\many.exe"));
+        let enricher = enricher();
+        let history = crate::history::HistorySwitch::default();
+        let mut learning = learning(&mut store);
+        let now = SystemTime::now();
+
+        // A finished flow whose program is not known.
+        let mut closed = Closed::default();
+        let mut unknown = finished("203.0.113.1:443");
+        unknown.stats.bytes_sent = 5_000;
+        closed.push(unknown.clone());
+        store_finished(
+            &mut store,
+            &mut closed,
+            &names,
+            &enricher,
+            history,
+            &mut learning,
+            false,
+        );
+        assert!(closed.rows[0].learned, "passed over once, not kept waiting");
+
+        // Live traffic: no program path, the flow-limit overflow, and (to
+        // show learning works at all) a flow with a path.
+        let mut overflow = row_to("0.0.0.0:0", None);
+        overflow.token = Some(2);
+        overflow.stats.bytes_sent = 7_000;
+        let mut known = row_to("203.0.113.2:443", None);
+        known.token = Some(1);
+        known.stats.bytes_sent = 9_000;
+        learn_traffic(
+            &mut learning,
+            &[unknown, overflow, known],
+            &names,
+            &enricher,
+            &mut store,
+            now,
+        );
+        learning.shutdown(&mut store, now);
+
+        let keys: Vec<String> = store
+            .profile_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.key)
+            .collect();
+        assert_eq!(
+            keys,
+            [whereabouts_store::known_app_key(r"C:\Apps\chat.exe")]
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

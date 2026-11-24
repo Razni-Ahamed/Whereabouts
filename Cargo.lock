@@ -5111,6 +5111,7 @@ dependencies = [
  "whereabouts-win-firewall",
  "whereabouts-win-pipe",
  "whereabouts-win-secrets",
+ "windows 0.62.2",
  "windows-service",
 ]
 

@@ -3,6 +3,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use whereabouts_detect::learner::Learner;
+use whereabouts_detect::signals::Toggles;
 pub use whereabouts_detect::{Detector, FlowFacts, Raised};
 use whereabouts_store::{AlertKind, Severity};
 
@@ -16,6 +18,12 @@ pub fn load_detector() -> Detector {
         println!("Spamhaus DROP: {ranges} network ranges");
     }
     detector
+}
+
+/// The behaviour Learner (Layer 2), with its signals' starting switches.
+/// `local_offset_secs` is the local time zone's offset from UTC.
+pub fn new_learner(local_offset_secs: i32) -> Learner {
+    Learner::new(Toggles::default(), local_offset_secs)
 }
 
 fn unix_secs(time: SystemTime) -> u64 {

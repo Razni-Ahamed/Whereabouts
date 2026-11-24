@@ -118,6 +118,20 @@ pub fn apply_retention(store: &mut Store) {
     }
 }
 
+/// Deletes what has aged out of the behaviour profiles (see
+/// [`Store::expire_profiles`]), printing what it did if anything.
+pub fn expire_profiles(store: &mut Store) {
+    match store.expire_profiles(SystemTime::now()) {
+        Ok(expiry) if expiry.profiles > 0 || expiry.items > 0 || expiry.hours > 0 => println!(
+            "Behaviour profiles: aged out {} destinations, {} hours of traffic and {} apps \
+             idle for 180 days",
+            expiry.items, expiry.hours, expiry.profiles
+        ),
+        Ok(_) => {}
+        Err(error) => report!("warning: ageing out behaviour profiles failed: {error}"),
+    }
+}
+
 /// `--history`: shows what is saved.
 pub fn show_history() -> ExitCode {
     let mut store = match open() {
