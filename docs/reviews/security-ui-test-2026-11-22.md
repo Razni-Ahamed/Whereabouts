@@ -101,9 +101,15 @@ the screen's top level or `App.svelte`.
   a normal user, `--status` listed two `claude.exe` programs from different folders (Claude Code and the
   Claude desktop app) as two "Top apps" rows with their own totals (37 and 24 flows), each with an
   `in <folder>` line under it. (The first re-test build printed the folder lines only in `--history`, so
-  the two rows looked the same; fixed in `console::folder_lines`, used by both tables.) Not re-tested:
-  the fake `chrome.exe` itself and the app card's "Last 24 hours" line, because history saving was
-  off on the test PC.
+  the two rows looked the same; fixed in `console::folder_lines`, used by both tables.)
+  Then, with history saving turned on for the test and real Chrome running, a copy of `curl.exe` named
+  `chrome.exe` in `%TEMP%` downloaded 60 MB. Within about 10 seconds `--status` listed two `chrome.exe`
+  apps: Chrome (Google LLC, `C:\Program Files\Google\Chrome\Application`, 1,253 flows, 1.3 GB received)
+  and the copy (Microsoft 3rd Party Application Component, its Temp folder, 1 flow, 57.3 MB). On the
+  Apps screen the copy's card read "Last 24 hours: 1 connection to 1 destinations · 698 B sent ·
+  57.3 MB received", and Chrome's card its own 1,260 connections and 1.3 GB: neither card took the
+  other's totals. History saving was turned off again afterwards (saved history kept), and the copy
+  was deleted. **H2 is fully fixed.**
 - **H3:** the Block menu opens centred over the 60-row Connections list. Code: `ui/src/lib/portal.ts`,
   used by `BlockMenu.svelte`.
 
