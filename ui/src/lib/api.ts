@@ -15,7 +15,7 @@ import {
   demoHistorySetting,
   demoSetPaused,
 } from './demo';
-import type { AlertView, AppSettings, AppTotals, ListsView, Live, Problem, Rules, RuleSpec } from './types';
+import type { Added, AlertView, AppSettings, AppTotals, ListsView, Live, Problem, Rules, RuleSpec } from './types';
 
 export const isDemo = !('__TAURI_INTERNALS__' in window);
 
@@ -81,9 +81,9 @@ export async function rules(): Promise<Result<Rules>> {
  * Shows what will be blocked in a native Windows dialog and blocks it if
  * the user agrees. The rule's ID, or `null` if the user said no.
  */
-export async function addRule(rule: RuleSpec): Promise<Result<number | null>> {
+export async function addRule(rule: RuleSpec): Promise<Result<Added | null>> {
   if (isDemo) return demoAddRule(rule);
-  return call<number | null>('add_rule', { rule });
+  return call<Added | null>('add_rule', { rule });
 }
 
 /** Deletes a rule and lifts its block. */

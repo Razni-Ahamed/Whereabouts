@@ -196,12 +196,14 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     }
     let mut last_retention = Instant::now();
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
-    let mut detector = crate::alerts::Detector::load(&crate::updates::lists_dir());
+    let mut detector = crate::alerts::load_detector();
     let mut blocking = crate::blocking::Blocking::start(
         whereabouts_win_firewall::Firewall::open,
         store.as_ref(),
         SystemTime::now(),
     );
+    // App rules from before fingerprints existed are pinned now, once.
+    blocking.pin_existing(store.as_mut());
 
     // Clients ask the engine for work only it can do (deleting everything)
     // through this channel.
@@ -210,24 +212,20 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         commands: Some(command_sender),
         ..crate::server::LiveState::default()
     }));
-    let serving = match crate::server::start(
+    // If another program holds the pipe name, this keeps trying; status is
+    // published either way, so clients see it as soon as the pipe is up.
+    crate::server::start_or_retry(
         PIPE_NAME,
-        options.client_sid.as_deref(),
+        options.client_sid.clone(),
         Arc::clone(&live),
-    ) {
-        Ok(()) => {
+        |live| {
             println!(
                 "Answering Whereabouts clients on {PIPE_NAME} (try --status in another terminal)"
             );
-            let updates = crate::updates::start(Arc::clone(&live));
+            let updates = crate::updates::start(Arc::clone(live));
             live.lock().unwrap_or_else(PoisonError::into_inner).updates = Some(updates);
-            true
-        }
-        Err(error) => {
-            report!("warning: {error}");
-            false
-        }
-    };
+        },
+    );
 
     let started = Instant::now();
     let mut last_draw = Instant::now();
@@ -312,7 +310,9 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        names.poll();
+        for identity in names.poll() {
+            block_if_copy(&identity, &mut blocking, store.as_mut(), &live);
+        }
         while let Ok(command) = commands.try_recv() {
             match command {
                 crate::server::EngineCommand::DeleteAll { reply } => {
@@ -349,7 +349,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                 }
                 crate::server::EngineCommand::ReloadDrop => {
-                    detector = crate::alerts::Detector::load(&crate::updates::lists_dir());
+                    detector = crate::alerts::load_detector();
                 }
                 crate::server::EngineCommand::Rules { command, reply } => {
                     // A new domain rule (or resuming) also applies to names
@@ -423,6 +423,9 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     store,
                     now,
                 ));
+                for error in detector.take_errors() {
+                    report!("warning: {error}");
+                }
                 if !raised.is_empty() {
                     let mut state = live.lock().unwrap_or_else(PoisonError::into_inner);
                     for alert in &raised {
@@ -430,30 +433,28 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                 }
             }
-            if serving {
-                let counts = capture.counts();
-                let (block_rules, blocking_paused) = blocking.summary();
-                let status = Status {
-                    uptime_secs: started.elapsed().as_secs(),
-                    events: counts.events,
-                    dropped: counts.dropped,
-                    unreadable: counts.malformed,
-                    rejected: counts.rejected,
-                    over_limit: view.over_limit,
-                    unattributed: view.unattributed,
-                    active_flows: u64::try_from(view.active).unwrap_or(u64::MAX),
-                    kernel_events_protected: capture.kernel_events_protected(),
-                    saving: store.is_some() && history.on(),
-                    save_history: history.choice(),
-                    tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
-                    block_rules,
-                    blocking_paused,
-                    drop_list: detector.has_drop(),
-                    // Filled in from the updater's state when answering.
-                    lists: whereabouts_ipc::ListsView::default(),
-                };
-                publish(&live, &view, &names, &enricher, status);
-            }
+            let counts = capture.counts();
+            let (block_rules, blocking_paused) = blocking.summary();
+            let status = Status {
+                uptime_secs: started.elapsed().as_secs(),
+                events: counts.events,
+                dropped: counts.dropped,
+                unreadable: counts.malformed,
+                rejected: counts.rejected,
+                over_limit: view.over_limit,
+                unattributed: view.unattributed,
+                active_flows: u64::try_from(view.active).unwrap_or(u64::MAX),
+                kernel_events_protected: capture.kernel_events_protected(),
+                saving: store.is_some() && history.on(),
+                save_history: history.choice(),
+                tracker_domains: u64::try_from(data.tracker_domains).unwrap_or(u64::MAX),
+                block_rules,
+                blocking_paused,
+                drop_list: detector.has_drop(),
+                // Filled in from the updater's state when answering.
+                lists: whereabouts_ipc::ListsView::default(),
+            };
+            publish(&live, &view, &names, &enricher, status);
             if options.show_table {
                 draw(
                     &view,
@@ -535,6 +536,37 @@ struct ProcessInfo {
     requested: bool,
     /// Whether its first use of the network has been handled.
     noted: bool,
+    /// A WebView2 process showing another app's web content: `name`,
+    /// `path` and `token` are that app's (see [`ProcessNames::note_traffic`]).
+    web_content: bool,
+}
+
+/// The program file every WebView2 app's web content runs in.
+const WEBVIEW2: &str = "msedgewebview2.exe";
+
+/// Whether `path` is the installed WebView2 runtime's program, in its
+/// folder under Program Files, which only administrators can change. Any
+/// program can call itself `msedgewebview2.exe`; only the real runtime may
+/// be credited to the app that started it, or a program could borrow that
+/// app's name and publisher (and get the app blocked instead of itself).
+fn is_webview2_runtime(path: &str) -> bool {
+    use std::sync::OnceLock;
+    use whereabouts_win_secrets::{KnownFolder, known_folder};
+    static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        [KnownFolder::ProgramFilesX86, KnownFolder::ProgramFiles]
+            .into_iter()
+            .filter_map(|folder| known_folder(folder).ok())
+            .map(|dir| {
+                let root = dir.join(r"Microsoft\EdgeWebView\Application");
+                format!("{}\\", root.to_string_lossy().to_lowercase())
+            })
+            .collect()
+    });
+    let path = path.to_lowercase();
+    file_name(&path) == WEBVIEW2
+        && !path.contains(r"\..\")
+        && roots.iter().any(|root| path.starts_with(root.as_str()))
 }
 
 /// What the console knows about each process, plus each process's program
@@ -570,6 +602,13 @@ impl ProcessNames {
 
     /// Called for each network event of `pid`: looks the process up if it
     /// is not known yet, and asks for its program's identity once.
+    ///
+    /// A WebView2 process (`msedgewebview2.exe`, one file shared by every
+    /// WebView2 app) is credited to the app that started it: it fetches that
+    /// app's web pages and ads, and "msedgewebview2 contacted Google" named
+    /// no app at all. It takes the app's name, path and identity, so the
+    /// app's publisher is shown and blocking blocks the app (whose web
+    /// content Whereabouts then keeps offline too).
     fn note_traffic(&mut self, pid: u32) {
         if !self.processes.contains_key(&pid) {
             let token = self.new_token();
@@ -579,15 +618,36 @@ impl ProcessNames {
                 token,
                 requested: false,
                 noted: false,
+                web_content: false,
             });
             self.processes.insert(pid, info);
         }
-        let Some(Some(info)) = self.processes.get_mut(&pid) else {
+        let Some(Some(info)) = self.processes.get(&pid) else {
             return;
         };
         if info.requested {
             return;
         }
+        if info.path.as_deref().is_some_and(is_webview2_runtime)
+            && let Some((host, _)) = process::ancestor_not_named(pid, WEBVIEW2)
+        {
+            self.note_traffic(host);
+            if let Some(Some(host_info)) = self.processes.get(&host) {
+                let shown = ProcessInfo {
+                    name: host_info.name.clone(),
+                    path: host_info.path.clone(),
+                    token: host_info.token,
+                    requested: true,
+                    noted: false,
+                    web_content: true,
+                };
+                self.processes.insert(pid, Some(shown));
+                return;
+            }
+        }
+        let Some(Some(info)) = self.processes.get_mut(&pid) else {
+            return;
+        };
         // Check the file the process is actually running, per the kernel's
         // record (which follows renames), locked while the process is alive
         // so it cannot be swapped before the check. If that cannot be
@@ -630,6 +690,7 @@ impl ProcessNames {
             token: self.new_token(),
             requested: false,
             noted: false,
+            web_content: false,
         };
         self.processes.insert(pid, Some(info));
     }
@@ -650,14 +711,18 @@ impl ProcessNames {
         self.identities.get(&token)
     }
 
-    /// Collects identities the background worker has finished.
-    fn poll(&mut self) {
+    /// Collects identities the background worker has finished, and returns
+    /// them.
+    fn poll(&mut self) -> Vec<AppIdentity> {
+        let mut finished = Vec::new();
         for (token, identity) in self.resolver.finished() {
             if self.identities.len() >= MAX_IDENTITIES {
                 self.identities.clear();
             }
+            finished.push(identity.clone());
             self.identities.insert(token, identity);
         }
+        finished
     }
 
     fn forget(&mut self, pid: u32) {
@@ -669,6 +734,15 @@ impl ProcessNames {
             .get(&pid)
             .and_then(Option::as_ref)
             .map_or("(unknown)", |info| info.name.as_str())
+    }
+
+    /// Whether `pid` is a WebView2 process showing another app's web content
+    /// (its name and path are that app's).
+    fn is_web_content(&self, pid: u32) -> bool {
+        self.processes
+            .get(&pid)
+            .and_then(Option::as_ref)
+            .is_some_and(|info| info.web_content)
     }
 
     /// Token of `pid`'s current process instance, if it has a program file
@@ -705,6 +779,50 @@ impl ProcessNames {
             None => (String::from("…"), true),
             Some(identity) => (identity.publisher_text(), identity.confirmed_running),
         }
+    }
+}
+
+/// Blocks the program `identity` describes if it is a byte-identical copy
+/// (or a link) of a blocked program in another place, with a rule of its own
+/// that shows on the Rules screen, and tells the app.
+///
+/// Unconfirmed checks count too (the process exited before its file could be
+/// locked, as a short download does): what is blocked is the path, and the
+/// file now at that path is the blocked program, whichever file ran.
+fn block_if_copy(
+    identity: &AppIdentity,
+    blocking: &mut crate::blocking::Blocking<whereabouts_win_firewall::Firewall>,
+    store: Option<&mut Store>,
+    live: &Mutex<crate::server::LiveState>,
+) {
+    let (Some(sha256), Some(store)) = (identity.sha256.as_deref(), store) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let Some(original) = blocking.copy_of(store, &identity.path, sha256, now) else {
+        return;
+    };
+    match blocking.block_copy(store, &identity.path, &original, now) {
+        whereabouts_ipc::Response::RuleAdded { already: false, .. } => {
+            println!("Blocked {}: a copy of blocked {original}", identity.path);
+            live.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_notice(
+                    whereabouts_ipc::NoticeKind::BlockedCopy {
+                        app: truncate(file_name(&identity.path), CLIENT_TEXT),
+                        path: truncate(&identity.path, CLIENT_TEXT * 2),
+                        of: truncate(&original, CLIENT_TEXT * 2),
+                    },
+                    now,
+                );
+        }
+        whereabouts_ipc::Response::Error { message } => {
+            report!(
+                "warning: could not block {}, a copy of blocked {original}: {message}",
+                identity.path
+            );
+        }
+        _ => {}
     }
 }
 
@@ -1106,6 +1224,7 @@ fn flow_view(row: &Row, names: &ProcessNames, enricher: &Enricher) -> FlowView {
         bytes_sent: row.stats.bytes_sent,
         bytes_received: row.stats.bytes_received,
         active: row.closed_at.is_none(),
+        web_content: names.is_web_content(row.key.pid),
     }
 }
 
@@ -1642,6 +1761,29 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(150 * 1024 * 1024), "150.0 MB");
         assert_eq!(format_bytes(u64::MAX), "16.0 EB");
+    }
+
+    #[test]
+    fn only_the_installed_webview2_runtime_is_credited_to_its_app() {
+        let x86 = whereabouts_win_secrets::known_folder(
+            whereabouts_win_secrets::KnownFolder::ProgramFilesX86,
+        )
+        .unwrap();
+        let runtime =
+            x86.join(r"Microsoft\EdgeWebView\Application\157.0.4341.60\msedgewebview2.exe");
+        assert!(is_webview2_runtime(&runtime.to_string_lossy()));
+        assert!(is_webview2_runtime(
+            &runtime.to_string_lossy().to_uppercase()
+        ));
+        // Anything can be called msedgewebview2.exe.
+        assert!(!is_webview2_runtime(
+            r"C:\Users\x\AppData\Local\Temp\msedgewebview2.exe"
+        ));
+        let other = x86.join(r"Microsoft\EdgeWebView\Application\157.0.4341.60\other.exe");
+        assert!(!is_webview2_runtime(&other.to_string_lossy()));
+        let sneaky =
+            x86.join(r"Microsoft\EdgeWebView\Application\..\..\..\..\Users\x\msedgewebview2.exe");
+        assert!(!is_webview2_runtime(&sneaky.to_string_lossy()));
     }
 
     #[test]

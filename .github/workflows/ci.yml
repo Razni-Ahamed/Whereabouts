@@ -44,6 +44,9 @@ jobs:
       - name: Test the UI
         working-directory: ui
         run: npm test
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - name: Lab tests (Python)
+        run: uv run --project lab --frozen pytest -q lab/tests
       - name: Build the UI
         working-directory: ui
         run: npm run build

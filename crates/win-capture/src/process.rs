@@ -10,12 +10,13 @@ use std::time::SystemTime;
 use std::collections::{HashMap, HashSet};
 
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -99,6 +100,32 @@ impl ProcessHandle {
         let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
         Some(filetime_to_system_time(i64::try_from(ticks).ok()?))
     }
+
+    /// Whether the process runs with administrator rights (an elevated
+    /// token). `false` if that cannot be read.
+    pub fn is_elevated(&self) -> bool {
+        let mut token = HANDLE::default();
+        // SAFETY: the process handle is open; `token` is a valid out-pointer.
+        if unsafe { OpenProcessToken(self.0, TOKEN_QUERY, &mut token) }.is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        // SAFETY: `elevation` is writable and its exact size is passed.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&raw mut elevation).cast()),
+                u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(0),
+                &mut len,
+            )
+        }
+        .is_ok();
+        // SAFETY: `token` was opened above and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        read && elevation.TokenIsElevated != 0
+    }
 }
 
 impl Drop for ProcessHandle {
@@ -170,9 +197,79 @@ pub fn descendants(root: u32) -> Vec<u32> {
     found
 }
 
+/// The nearest ancestor of process `pid` whose program file is not called
+/// `name` (compared without regard to case), with its full path: for a
+/// WebView2 process, the app that shows the web content.
+///
+/// Strict about reused process IDs: a recorded parent that started after
+/// its child is someone else, and if a start time or path cannot be read
+/// the answer is `None`. Crediting traffic to the wrong app is worse than
+/// not crediting it.
+pub fn ancestor_not_named(pid: u32, name: &str) -> Option<(u32, String)> {
+    /// Deeper than any real WebView2 tree (app → browser → utility).
+    const MAX_DEPTH: usize = 6;
+    let parent_of: HashMap<u32, u32> = parents().into_iter().collect();
+    let mut current = ProcessHandle::open(pid)?;
+    let mut current_start = current.start_time()?;
+    let mut current_pid = pid;
+    for _ in 0..MAX_DEPTH {
+        let parent_pid = *parent_of.get(&current_pid)?;
+        if parent_pid == current_pid {
+            return None;
+        }
+        let parent = ProcessHandle::open(parent_pid)?;
+        let parent_start = parent.start_time()?;
+        if parent_start > current_start {
+            return None; // the ID was reused by a later process
+        }
+        let path = parent.image_path()?;
+        let file = path.rsplit('\\').next().unwrap_or(&path);
+        if !file.eq_ignore_ascii_case(name) {
+            return Some((parent_pid, path));
+        }
+        (current, current_start, current_pid) = (parent, parent_start, parent_pid);
+    }
+    drop(current);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_nearest_ancestor_with_another_name() {
+        // This test process starts cmd, which starts another cmd: the
+        // nearest ancestor of the inner cmd not called cmd.exe is this test.
+        let mut child = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/c",
+                r"C:\Windows\System32\cmd.exe /c ping -n 4 127.0.0.1 > nul",
+            ])
+            .spawn()
+            .unwrap();
+        let mut inner = None;
+        for _ in 0..40 {
+            inner = descendants(child.id()).into_iter().next();
+            if inner.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let inner = inner.expect("the inner cmd started");
+        let found = ancestor_not_named(inner, "CMD.EXE");
+        let _ = child.kill();
+        let _ = child.wait();
+        let (pid, path) = found.expect("an ancestor");
+        assert_eq!(pid, std::process::id());
+        let own = std::env::current_exe().unwrap();
+        assert!(
+            path.eq_ignore_ascii_case(&own.to_string_lossy()),
+            "{path} vs {}",
+            own.display()
+        );
+        assert_eq!(ancestor_not_named(0, "cmd.exe"), None);
+    }
 
     #[test]
     fn finds_children_and_grandchildren() {

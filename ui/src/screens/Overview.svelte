@@ -31,7 +31,7 @@
 
   const topApps = $derived<BarItem[]>(
     store.apps.slice(0, 6).map((a) => ({
-      key: a.app,
+      key: a.key,
       label: appLabel(a.app),
       sub: a.publisher !== '-' && a.publisher !== '…' ? a.publisher : null,
       value: a.sent + a.received,

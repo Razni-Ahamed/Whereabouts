@@ -1,0 +1,23 @@
+[package]
+name = "whereabouts-lab-replay"
+description = "Whereabouts lab: replays simulated user-weeks through the shipped detection code (never shipped)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+whereabouts-core.workspace = true
+whereabouts-detect.workspace = true
+whereabouts-enrich.workspace = true
+whereabouts-ipc.workspace = true
+whereabouts-store.workspace = true
+
+[lints]
+workspace = true

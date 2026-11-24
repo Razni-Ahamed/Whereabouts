@@ -134,7 +134,7 @@
 
   <main>
     {#key screen}
-      <div class="fade-in">
+      <div class="screen-in">
         {#if screen === 'overview'}
           <Overview onpickapp={openApp} ongo={(s: Screen) => (screen = s)} />
         {:else if screen === 'apps'}
@@ -188,7 +188,11 @@
     gap: 18px;
     min-height: 100vh;
   }
+  /* Stays in view while a long list scrolls, so screens can be switched. */
   .topbar {
+    position: sticky;
+    top: 12px;
+    z-index: 10;
     display: flex;
     align-items: center;
     justify-content: space-between;

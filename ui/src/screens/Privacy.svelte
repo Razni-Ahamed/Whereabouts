@@ -142,7 +142,7 @@
       <div>
         <b class="display">{store.live ? own.length : '—'}</b>
         <span>
-          internet connections by Whereabouts itself right now: the service, this app and the
+          internet {own.length === 1 ? 'connection' : 'connections'} by Whereabouts itself right now: the service, this app and the
           WebView2 helpers that draw its window. It watches itself like any other app. Its only
           requests are the list updates you allow below; all lookups happen offline.
         </span>

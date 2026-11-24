@@ -20,6 +20,7 @@ use tauri::{AppHandle, Manager, WebviewWindowBuilder, Wry};
 use tauri_plugin_notification::NotificationExt;
 use whereabouts_client::{Client, Problem, unexpected};
 use whereabouts_core::text::display_safe;
+use whereabouts_ipc::notify::AlertLimiter;
 use whereabouts_ipc::{
     AlertKind, AlertView, NoticeKind, PIPE_NAME, Request, Response, Severity, Status,
 };
@@ -34,9 +35,6 @@ const DOWN_AFTER: Duration = Duration::from_secs(20);
 const PAUSED_REMINDER: Duration = Duration::from_secs(60 * 60);
 /// At most one "new app" notification this often; more are grouped.
 const NEW_APPS_EVERY: Duration = Duration::from_secs(60);
-/// At most one alert notification per app (or per kind of system alert)
-/// this often, except critical ones (design spec §6.4).
-const ALERTS_PER_APP_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How often the tracker summary is sent.
 const DIGEST_EVERY: u64 = 24 * 60 * 60;
 
@@ -209,8 +207,10 @@ struct Checker {
     /// New apps waiting to be announced, and when the last announcement was.
     new_apps: Vec<String>,
     last_new_apps: Option<Instant>,
-    /// When an alert was last notified, per app (or kind of system alert).
-    alerted: HashMap<String, Instant>,
+    /// Which alerts are notified (shared with the lab: `ipc::notify`).
+    alerts: AlertLimiter,
+    /// When the checker started (the limiter counts seconds from then).
+    started: Option<Instant>,
 }
 
 /// An alert notice.
@@ -224,6 +224,9 @@ struct AlertNotice {
 struct Snapshot {
     status: Status,
     new_apps: Vec<String>,
+    /// Copies of blocked programs the service blocked too: (copy's name,
+    /// copy's path).
+    blocked_copies: Vec<(String, String)>,
     alerts: Vec<AlertNotice>,
     last_notice: u64,
 }
@@ -261,10 +264,14 @@ impl Checker {
             other => return Err(unexpected(&other)),
         };
         let mut new_apps = Vec::new();
+        let mut blocked_copies = Vec::new();
         let mut alerts = Vec::new();
         for notice in notices {
             match notice.kind {
                 NoticeKind::NewApp { app, .. } => new_apps.push(display_safe(&app)),
+                NoticeKind::BlockedCopy { app, path, .. } => {
+                    blocked_copies.push((display_safe(&app), display_safe(&path)));
+                }
                 NoticeKind::Alert {
                     alert,
                     severity,
@@ -280,6 +287,7 @@ impl Checker {
         Ok(Snapshot {
             status,
             new_apps,
+            blocked_copies,
             alerts,
             last_notice,
         })
@@ -362,22 +370,17 @@ impl Checker {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .show_names;
+        let now_secs = now
+            .duration_since(*self.started.get_or_insert(now))
+            .as_secs();
         for alert in alerts {
-            if alert.severity < Severity::Medium {
-                continue;
-            }
             let who = alert
                 .app
                 .clone()
                 .unwrap_or_else(|| format!("{:?}", alert.kind));
-            let recent = self
-                .alerted
-                .get(&who)
-                .is_some_and(|last| now.duration_since(*last) < ALERTS_PER_APP_EVERY);
-            if recent && alert.severity < Severity::Critical {
+            if !self.alerts.allow(&who, alert.severity, now_secs) {
                 continue;
             }
-            self.alerted.insert(who, now);
             let (title, body) = alert_text(&alert, show_names);
             notify(app, &title, &body);
         }
@@ -450,6 +453,16 @@ impl Checker {
 
         // Only notices that arrive while the app runs are announced.
         if self.last_notice.is_some() {
+            if !snapshot.blocked_copies.is_empty() {
+                let show_names = app
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .show_names;
+                let (title, body) = blocked_copies_text(&snapshot.blocked_copies, show_names);
+                notify(app, &title, &body);
+            }
             self.new_apps.extend(snapshot.new_apps);
             self.announce_alerts(app, snapshot.alerts, now);
         }
@@ -469,6 +482,29 @@ impl Checker {
             self.new_apps.clear();
             self.last_new_apps = Some(now);
         }
+    }
+}
+
+/// The notification for copies of blocked programs that were blocked too:
+/// without names unless allowed.
+fn blocked_copies_text(copies: &[(String, String)], show_names: bool) -> (String, String) {
+    let lift = "It is on the Rules screen, where you can lift it.";
+    match (copies, show_names) {
+        ([(app, path)], true) => (
+            format!("Whereabouts blocked a copy of {app}"),
+            format!("{path} is the same program as one you blocked. {lift}"),
+        ),
+        ([_], false) => (
+            String::from("Whereabouts blocked a copy of a blocked app"),
+            format!("The same program ran from another folder. {lift}"),
+        ),
+        (many, _) => (
+            format!("Whereabouts blocked {} copies of blocked apps", many.len()),
+            String::from(
+                "The same programs ran from other folders. They are on the Rules screen, \
+                 where you can lift them.",
+            ),
+        ),
     }
 }
 

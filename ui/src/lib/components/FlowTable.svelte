@@ -4,6 +4,7 @@
   import BlockMenu from './BlockMenu.svelte';
   import Trust from './Trust.svelte';
   import { appLabel, bytes, countryName, ownerParts } from '../format';
+  import { appKey } from '../apps';
   import { isTracking } from '../state.svelte';
   import type { FlowView } from '../types';
 
@@ -11,7 +12,14 @@
     flows,
     showApp = true,
     onpickapp,
-  }: { flows: FlowView[]; showApp?: boolean; onpickapp?: (app: string) => void } = $props();
+    empty = 'No connections yet.',
+  }: {
+    flows: FlowView[];
+    showApp?: boolean;
+    onpickapp?: (app: string) => void;
+    /** What to say when there are no rows (a search may have found none). */
+    empty?: string;
+  } = $props();
 
   let blocking = $state<FlowView | null>(null);
 </script>
@@ -36,13 +44,21 @@
     {@const owner = ownerParts(flow.owner)}
     <div class="row" role="row" class:noapp={!showApp} class:closed={!flow.active}>
       {#if showApp}
-        <button class="app" type="button" onclick={() => onpickapp?.(flow.app)} title="PID {flow.pid}">
+        <button class="app" type="button" onclick={() => onpickapp?.(appKey(flow.app, flow.path))} title="PID {flow.pid}">
           <AppAvatar app={flow.app} size={30} />
           <span class="stack">
             <span class="name">{appLabel(flow.app)}</span>
             <span class="minor">
               {flow.publisher === '-' ? 'no program file' : flow.publisher}
             </span>
+            {#if flow.web_content}
+              <span
+                class="minor web"
+                title="Fetched by the web pages this app shows in its window (Microsoft Edge WebView2)"
+              >
+                web content
+              </span>
+            {/if}
           </span>
         </button>
       {/if}
@@ -51,6 +67,11 @@
           {flow.domain ?? flow.remote}
           <Trust kind="domain" trust={flow.domain_trust} />
         </span>
+        {#if flow.web_content && !showApp}
+          <span class="minor web" title="Fetched by the web pages this app shows in its window (Microsoft Edge WebView2)">
+            web content
+          </span>
+        {/if}
         {#if flow.via}
           <span class="minor mono via" title="{flow.domain} points to {flow.via}, which is what shows who is behind it">
             via {flow.via}
@@ -84,7 +105,7 @@
       </span>
     </div>
   {:else}
-    <p class="muted empty">No connections yet.</p>
+    <p class="muted empty">{empty}</p>
   {/each}
 </div>
 
@@ -146,6 +167,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .web {
+    color: var(--info);
   }
   .minor {
     font-size: 11.5px;

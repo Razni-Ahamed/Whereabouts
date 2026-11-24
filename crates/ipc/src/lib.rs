@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod notify;
+
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
 
@@ -252,6 +254,16 @@ pub enum NoticeKind {
         /// Executable file name, if it concerns one app.
         app: Option<String>,
     },
+    /// A byte-identical copy (or link) of a blocked program connected from
+    /// another place, so Whereabouts blocked it too, with a rule of its own.
+    BlockedCopy {
+        /// The copy's file name.
+        app: String,
+        /// The copy's full path.
+        path: String,
+        /// The blocked program it is a copy of (full path).
+        of: String,
+    },
 }
 
 /// What a blocking rule blocks.
@@ -391,6 +403,10 @@ pub enum Response {
         /// The new rule's ID (or the existing one's, if it was already
         /// saved).
         id: i64,
+        /// Whether the rule was already saved, so nothing new was blocked
+        /// (and undoing must not remove the existing rule).
+        #[serde(default)]
+        already: bool,
     },
     /// The request could not be answered.
     Error {
@@ -534,6 +550,10 @@ pub struct FlowView {
     pub bytes_received: u64,
     /// Whether the flow is still open.
     pub active: bool,
+    /// Made by the app's web content (a WebView2 process the app started):
+    /// `app`, `path` and `publisher` are the app's.
+    #[serde(default)]
+    pub web_content: bool,
 }
 
 /// Saved totals for one app.
@@ -628,6 +648,7 @@ mod tests {
                 bytes_sent: 659,
                 bytes_received: 5800,
                 active: false,
+                web_content: true,
             }],
         });
     }

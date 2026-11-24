@@ -30,7 +30,7 @@ use serde::Serialize;
 use tauri_plugin_dialog::{
     DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
 };
-use whereabouts_client::{Client, Problem, unexpected};
+use whereabouts_client::{Client, Problem, ProblemKind, unexpected};
 use whereabouts_core::text::display_safe;
 use whereabouts_ipc::{
     AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, MAX_HOURS, MAX_ROWS, PIPE_NAME,
@@ -56,16 +56,20 @@ struct Connection(Mutex<Option<Client>>);
 impl Connection {
     /// Runs `ask` with a connected client: the open one if it still works,
     /// otherwise a newly connected one.
+    ///
+    /// Only a lost connection is asked again: an error *answer* (the
+    /// service refused, or timed out) is returned as it is, since repeating
+    /// Delete everything or a new rule would do it twice.
     fn with<T>(
         &self,
         mut ask: impl FnMut(&mut Client) -> Result<T, Problem>,
     ) -> Result<T, Problem> {
         let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(client) = slot.as_mut() {
-            if let Ok(value) = ask(client) {
-                return Ok(value);
+            match ask(client) {
+                Err(problem) if problem.kind == ProblemKind::Lost => *slot = None,
+                answered => return answered,
             }
-            *slot = None;
         }
         let mut client = Client::connect(PIPE_NAME)?;
         let value = ask(&mut client)?;
@@ -215,19 +219,14 @@ async fn delete_history(
 ) -> Result<bool, Problem> {
     let connection = Arc::clone(&connection);
     blocking(move || {
-        let confirmed = app
-            .dialog()
-            .message(
-                "All saved connection history and hourly totals will be deleted and overwritten. \
-                 This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards.",
-            )
-            .title("Delete everything Whereabouts saved?")
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                String::from("Delete everything"),
-                String::from("Cancel"),
-            ))
-            .blocking_show();
+        // Cancel is the default: Enter must never delete everything.
+        let confirmed = whereabouts_win_dialog::confirm(
+            main_window(&app),
+            "Delete everything Whereabouts saved?",
+            "All saved connection history and hourly totals will be deleted and overwritten. \
+             This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards.",
+            "Delete everything",
+        );
         if !confirmed {
             return Ok(false);
         }
@@ -242,6 +241,12 @@ async fn delete_history(
         })
     })
     .await
+}
+
+/// The main window's handle, to own native dialogs.
+fn main_window(app: &tauri::AppHandle) -> Option<isize> {
+    let window = app.get_webview_window("main")?;
+    window.hwnd().ok().map(|hwnd| hwnd.0 as isize)
 }
 
 /// The blocking rules and whether blocking is paused.
@@ -278,16 +283,24 @@ fn program_name(path: &str) -> String {
 fn describe(rule: &RuleSpec) -> (String, String) {
     const DOMAIN_NOTE: &str = "Whereabouts blocks the addresses Windows' DNS service confirms \
                                for it, so a connection that is already starting may still get \
-                               through once.";
+                               through once. A program that looks names up on its own (for \
+                               example with DNS over HTTPS) or uses fixed addresses can get \
+                               around a domain block; to stop a program completely, block the \
+                               program.";
     const EVERY_APP_NOTE: &str = "This applies to every app on this computer. Whereabouts never \
                                   blocks addresses that other, unblocked sites also use, nor what \
                                   Windows needs to stay online.";
+    const WEB_PAGES_NOTE: &str = "If the app shows web pages inside its window (some apps use \
+                                  Microsoft Edge WebView2 for this, often for ads), those are \
+                                  blocked from the next time the app starts. Its own local pages \
+                                  keep working.";
     let undo = "You can unblock it at any time on the Rules screen.";
     match rule {
         RuleSpec::App { path } => (
             format!("Block {}?", program_name(path)),
             format!(
-                "Every connection {} makes will be blocked, until you unblock it.\n\n{}\n\n{undo}",
+                "Every connection {} makes or accepts will be blocked, until you unblock \
+                 it.\n\n{}\n\n{WEB_PAGES_NOTE}\n\n{undo}",
                 program_name(path),
                 display_safe(path)
             ),
@@ -298,8 +311,8 @@ fn describe(rule: &RuleSpec) -> (String, String) {
         } => (
             format!("Block {} for {}?", display_safe(name), program_name(app)),
             format!(
-                "{} will not be able to connect to {} or its subdomains.\n\n{}\n\n{DOMAIN_NOTE}\n\n\
-                 {undo}",
+                "Whereabouts will block {} from reaching {} and its subdomains.\n\n{}\n\n\
+                 {DOMAIN_NOTE}\n\n{undo}",
                 program_name(app),
                 display_safe(name),
                 display_safe(app)
@@ -308,8 +321,8 @@ fn describe(rule: &RuleSpec) -> (String, String) {
         RuleSpec::Domain { name, app: None } => (
             format!("Block {} for every app?", display_safe(name)),
             format!(
-                "No app will be able to connect to {} or its subdomains.\n\n{EVERY_APP_NOTE}\n\n\
-                 {DOMAIN_NOTE}\n\n{undo}",
+                "Whereabouts will block every app from reaching {} and its subdomains.\n\n\
+                 {EVERY_APP_NOTE}\n\n{DOMAIN_NOTE}\n\n{undo}",
                 display_safe(name)
             ),
         ),
@@ -332,15 +345,24 @@ fn describe(rule: &RuleSpec) -> (String, String) {
     }
 }
 
+/// A rule the service saved (or already had).
+#[derive(Debug, Serialize)]
+struct Added {
+    id: i64,
+    /// It was already there: nothing new was blocked, and undoing must not
+    /// remove it.
+    already: bool,
+}
+
 /// Shows exactly what will be blocked in a native Windows dialog and, if
 /// the user agrees, asks the service to block it. `None` if the user said
-/// no; otherwise the rule's ID.
+/// no.
 #[tauri::command]
 async fn add_rule(
     rule: RuleSpec,
     app: tauri::AppHandle,
     connection: tauri::State<'_, Arc<Connection>>,
-) -> Result<Option<i64>, Problem> {
+) -> Result<Option<Added>, Problem> {
     let connection = Arc::clone(&connection);
     blocking(move || {
         let (title, message) = describe(&rule);
@@ -359,7 +381,7 @@ async fn add_rule(
         }
         let request = Request::AddRule { rule };
         connection.with(|client| match client.ask(&request)? {
-            Response::RuleAdded { id } => Ok(Some(id)),
+            Response::RuleAdded { id, already } => Ok(Some(Added { id, already })),
             other => Err(unexpected(&other)),
         })
     })
@@ -446,19 +468,16 @@ async fn dismiss_alert(
                     .as_deref()
                     .or(alert.target.as_deref())
                     .map_or_else(|| String::from("this network"), display_safe);
-                let confirmed = app
-                    .dialog()
-                    .message(format!(
+                // Cancel is the default: Enter must not silence a warning.
+                let confirmed = whereabouts_win_dialog::confirm(
+                    main_window(&app),
+                    "Stop these warnings?",
+                    &format!(
                         "Whereabouts will no longer warn you when this program connects to this \
                          network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
-                    ))
-                    .title("Stop these warnings?")
-                    .kind(MessageDialogKind::Warning)
-                    .buttons(MessageDialogButtons::OkCancelCustom(
-                        String::from("Stop these warnings"),
-                        String::from("Cancel"),
-                    ))
-                    .blocking_show();
+                    ),
+                    "Stop these warnings",
+                );
                 if !confirmed {
                     return Ok(false);
                 }
@@ -776,6 +795,8 @@ mod tests {
         let (title, text) = describe(&RuleSpec::App { path: app.clone() });
         assert_eq!(title, "Block chat.exe?");
         assert!(text.contains(&app));
+        assert!(text.contains("makes or accepts"), "both directions");
+        assert!(text.contains("next time the app starts"), "WebView2 pages");
 
         let (title, text) = describe(&RuleSpec::Domain {
             name: String::from("ads.example.com"),
@@ -783,6 +804,8 @@ mod tests {
         });
         assert_eq!(title, "Block ads.example.com for every app?");
         assert!(text.contains("every app on this computer"));
+        // Honest about what a domain block cannot stop.
+        assert!(text.contains("DNS over HTTPS"), "{text}");
 
         // Rules for one app always show that app's full path, so two
         // programs with the same name cannot be confused.

@@ -59,8 +59,21 @@ CI runs the same checks, so running them locally saves time:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui; npm run check; cd ..
+cd ui; npm run check; npm test; cd ..
+uv run --project lab pytest -q lab/tests
 ```
+
+## The lab
+
+`lab/` measures detection on scripted sessions on GitHub's Windows runners (never real user data); see [lab/README.md](lab/README.md). Its Python code runs only through [uv](https://docs.astral.sh/uv/):
+
+```powershell
+uv sync --project lab
+uv run --project lab pytest -q lab/tests
+cargo test -p whereabouts-lab-replay
+```
+
+Run the lab itself on GitHub: `gh workflow run lab.yml` (inputs: `minutes`, `sessions_per_persona`, `users_per_persona`, `seed`, `inject`, `reanalyse_run_id`). Lab datasets are workflow artifacts and are never committed.
 
 ## Live tests
 

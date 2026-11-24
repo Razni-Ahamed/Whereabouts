@@ -1,11 +1,58 @@
-# Detection lab
+# Whereabouts lab
 
-Tools for measuring how well Whereabouts detects problems, **using lab data only, never real users' data**. See the [design spec, section 6.6](../docs/design-spec.md#66-evaluation-lab-never-on-user-data).
+The lab measures how well Whereabouts' detection works **before** it ships: how many false alarms a person would get per week, how many staged problems it catches, and how fast. It exists for v0.3 ("Learn") and later layers; every threshold is judged by its numbers.
 
-Planned contents:
+**It never uses real user data.** All traffic comes from scripted sessions on GitHub's disposable Windows runners, destroyed after each run. Nothing in this folder ships with the app.
 
-- scripted app sessions in Windows virtual machines (normal behaviour)
-- injected scenarios: hidden uploads, beaconing, random-looking domains, known-bad hosts, renamed binaries
-- an evaluation harness reporting false alarms per user per week, detection rate and time to detect, for each detection layer
+> The numbers compare detection layers with each other. They are **not real-world rates**: the sessions are short, on datacenter machines, with no real person behind them.
 
-Nothing in this folder is shipped with the app. Raw captures and outputs are git-ignored.
+## How it works
+
+```
+capture (one runner per session)         analyse (one runner)
+  engine --console records                  lab timeline   sessions → simulated user-weeks
+  a persona uses real apps, logged out                     + synthetic scenarios, labels
+  live scenarios (optional)                 lab droplist   Spamhaus DROP + test entries
+  --export → session.csv + session.json     whereabouts-lab-replay   → alerts (shipped detector)
+                                            lab report     → report.md, charts, job summary
+```
+
+1. **Capture** (`capture/run-session.ps1`): the Whereabouts engine records while a persona (`office`, `media`, `gamer`, `developer`) uses real apps, all logged out (see [APPS.md](APPS.md) for each app's terms). Health counters are sampled with `--status --json`. Session 0 of each persona also stages two **live scenarios**: a copy of `curl.exe` named `Discord.exe` (a program posing as a popular app) and a fetch of example.com, which the analysis lists as a test "known-bad" address. Nothing risky is ever contacted.
+2. **Simulated user-weeks** (`lab timeline`): each simulated user has one persona and 14 days: 7 learning days (design spec D15) and a 7-day test week. Sessions are placed at the persona's usual hours. Per persona the sessions are split into a learning pool and a test pool, so **a user's test week never reuses a session it learned from** (no leakage).
+3. **Synthetic scenarios** (`--inject`), added to the test week with labels, because they must not be staged for real: a 200 MB hidden upload, 3 hours of beaconing, random-looking domains, a swapped program reaching new destinations. Their addresses are documentation ranges and `example.*` names.
+4. **Replay** (`crates/lab-replay`): runs every simulated user through **the same detection code the app ships** (`whereabouts-detect`), with a fresh temporary encrypted store each, and the same rule the app uses to decide what becomes a notification (`whereabouts_ipc::notify`).
+5. **Score and report** (`lab report`): an alert of medium or higher matches a scenario when it is for the same user and app within the scenario's window plus an hour. Everything else in the test week is a false alarm. Reported: false alarms per simulated user-week (medium and up; and notified), detection rate and time to detect per scenario type.
+
+## Running it
+
+On GitHub (Actions → **Lab** → Run workflow), or:
+
+```powershell
+gh workflow run lab.yml -f minutes=8 -f sessions_per_persona=4 -f users_per_persona=3 -f seed=1
+```
+
+It also runs weekly. Results: the job summary, and the `lab-report-<run>` and `lab-dataset-<run>` artifacts (kept 90 days; datasets are never committed). To re-analyse an earlier run's sessions, pass `-f reanalyse_run_id=<run id>`.
+
+## Working on the lab code
+
+```powershell
+uv sync --project lab
+uv run --project lab pytest -q lab/tests
+cargo test -p whereabouts-lab-replay
+```
+
+Python runs only through uv (the version is pinned in `.python-version`, dependencies in `uv.lock`). Random choices take an explicit seed, recorded in `info.json`.
+
+## Formats
+
+- **Session**: the engine's CSV export (`whereabouts-service --export`) and `session.json` (persona, times, runner image, engine commit, apps with versions and SHA-256, health counters, live-scenario labels).
+- **Timeline** (`timeline.jsonl`): a header line `{"type":"header","schema":1}`, then `flow` and `counters` lines sorted by time (simulated Unix seconds).
+- **Labels** (`labels.jsonl`): one per scenario instance: type, user, app, start, end, live or synthetic.
+- **Alerts** (`alerts-layer1.jsonl`): user, time, layer, kind, severity, app, target, detail, reasons, notified.
+
+## Known gaps
+
+- The capture is the engine's CSV export: no process IDs and no DNS alias chains, so trackers hidden behind a site's own name are not detected in the lab (they are in the app).
+- New-app notices are not measured.
+- GitHub's runner agents (`Runner.Worker.exe`, the Azure guest agents, `provjobd.exe…`) are dropped from the data; `info.json` records how many flows were dropped.
+- Steam is left out (its terms assume an account); apps run logged out, so their traffic is start-up, update and telemetry chatter, not active use.

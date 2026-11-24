@@ -1,0 +1,208 @@
+name: Lab
+
+# The Whereabouts lab (v0.3, L0; see lab/README.md): scripted sessions of
+# real apps on disposable Windows runners, recorded by the engine, stitched
+# into simulated user-weeks with staged problems, replayed through the
+# shipped detection code, and scored. Never real user data. Not part of CI:
+# it runs by hand or weekly, never on pull requests.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per session
+        default: "8"
+      sessions_per_persona:
+        description: Sessions per persona (at least 2; half learn, half test)
+        default: "4"
+      users_per_persona:
+        description: Simulated users per persona
+        default: "3"
+      seed:
+        description: Random seed
+        default: "1"
+      inject:
+        description: Synthetic scenarios per user
+        default: "upload=1,beacon=1,random_domain=1,swapped_binary=1"
+      reanalyse_run_id:
+        description: Re-analyse an earlier run's sessions (its run ID) instead of capturing
+        default: ""
+  schedule:
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+
+jobs:
+  plan:
+    name: Plan the run
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      minutes: ${{ steps.plan.outputs.minutes }}
+      users: ${{ steps.plan.outputs.users }}
+      seed: ${{ steps.plan.outputs.seed }}
+      inject: ${{ steps.plan.outputs.inject }}
+      reanalyse: ${{ steps.plan.outputs.reanalyse }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          MINUTES: ${{ inputs.minutes || '8' }}
+          SESSIONS: ${{ inputs.sessions_per_persona || '4' }}
+          USERS: ${{ inputs.users_per_persona || '3' }}
+          SEED: ${{ inputs.seed || '1' }}
+          INJECT: ${{ inputs.inject || 'upload=1,beacon=1,random_domain=1,swapped_binary=1' }}
+          REANALYSE: ${{ inputs.reanalyse_run_id || '' }}
+        run: |
+          set -euo pipefail
+          for value in "$MINUTES" "$SESSIONS" "$USERS" "$SEED"; do
+            [[ "$value" =~ ^[0-9]+$ ]] || { echo "not a whole number: $value"; exit 1; }
+          done
+          [[ "$INJECT" =~ ^[a-z_=0-9,]*$ ]] || { echo "bad inject list"; exit 1; }
+          [[ "$REANALYSE" =~ ^[0-9]*$ ]] || { echo "bad run id"; exit 1; }
+          (( SESSIONS >= 2 )) || { echo "need at least 2 sessions per persona"; exit 1; }
+          matrix=$(python3 -c "
+          import json, sys
+          n = int(sys.argv[1])
+          print(json.dumps({'include': [{'persona': p, 'index': i, 'live': i == 0}
+                for p in ('office', 'media', 'gamer', 'developer') for i in range(n)]}))" "$SESSIONS")
+          {
+            echo "matrix=$matrix"
+            echo "minutes=$MINUTES"
+            echo "users=$USERS"
+            echo "seed=$SEED"
+            echo "inject=$INJECT"
+            echo "reanalyse=$REANALYSE"
+          } >> "$GITHUB_OUTPUT"
+
+  capture:
+    name: Session ${{ matrix.persona }} ${{ matrix.index }}
+    needs: plan
+    if: needs.plan.outputs.reanalyse == ''
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - name: Build the engine
+        run: cargo build --release --locked -p whereabouts-service
+      - name: Download offline data
+        shell: pwsh
+        run: ./scripts/update-data.ps1
+      - name: Lab Python environment
+        run: uv sync --project lab --frozen
+      - name: Record the session
+        shell: pwsh
+        run: >
+          ./lab/capture/run-session.ps1
+          -Persona ${{ matrix.persona }} -Minutes ${{ needs.plan.outputs.minutes }}
+          -SessionId "${{ github.run_id }}-${{ matrix.persona }}-${{ matrix.index }}"
+          -Seed ${{ matrix.index }}
+          -Service "${{ github.workspace }}\target\release\whereabouts-service.exe"
+          -Out "${{ runner.temp }}\session"
+          ${{ matrix.live && '-LiveScenarios' || '' }}
+      - name: Check the session
+        shell: pwsh
+        run: ./lab/capture/Test-Capture.ps1 -Out "${{ runner.temp }}\session" ${{ matrix.live && '-LiveScenarios' || '' }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: session-${{ matrix.persona }}-${{ matrix.index }}
+          path: |
+            ${{ runner.temp }}\session\session.csv
+            ${{ runner.temp }}\session\session.json
+            ${{ runner.temp }}\session\engine.log
+          retention-days: 90
+          if-no-files-found: warn
+
+  analyse:
+    name: Analyse
+    needs: [plan, capture]
+    if: always() && needs.plan.result == 'success' && needs.capture.result != 'cancelled'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read # to download an earlier run's sessions
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - name: Lab tests (Python and replay)
+        run: |
+          uv run --project lab --frozen pytest -q lab/tests
+          cargo test --locked -p whereabouts-lab-replay
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: session-*
+          path: ${{ runner.temp }}\sessions
+          run-id: ${{ needs.plan.outputs.reanalyse || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Download offline data
+        shell: pwsh
+        run: ./scripts/update-data.ps1
+      - name: Spamhaus DROP (for this run only; never uploaded)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'spamhaus'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          foreach ($name in 'drop_v4.json', 'drop_v6.json') {
+            Invoke-WebRequest -Uri "https://www.spamhaus.org/drop/$name" -OutFile (Join-Path $dir $name)
+          }
+      - name: Simulated user-weeks
+        run: >
+          uv run --project lab --frozen lab timeline
+          --sessions "${{ runner.temp }}\sessions"
+          --users-per-persona ${{ needs.plan.outputs.users }}
+          --seed ${{ needs.plan.outputs.seed }}
+          --inject "${{ needs.plan.outputs.inject }}"
+          --out "${{ runner.temp }}\dataset"
+      - name: Lab DROP list
+        run: >
+          uv run --project lab --frozen lab droplist
+          --labels "${{ runner.temp }}\dataset\labels.jsonl"
+          --real "${{ runner.temp }}\spamhaus"
+          --out "${{ runner.temp }}\lists"
+      - name: Replay (Layer 1)
+        run: >
+          cargo run --release --locked -p whereabouts-lab-replay --
+          --timeline "${{ runner.temp }}\dataset\timeline.jsonl"
+          --data data --lists "${{ runner.temp }}\lists" --layers 1
+          --out "${{ runner.temp }}\dataset\alerts-layer1.jsonl"
+      - name: Report
+        shell: pwsh
+        run: |
+          uv run --project lab --frozen lab report `
+            --timeline-dir "$env:RUNNER_TEMP\dataset" `
+            --alerts "Layer 1=$env:RUNNER_TEMP\dataset\alerts-layer1.jsonl" `
+            --out "$env:RUNNER_TEMP\report"
+          Get-Content "$env:RUNNER_TEMP\report\summary.md" | Add-Content $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-dataset-${{ github.run_id }}
+          path: ${{ runner.temp }}\dataset
+          retention-days: 90
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-report-${{ github.run_id }}
+          path: ${{ runner.temp }}\report
+          retention-days: 90

@@ -1,7 +1,7 @@
 // Made-up data, shown only when the UI runs in an ordinary browser (for
 // design work). The desktop app always shows real data from the service.
 
-import type { AlertView, AppTotals, FlowView, ListsView, Live, Problem, Rules, RuleSpec } from './types';
+import type { Added, AlertView, AppTotals, FlowView, ListsView, Live, Problem, Rules, RuleSpec } from './types';
 
 // Demo list updates, kept while the page is open.
 export const demoLists: ListsView = {
@@ -152,7 +152,7 @@ export function demoRules(): Rules {
 
 export async function demoAddRule(
   rule: RuleSpec,
-): Promise<{ ok: true; value: number | null } | { ok: false; problem: Problem }> {
+): Promise<{ ok: true; value: Added | null } | { ok: false; problem: Problem }> {
   await new Promise((r) => setTimeout(r, 300));
   if (rule.kind === 'app' && /\\windows\\system32\\svchost\.exe$/i.test(rule.path)) {
     return {
@@ -164,9 +164,12 @@ export async function demoAddRule(
     };
   }
   if (!window.confirm(`Demo: block ${JSON.stringify(rule)}?`)) return { ok: true, value: null };
+  // Like the service: the same rule again is the existing one.
+  const existing = demo.rules.find((r) => JSON.stringify(r.rule) === JSON.stringify(rule));
+  if (existing) return { ok: true, value: { id: existing.id, already: true } };
   const id = nextId++;
   demo.rules.push({ id, rule, created_secs: now(), blocked_addresses: rule.kind === 'domain' ? 1 : 0 });
-  return { ok: true, value: id };
+  return { ok: true, value: { id, already: false } };
 }
 
 export function demoRemoveRule(id: number): Rules {

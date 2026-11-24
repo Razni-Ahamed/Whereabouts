@@ -28,6 +28,9 @@ use whereabouts_core::model::{Protocol, Signature};
 /// Version of the database layout this code writes.
 pub const SCHEMA_VERSION: i64 = 4;
 
+/// Setting holding the highest blocking-rule ID ever given out.
+const RULE_ID_SETTING: &str = "rule_id_used";
+
 /// Length of the database key in bytes.
 pub const KEY_LEN: usize = 32;
 
@@ -471,11 +474,32 @@ impl Store {
         if let Some(id) = existing {
             return Ok(id);
         }
-        self.conn.execute(
-            "INSERT INTO rules (kind, app_path, domain, ip, created) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![kind, app, domain, ip, unix_ms(now)],
+        // IDs are never used twice: a removed rule's ID could otherwise be
+        // given to the next rule, and an old ID (an Undo, a script's
+        // `--unblock 3`) would then remove a different rule.
+        let highest: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM rules", [], |row| {
+                    row.get(0)
+                })?;
+        let used: i64 = self
+            .setting(RULE_ID_SETTING)?
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0);
+        let id = highest.max(used) + 1;
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO rules (id, kind, app_path, domain, ip, created) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, kind, app, domain, ip, unix_ms(now)],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        transaction.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![RULE_ID_SETTING, id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(id)
     }
 
     /// Deletes a blocking rule. Returns `false` if there was no such rule.
@@ -540,6 +564,14 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Deletes a setting. Returns `false` if it was not set.
+    pub fn remove_setting(&mut self, key: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM settings WHERE key = ?1", [key])?
+            > 0)
     }
 
     /// Stores finished flows in one transaction.
@@ -1275,6 +1307,29 @@ mod tests {
     }
 
     #[test]
+    fn rule_ids_are_never_used_twice() {
+        let path = temp_db("rule-ids");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let target = |n: u8| RuleTarget::Address {
+            ip: std::net::IpAddr::from([203, 0, 113, n]),
+            app: None,
+        };
+        let first = store.add_rule(&target(1), at(1000)).unwrap();
+        let second = store.add_rule(&target(2), at(1001)).unwrap();
+        assert!(store.remove_rule(second).unwrap());
+        let third = store.add_rule(&target(3), at(1002)).unwrap();
+        assert!(
+            third > second,
+            "the removed rule's ID is not given out again"
+        );
+        assert!(store.remove_rule(first).unwrap() && store.remove_rule(third).unwrap());
+        // Also when every rule is gone.
+        let fourth = store.add_rule(&target(4), at(1003)).unwrap();
+        assert!(fourth > third);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn rules_are_saved_listed_and_removed() {
         let path = temp_db("rules");
         let mut store = Store::open(&path, &key(7)).unwrap();
@@ -1327,6 +1382,9 @@ mod tests {
             store.setting("blocking_paused").unwrap().as_deref(),
             Some("false")
         );
+        assert!(store.remove_setting("blocking_paused").unwrap());
+        assert_eq!(store.setting("blocking_paused").unwrap(), None);
+        assert!(!store.remove_setting("blocking_paused").unwrap());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

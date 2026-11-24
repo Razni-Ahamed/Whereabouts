@@ -2,7 +2,8 @@
 //!
 //! Blocks a program's connections, or connections to one address (by one
 //! program or by every program), with user-mode WFP filters at the ALE
-//! connect layers. No kernel driver is involved.
+//! layers: connect (outgoing) for every rule, and also receive/accept
+//! (incoming) for a whole program. No kernel driver is involved.
 //!
 //! Safety rules:
 //! - **Guard-list:** core Windows programs, Microsoft Defender and
@@ -22,6 +23,7 @@
 #![allow(unsafe_code)]
 
 pub mod guard;
+mod webview2;
 mod wfp;
 
 use std::io;
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
 };
 use windows::core::GUID;
 
@@ -53,11 +56,24 @@ const TESTS: Scope = Scope {
     name: "Whereabouts (tests)",
 };
 
+/// Every layer a Whereabouts filter can be in.
+const ALL_LAYERS: [GUID; 4] = [
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+];
+
+/// Whether `layer` decides on incoming connections.
+fn is_incoming(layer: GUID) -> bool {
+    layer == FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || layer == FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6
+}
+
 /// What to block.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Block {
-    /// Every connection a program makes.
+    /// Every connection a program makes or accepts.
     App {
         /// The program's full path.
         path: PathBuf,
@@ -114,13 +130,13 @@ impl Block {
         }
     }
 
-    /// The WFP layers (IPv4, IPv6) this rule needs a filter in.
+    /// The WFP layers (IPv4, IPv6) this rule needs a filter in. A whole
+    /// program is also refused incoming connections: a blocked torrent
+    /// client could otherwise keep trading with peers that connect to it
+    /// (Windows Firewall usually allows that when the app is installed).
     fn layers(&self) -> Vec<GUID> {
         match self {
-            Self::App { .. } => vec![
-                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            ],
+            Self::App { .. } => ALL_LAYERS.to_vec(),
             Self::Address { ip, .. } if ip.is_ipv4() => vec![FWPM_LAYER_ALE_AUTH_CONNECT_V4],
             Self::Address { .. } => vec![FWPM_LAYER_ALE_AUTH_CONNECT_V6],
         }
@@ -270,28 +286,56 @@ impl From<io::Error> for BlockError {
 pub struct Firewall {
     engine: Engine,
     scope: Scope,
+    /// Where the WebView2 setting for blocked apps lives, under
+    /// `HKEY_LOCAL_MACHINE` (see [`webview2`]).
+    webview2_key: &'static str,
 }
+
+/// A registry key WebView2 never reads, for tests.
+const TESTS_WEBVIEW2_KEY: &str = r"SOFTWARE\Whereabouts tests\WebView2\AdditionalBrowserArguments";
 
 impl Firewall {
     /// Opens WFP for Whereabouts' rules. Needs administrator rights.
     pub fn open() -> io::Result<Self> {
-        Self::open_scope(WHEREABOUTS)
+        Self::open_scope(WHEREABOUTS, webview2::POLICY_KEY)
     }
 
     /// Opens WFP with a separate scope for tests, which can never touch the
     /// real rules.
     #[doc(hidden)]
     pub fn open_for_tests() -> io::Result<Self> {
-        Self::open_scope(TESTS)
+        Self::open_scope(TESTS, TESTS_WEBVIEW2_KEY)
     }
 
-    fn open_scope(scope: Scope) -> io::Result<Self> {
+    fn open_scope(scope: Scope, webview2_key: &'static str) -> io::Result<Self> {
         let engine = Engine::open()?;
         engine.transaction(|| {
             engine.ensure_scope(&scope)?;
             add_exemptions(&engine, &scope)
         })?;
-        Ok(Self { engine, scope })
+        Ok(Self {
+            engine,
+            scope,
+            webview2_key,
+        })
+    }
+
+    /// Makes the WebView2 setting match the app blocks now in WFP: blocked
+    /// apps' web pages stay offline from their next start (see
+    /// [`webview2`]). The block calls do this themselves, best effort: the
+    /// filters are what blocks the app, and they are in place either way.
+    pub fn sync_webview2(&self) -> io::Result<()> {
+        let wanted = self
+            .rules()?
+            .into_iter()
+            .filter_map(|block| match block {
+                Block::App { path } => path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_lowercase()),
+                Block::Address { .. } => None,
+            })
+            .collect();
+        webview2::sync(self.webview2_key, &wanted)
     }
 
     /// Adds `block`, after checking the guard-list. Blocking something
@@ -317,24 +361,36 @@ impl Firewall {
                         data: &data,
                         app,
                         remote,
+                        // An app's own window often talks to the app over
+                        // loopback (uTorrent Web's does); that is not the
+                        // internet. (The outgoing filters predate this and
+                        // keep their keys and conditions unchanged.)
+                        except_loopback: is_incoming(layer),
                         permit: false,
                     },
                 )?;
             }
             Ok(())
         })?;
+        if matches!(block, Block::App { .. }) {
+            let _ = self.sync_webview2();
+        }
         Ok(())
     }
 
     /// Removes `block`. Returns `false` if it was not blocked.
     pub fn unblock(&self, block: &Block) -> io::Result<bool> {
-        self.engine.transaction(|| {
+        let removed = self.engine.transaction(|| {
             let mut removed = false;
             for layer in block.layers() {
                 removed |= self.engine.delete(&filter_key(&self.scope, block, layer))?;
             }
             Ok(removed)
-        })
+        })?;
+        if matches!(block, Block::App { .. }) {
+            let _ = self.sync_webview2();
+        }
+        Ok(removed)
     }
 
     /// Everything currently blocked, read from WFP itself.
@@ -364,10 +420,7 @@ impl Firewall {
     /// Removes our filters whose stored data `matches`.
     fn remove_where(&self, matches: impl Fn(&[u8]) -> bool) -> io::Result<usize> {
         let mut keys = Vec::new();
-        for layer in [
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        ] {
+        for layer in ALL_LAYERS {
             keys.extend(
                 self.engine
                     .list(&self.scope, layer)?
@@ -376,7 +429,7 @@ impl Firewall {
                     .map(|f| f.key),
             );
         }
-        self.engine.transaction(|| {
+        let removed = self.engine.transaction(|| {
             let mut removed = 0;
             for key in &keys {
                 if self.engine.delete(key)? {
@@ -384,7 +437,11 @@ impl Firewall {
                 }
             }
             Ok(removed)
-        })
+        })?;
+        // Removing everything (pause, the emergency switch, uninstalling)
+        // must also take the WebView2 setting away, so this one reports.
+        self.sync_webview2()?;
+        Ok(removed)
     }
 
     /// Removes every rule, then Whereabouts' WFP provider and sublayer:
@@ -436,6 +493,7 @@ fn add_exemptions(engine: &Engine, scope: &Scope) -> io::Result<()> {
                     data: data.as_bytes(),
                     app: Some(&path),
                     remote: None,
+                    except_loopback: false,
                     permit: true,
                 },
             )?;
@@ -535,6 +593,11 @@ mod tests {
             filter_key(&WHEREABOUTS, &all, layer)
         );
         assert_eq!(one.layers(), vec![FWPM_LAYER_ALE_AUTH_CONNECT_V4]);
+        assert_eq!(
+            app(r"C:\Apps\x.exe").layers(),
+            ALL_LAYERS.to_vec(),
+            "a whole program is blocked both ways"
+        );
         let v6 = Block::Address {
             ip: "2001:db8::1".parse().unwrap(),
             app: None,
@@ -691,6 +754,72 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .starts_with(r"\\?\")
+        );
+    }
+
+    #[test]
+    #[ignore = "needs administrator rights; run with --ignored"]
+    fn an_app_block_refuses_incoming_connections_but_not_loopback() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A listener in this test program, which then blocks itself.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let firewall = Firewall::open_for_tests().expect("needs administrator rights");
+        let block = Block::app(&std::env::current_exe().unwrap()).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            firewall.block(&block).unwrap();
+            for layer in ALL_LAYERS {
+                let keys: Vec<GUID> = firewall
+                    .engine
+                    .list(&TESTS, layer)
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| f.key)
+                    .collect();
+                assert!(
+                    keys.contains(&filter_key(&TESTS, &block, layer)),
+                    "a filter in every layer"
+                );
+            }
+            // Another program (curl) connecting over loopback still gets in.
+            let curl =
+                PathBuf::from(std::env::var("SystemRoot").unwrap()).join(r"System32\curl.exe");
+            let status = std::process::Command::new(curl)
+                .args(["--silent", "--output", "NUL", "--max-time", "5"])
+                .arg(format!("http://127.0.0.1:{port}/"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "loopback is never blocked: {status}");
+        });
+        let exe_name = std::env::current_exe()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let set = webview2::value(TESTS_WEBVIEW2_KEY, &exe_name);
+        let _ = firewall.uninstall();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert_eq!(
+            set.unwrap().as_deref(),
+            Some(webview2::ARGUMENTS),
+            "the blocked app's WebView2 is sent nowhere"
+        );
+        assert_eq!(
+            webview2::value(TESTS_WEBVIEW2_KEY, &exe_name).unwrap(),
+            None,
+            "removed with the block"
         );
     }
 

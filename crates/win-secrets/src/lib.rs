@@ -30,18 +30,18 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SetSecurityInfo,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom, CRYPT_INTEGER_BLOB,
     CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid,
-    WinLocalSystemSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, INHERIT_ONLY_ACE, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
@@ -51,7 +51,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KNOWN_FOLDER_FLAG,
+    SHGetKnownFolderPath,
 };
 use windows::core::{BOOL, GUID, HRESULT, HSTRING, w};
 
@@ -229,6 +230,8 @@ pub fn load_or_create_key(path: &Path, legacy: &Path) -> io::Result<[u8; KEY_LEN
 pub enum KnownFolder {
     /// `C:\Program Files` (the 64-bit one on 64-bit Windows).
     ProgramFiles,
+    /// `C:\Program Files (x86)` (32-bit programs on 64-bit Windows).
+    ProgramFilesX86,
     /// `C:\ProgramData`.
     ProgramData,
 }
@@ -238,6 +241,7 @@ pub enum KnownFolder {
 pub fn known_folder(folder: KnownFolder) -> io::Result<std::path::PathBuf> {
     let id: &GUID = match folder {
         KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
+        KnownFolder::ProgramFilesX86 => &FOLDERID_ProgramFilesX86,
         KnownFolder::ProgramData => &FOLDERID_ProgramData,
     };
     // SAFETY: `id` is a valid folder ID; the returned string is allocated
@@ -361,6 +365,110 @@ fn owned_by_system_or_administrators(handle: &OwnedHandle) -> io::Result<bool> {
     Ok(trusted)
 }
 
+/// The account that owns Windows' own files.
+const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Access that lets an account change a file's content or who may: write
+/// or append data, change its permissions or owner, or the generic rights
+/// that include them.
+const CHANGE_ACCESS: u32 =
+    0x0000_0002 | 0x0000_0004 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
+
+/// ACE type of a plain "access allowed" entry.
+const ACCESS_ALLOWED: u8 = 0;
+
+/// Whether the file at `path` (not followed if it is a link) was put there
+/// by Windows or an administrator and only they can change it: it is owned
+/// by TrustedInstaller, SYSTEM or Administrators, and its permissions let
+/// no one else change its content or permissions. A program of a normal
+/// account cannot make such a file (a copy it makes is its own), whichever
+/// folder it is in; a folder name says nothing about that.
+pub fn installed_by_administrators(path: &Path) -> io::Result<bool> {
+    let handle = open_no_follow(path, READ_CONTROL.0)?;
+    let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `handle` is open with READ_CONTROL; `descriptor` receives a
+    // LocalAlloc'd buffer that `owner` and `dacl` point into, freed below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "reading the permissions of {} failed: {status:?}",
+            path.display()
+        )));
+    }
+    let mut installer = PSID::default();
+    // SAFETY: the constant is a valid SID string; `installer` receives a
+    // LocalAlloc'd SID freed below.
+    let converted =
+        unsafe { ConvertStringSidToSidW(&HSTRING::from(TRUSTED_INSTALLER), &mut installer) };
+    // SAFETY: `sid` points into `descriptor` (alive until freed below);
+    // `installer` is valid when the conversion succeeded.
+    let administrator = |sid: PSID| unsafe {
+        IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+            || (converted.is_ok() && EqualSid(sid, installer).is_ok())
+    };
+    // No permissions at all (a NULL DACL) lets everyone change the file.
+    let mut trusted = administrator(owner) && !dacl.is_null();
+    if trusted {
+        // SAFETY: `dacl` is a valid ACL inside `descriptor`.
+        let count = unsafe { (*dacl).AceCount };
+        for index in 0..u32::from(count) {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `index` is below the ACL's entry count; `ace` receives
+            // a pointer into the ACL.
+            if unsafe { GetAce(dacl, index, &mut ace) }.is_err() {
+                trusted = false;
+                break;
+            }
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if header.AceFlags & INHERIT_ONLY_ACE.0 as u8 != 0 {
+                continue; // applies to children only, not to this file
+            }
+            match header.AceType {
+                ACCESS_ALLOWED => {
+                    // SAFETY: an ACCESS_ALLOWED ACE; its SID starts at
+                    // `SidStart`, inside the ACE.
+                    let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+                    let sid = PSID((&raw const allowed.SidStart).cast_mut().cast());
+                    if allowed.Mask & CHANGE_ACCESS != 0 && !administrator(sid) {
+                        trusted = false;
+                        break;
+                    }
+                }
+                // Other "allow" kinds (object, callback): not expected on a
+                // program file; to be safe, not trusted.
+                5 | 9 | 11 => {
+                    trusted = false;
+                    break;
+                }
+                // Deny and audit entries only take access away.
+                _ => {}
+            }
+        }
+    }
+    if converted.is_ok() {
+        // SAFETY: allocated by ConvertStringSidToSidW; freed once.
+        let _ = unsafe { LocalFree(Some(HLOCAL(installer.0))) };
+    }
+    // SAFETY: allocated by GetSecurityInfo above; freed exactly once.
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    Ok(trusted)
+}
+
 /// Refuses an object that is a link/junction, of the wrong kind, or not
 /// owned by SYSTEM or Administrators.
 fn check_trusted(handle: &OwnedHandle, path: &Path, directory: bool) -> io::Result<()> {
@@ -400,6 +508,16 @@ fn check_trusted(handle: &OwnedHandle, path: &Path, directory: bool) -> io::Resu
     Ok(())
 }
 
+/// Whether the open object is a real folder: not a link or junction.
+fn is_plain_directory(handle: &OwnedHandle) -> io::Result<bool> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open; `info` is writable.
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
+        .map_err(|e| io::Error::other(format!("could not inspect a folder: {e}")))?;
+    Ok(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0)
+}
+
 /// Makes sure `path` is a private Whereabouts folder: creates it already
 /// secured if it does not exist; otherwise refuses it unless it is a real
 /// folder (not a link or junction) owned by SYSTEM or Administrators. Then
@@ -412,21 +530,41 @@ pub fn secure_directory(path: &Path) -> io::Result<()> {
         lpSecurityDescriptor: descriptor.0.0,
         bInheritHandle: false.into(),
     };
-    // SAFETY: the path string and `attributes` (pointing at `descriptor`)
-    // live for the call.
-    match unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attributes)) } {
-        Ok(()) => {}
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
-        Err(error) => {
-            return Err(io::Error::other(format!(
+    // Creates the folder already secured; `true` if it was created now.
+    let create = || -> io::Result<bool> {
+        // SAFETY: the path string and `attributes` (pointing at
+        // `descriptor`) live for the call.
+        match unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attributes)) } {
+            Ok(()) => Ok(true),
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => Ok(false),
+            Err(error) => Err(io::Error::other(format!(
                 "could not create {}: {error}",
                 path.display()
-            )));
+            ))),
         }
-    }
+    };
+    let created = create()?;
 
-    let handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
-    check_trusted(&handle, path, true)?;
+    let mut handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
+    if let Err(error) = check_trusted(&handle, path, true) {
+        // A normal account made the folder first (before installing, or
+        // after uninstalling), which would keep the service from starting.
+        // It is never adopted: Windows checks access when a handle is
+        // opened, so a handle its maker opened earlier would still reach
+        // into it after its permissions changed. A real, empty folder is
+        // removed instead (removing fails if anything is in it) and made
+        // anew, secured from the start, out of reach of any older handle.
+        // Links, folders with content, and anything else stay refused.
+        if created || !is_plain_directory(&handle)? {
+            return Err(error);
+        }
+        drop(handle);
+        if std::fs::remove_dir(path).is_err() || !create()? {
+            return Err(error);
+        }
+        handle = open_no_follow(path, READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0)?;
+        check_trusted(&handle, path, true)?;
+    }
     let owner = descriptor.owner()?;
     let dacl = descriptor.dacl()?;
     // SAFETY: `handle` is open with WRITE_DAC and WRITE_OWNER; `owner` and
@@ -558,8 +696,53 @@ mod tests {
             return;
         }
         drop(handle);
+        // With something in it, it is refused: it could hold planted files.
+        std::fs::write(planted.join("whereabouts.db"), b"planted").unwrap();
         let error = secure_directory(&planted).unwrap_err();
         assert!(error.to_string().contains("owned by an account"), "{error}");
+        std::fs::remove_file(planted.join("whereabouts.db")).unwrap();
+        // Empty, but its maker still holds it open (without letting it be
+        // deleted), as someone would to reach into it later: refused.
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+                .open(&planted)
+                .unwrap();
+            let error = secure_directory(&planted).unwrap_err();
+            assert!(error.to_string().contains("owned by an account"), "{error}");
+            drop(held);
+        }
+        // Empty and not held: removed and made anew. A normal account (this
+        // test) cannot make Administrators the new folder's owner, so the
+        // new folder is not made here; the old one is gone either way.
+        let error = secure_directory(&planted).unwrap_err();
+        assert!(
+            !error.to_string().contains("owned by an account"),
+            "{error}"
+        );
+        assert!(!planted.exists(), "the folder its maker made is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_own_files_count_as_installed_and_copies_do_not() {
+        let curl = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap())
+            .join(r"System32\curl.exe");
+        assert!(
+            installed_by_administrators(&curl).unwrap(),
+            "TrustedInstaller"
+        );
+        // A copy in a user's folder never counts: it is owned by whoever made
+        // it, and even when an elevated administrator made it (as when tests
+        // run as one, on CI) the folder's permissions let the user change it.
+        let dir = temp("owned-copy");
+        let copy = dir.join("curl.exe");
+        std::fs::copy(&curl, &copy).unwrap();
+        assert!(!installed_by_administrators(&copy).unwrap());
+        assert!(installed_by_administrators(&dir.join("missing.exe")).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -80,7 +80,12 @@ pub enum ProblemKind {
     Untrusted,
     /// Whereabouts hung up: it only answers its own programs.
     Refused,
-    /// Anything else (lost connection, unexpected answer, other version).
+    /// The connection broke while asking (for example the service
+    /// restarted). Asking again on a new connection is safe: the request may
+    /// not have arrived.
+    Lost,
+    /// Anything else (an error answer, an unexpected answer, another
+    /// version).
     Other,
 }
 
@@ -192,7 +197,7 @@ impl Client {
             .and_then(|()| whereabouts_ipc::read_message(&mut self.connection))
             .map_err(|e| {
                 Problem::new(
-                    ProblemKind::Other,
+                    ProblemKind::Lost,
                     format!("Lost the connection to Whereabouts ({e})."),
                 )
             })

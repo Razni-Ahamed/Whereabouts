@@ -54,6 +54,8 @@ export interface FlowView {
   bytes_sent: number;
   bytes_received: number;
   active: boolean;
+  /** Made by the app's web content (its WebView2); app, path and publisher are the app's. */
+  web_content?: boolean;
 }
 
 export interface AppTotals {
@@ -66,7 +68,7 @@ export interface AppTotals {
 }
 
 /** Why the service could not be reached. */
-export type ProblemKind = 'not_running' | 'access_denied' | 'untrusted' | 'refused' | 'other';
+export type ProblemKind = 'not_running' | 'access_denied' | 'untrusted' | 'refused' | 'lost' | 'other';
 
 export interface Problem {
   kind: ProblemKind;
@@ -86,6 +88,12 @@ export interface RuleView {
   created_secs: number;
   /** For a domain rule: how many of its addresses are blocked now. */
   blocked_addresses: number;
+}
+
+/** A rule the service saved, or already had (then nothing new was blocked). */
+export interface Added {
+  id: number;
+  already: boolean;
 }
 
 export interface Rules {

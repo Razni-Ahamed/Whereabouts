@@ -1,0 +1,29 @@
+{
+  "_comment": "Apps the lab sessions use, all started logged out. See lab/APPS.md for each app's terms. 'exe' is where the app's program ends up; %VAR% is expanded. 'exe_alt' is a second place it may install to (per-user installs).",
+  "chrome": {
+    "name": "Google Chrome",
+    "winget": "Google.Chrome",
+    "choco": "googlechrome",
+    "exe": "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe"
+  },
+  "spotify": {
+    "name": "Spotify",
+    "winget": "Spotify.Spotify",
+    "choco": "spotify",
+    "exe": "%APPDATA%\\Spotify\\Spotify.exe"
+  },
+  "discord": {
+    "name": "Discord",
+    "winget": "Discord.Discord",
+    "choco": "discord",
+    "exe": "%LOCALAPPDATA%\\Discord\\Update.exe",
+    "start_args": "--processStart Discord.exe"
+  },
+  "vscode": {
+    "name": "Visual Studio Code",
+    "winget": "Microsoft.VisualStudioCode",
+    "choco": "vscode",
+    "exe": "%ProgramFiles%\\Microsoft VS Code\\Code.exe",
+    "exe_alt": "%LOCALAPPDATA%\\Programs\\Microsoft VS Code\\Code.exe"
+  }
+}

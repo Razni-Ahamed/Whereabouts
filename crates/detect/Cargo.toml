@@ -1,0 +1,18 @@
+[package]
+name = "whereabouts-detect"
+description = "Whereabouts detection: alerts from what the engine sees (shared by the service and the lab)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+whereabouts-core.workspace = true
+whereabouts-enrich.workspace = true
+whereabouts-store.workspace = true
+
+[lints]
+workspace = true

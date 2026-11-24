@@ -19,9 +19,15 @@ const SHOW_FLOWS: u32 = 10;
 /// Apps shown by `--status`.
 const SHOW_APPS: u32 = 5;
 
-/// `--status`: prints the running service's status.
-pub fn status() -> ExitCode {
-    match show_status(PIPE_NAME) {
+/// `--status`: prints the running service's status (with `json`, only the
+/// status, as one line of JSON).
+pub fn status(json: bool) -> ExitCode {
+    let result = if json {
+        status_json(PIPE_NAME)
+    } else {
+        show_status(PIPE_NAME)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {message}");
@@ -57,6 +63,18 @@ fn ask(client: &mut Client, request: &Request) -> Result<Response, String> {
 
 fn unexpected(response: &Response) -> String {
     display_safe(&whereabouts_client::unexpected(response).message)
+}
+
+fn status_json(name: &str) -> Result<(), String> {
+    let mut client = Client::connect(name).map_err(|problem| explain(&problem))?;
+    match ask(&mut client, &Request::Status {})? {
+        Response::Status(status) => {
+            let line = serde_json::to_string(&status).map_err(|e| e.to_string())?;
+            println!("{line}");
+            Ok(())
+        }
+        other => Err(unexpected(&other)),
+    }
 }
 
 fn show_status(name: &str) -> Result<(), String> {
@@ -171,8 +189,12 @@ fn run_rules(name: &str, action: RuleAction) -> Result<(), String> {
     };
     let mut client = Client::connect(name).map_err(|problem| explain(&problem))?;
     let mut response = ask(&mut client, &request)?;
-    if let Response::RuleAdded { id } = response {
-        println!("Added rule {id}.");
+    if let Response::RuleAdded { id, already } = response {
+        if already {
+            println!("Already blocked by rule {id}.");
+        } else {
+            println!("Added rule {id}.");
+        }
         response = ask(&mut client, &Request::ListRules {})?;
     }
     match response {
@@ -357,6 +379,7 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
             active: true,
+            web_content: false,
         };
         let publisher = publisher_text(&flow);
         assert!(publisher.ends_with("…?"), "{publisher}");
@@ -389,7 +412,9 @@ mod tests {
             commands: Some(sender),
             ..crate::server::LiveState::default()
         }));
-        crate::server::start(&name, None, state).unwrap();
+        // Answered as if this test were the desktop app (see the next test
+        // for an ordinary command line).
+        crate::server::start_trusting_app(&name, state).unwrap();
         // A stand-in engine: adds a rule, then lists it.
         let engine = std::thread::spawn(move || {
             for _ in 0..2 {
@@ -401,7 +426,10 @@ mod tests {
                                 app: None,
                             }) => {
                                 assert_eq!(ip, "203.0.113.5".parse::<IpAddr>().unwrap());
-                                Response::RuleAdded { id: 1 }
+                                Response::RuleAdded {
+                                    id: 1,
+                                    already: false,
+                                }
                             }
                             crate::blocking::RuleCommand::List => Response::Rules {
                                 rules: Vec::new(),
@@ -421,6 +449,28 @@ mod tests {
         )
         .unwrap();
         engine.join().unwrap();
+    }
+
+    #[test]
+    fn an_ordinary_command_line_cannot_change_rules() {
+        let name = format!(r"\\.\pipe\whereabouts-rules-refused-{}", std::process::id());
+        let (sender, commands) = std::sync::mpsc::channel();
+        let state = Arc::new(Mutex::new(crate::server::LiveState {
+            commands: Some(sender),
+            ..crate::server::LiveState::default()
+        }));
+        // The real check: this test program runs the service's own file, so
+        // it is the command line.
+        crate::server::start(&name, None, state).unwrap();
+        let elevated = whereabouts_win_capture::process::ProcessHandle::open(std::process::id())
+            .is_some_and(|process| process.is_elevated());
+        if elevated {
+            eprintln!("skipped: an administrator's command line may change rules");
+            return;
+        }
+        let error = run_rules(&name, RuleAction::Pause(true)).unwrap_err();
+        assert!(error.contains("administrator"), "{error}");
+        assert!(commands.try_recv().is_err(), "nothing reached the engine");
     }
 
     #[test]
