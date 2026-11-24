@@ -25,8 +25,10 @@ use rusqlite::{Connection, ErrorCode, params};
 use whereabouts_core::dns::LabelSource;
 use whereabouts_core::model::{Protocol, Signature};
 
+mod profiles;
 mod reasons;
 
+pub use profiles::*;
 pub use reasons::{REASON_VALUE_MAX_CHARS, Reason, Signal};
 
 /// Version of the database layout this code writes.

@@ -5,6 +5,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 ## [Unreleased]
 
 - Storage: the database moves to layout version 5, which can keep why an alert was raised and the per-app behaviour profiles that the coming "Learn" feature builds. Existing alerts are kept.
+- Storage: the store can now read, write, reset and age out per-app behaviour profiles (what each app normally talks to, and when).
 
 ## [0.2.1] - 2026-11-24
 
