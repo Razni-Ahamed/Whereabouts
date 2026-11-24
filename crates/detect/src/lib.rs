@@ -19,6 +19,7 @@
 
 pub mod browsers;
 pub mod profile;
+pub mod signals;
 
 pub use profile::{LEARNING, Profile};
 
