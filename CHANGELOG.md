@@ -4,6 +4,10 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-24
+
+*Security update.* Fixes every attack found in the [security test of 2026-11-22](docs/reviews/security-ui-test-2026-11-22.md), which work against 0.2.0 and earlier (see **Security** below); please update. Also: a choice to save no history, much less writing to disk, and a lighter, living background.
+
 ### Added
 
 - **Choose whether history is saved.** A new **Save connection history** switch on the Privacy screen, also asked once when the app starts (on by default; history is saved until you answer). With it off, the service saves no finished connections; live connections, alerts, blocking and notifications keep working. Turning it off asks, in a Windows dialog, whether to keep what is saved (it still ages out after 30 days, hourly totals after 180) or delete it now; alerts, rules and the list of programs seen are kept either way. The History view, export and (from 0.3) learning what is normal for each app need history, and the app says so. How much saving writes to disk is under **Changed** below.
@@ -127,7 +131,8 @@ First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
 - `core`: connection metadata model, robust statistics (median, MAD, robust z-score) and domain entropy.
 - CI on Windows: formatting, Clippy, tests, and licence/advisory checks with `cargo-deny`.
 
-[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Razni-Ahamed/Whereabouts/releases/tag/v0.1.0
