@@ -11,11 +11,13 @@
 //!   it is moved over automatically);
 //! - `service.log`: the service's warnings (never captured data).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use whereabouts_store::{Key, Retention, Store};
+use whereabouts_core::text::display_safe;
+use whereabouts_store::{AppSummary, Key, Retention, Store};
 use whereabouts_win_secrets::{
     KnownFolder, ensure_private_file, known_folder, load_or_create_key, secure_directory,
 };
@@ -156,7 +158,8 @@ pub fn show_history() -> ExitCode {
         "{:<24} {:<26} {:>6} {:>13} {:>10} {:>10}",
         "APP", "PUBLISHER", "FLOWS", "DESTINATIONS", "SENT", "RECEIVED"
     );
-    for app in top {
+    let shared = shared_names(&top);
+    for app in &top {
         println!(
             "{:<24} {:<26} {:>6} {:>13} {:>10} {:>10}",
             truncate(&app.app_name, 24),
@@ -166,8 +169,37 @@ pub fn show_history() -> ExitCode {
             crate::console::format_bytes(app.bytes_sent),
             crate::console::format_bytes(app.bytes_received)
         );
+        if let Some(folder) = folder_line(app, &shared) {
+            println!("{folder}");
+        }
     }
     ExitCode::SUCCESS
+}
+
+/// File names (lowercase) that more than one app in `apps` has.
+fn shared_names(apps: &[AppSummary]) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut shared = HashSet::new();
+    for app in apps {
+        let name = app.app_name.to_lowercase();
+        if !seen.insert(name.clone()) {
+            shared.insert(name);
+        }
+    }
+    shared
+}
+
+/// For an app whose file name another app in the table shares, a line
+/// under its row with its folder, so the two can be told apart.
+fn folder_line(app: &AppSummary, shared: &HashSet<String>) -> Option<String> {
+    if !shared.contains(&app.app_name.to_lowercase()) {
+        return None;
+    }
+    let folder = match app.app_path.as_deref() {
+        Some(path) => path.rsplit_once('\\').map_or(path, |(folder, _)| folder),
+        None => "(folder not saved)",
+    };
+    Some(format!("  in {}", display_safe(folder)))
 }
 
 /// `--export <FILE>`: writes all saved flows as CSV.
@@ -254,4 +286,63 @@ fn age(time: SystemTime) -> String {
 
 fn truncate(text: &str, max: usize) -> String {
     crate::console::truncate(text, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(name: &str, path: Option<&str>) -> AppSummary {
+        AppSummary {
+            app_name: name.to_owned(),
+            app_path: path.map(str::to_owned),
+            publisher: None,
+            flows: 1,
+            destinations: 1,
+            bytes_sent: 1,
+            bytes_received: 1,
+        }
+    }
+
+    #[test]
+    fn apps_that_share_a_name_show_their_folder() {
+        let apps = [
+            app(
+                "chrome.exe",
+                Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            ),
+            app(
+                "Chrome.exe",
+                Some(r"C:\Users\me\AppData\Local\Temp\Chrome.exe"),
+            ),
+            app("chrome.exe", None),
+            app("code.exe", Some(r"C:\Apps\code.exe")),
+        ];
+        let shared = shared_names(&apps);
+        let lines: Vec<_> = apps.iter().map(|a| folder_line(a, &shared)).collect();
+        assert_eq!(
+            lines,
+            [
+                Some(String::from(
+                    r"  in C:\Program Files\Google\Chrome\Application"
+                )),
+                Some(String::from(r"  in C:\Users\me\AppData\Local\Temp")),
+                Some(String::from("  in (folder not saved)")),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn folder_lines_hide_invisible_characters() {
+        let apps = [
+            app("a.exe", Some("C:\\Temp\u{202E}exe.\\a.exe")),
+            app("a.exe", None),
+        ];
+        let shared = shared_names(&apps);
+        assert_eq!(
+            folder_line(&apps[0], &shared).as_deref(),
+            Some(r"  in C:\Temp?exe.")
+        );
+    }
 }
