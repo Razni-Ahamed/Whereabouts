@@ -10,6 +10,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - Detection: the detector can now tell whether an app is still in its first week of learning, what it is known to talk to, and recognise a genuine web browser by its publisher (a program that only borrows a browser's file name does not count).
 - Detection: the detector now has its behaviour signals (new site, company or country, upload spike, ratio flip, unusual hour, random-looking name, changed program file), with starting thresholds from the lab. Not switched on yet.
 - Detection: the detector can now measure each app's traffic per hour and spot steady, regular check-ins to one destination (beaconing).
+- Detection: Whereabouts can now learn each app's usual behaviour from its traffic and raise explained alerts when it changes: signals within 10 minutes combine into one alert, and a warning that's still waiting for you is updated ("seen again") instead of repeated. Not switched on yet.
 
 ## [0.2.1] - 2026-11-24
 

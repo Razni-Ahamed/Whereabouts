@@ -325,15 +325,10 @@ impl Store {
         alert: &NewAlert,
         now: SystemTime,
     ) -> Result<Option<i64>, StoreError> {
-        if let Some(allow) = &alert.allow_key {
-            let allowed: bool = self.conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM alert_allows WHERE key = ?1)",
-                [allow],
-                |row| row.get(0),
-            )?;
-            if allowed {
-                return Ok(None);
-            }
+        if let Some(allow) = &alert.allow_key
+            && self.is_allowed(allow)?
+        {
+            return Ok(None);
         }
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO alerts (key, allow_key, created, kind, severity, app_name, \
@@ -352,6 +347,16 @@ impl Store {
             ],
         )?;
         Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Whether the user said alerts with this allow key are fine ("this is
+    /// fine" on an alert that had it).
+    pub fn is_allowed(&self, allow_key: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM alert_allows WHERE key = ?1)",
+            [allow_key],
+            |row| row.get(0),
+        )?)
     }
 
     /// Adds `reasons` to an open alert (a reason with the same signal and
@@ -2155,6 +2160,25 @@ mod tests {
         let alerts = store.alerts(UNIX_EPOCH, 10).unwrap();
         assert_eq!(alerts[0].kind, AlertKind::Behaviour);
         assert_eq!(alerts[0].reasons, reasons);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn is_allowed_after_this_is_fine() {
+        let path = temp_db("is-allowed");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let mut alert = behaviour_alert(vec![country("RU")]);
+        alert.allow_key = Some(String::from("behaviour|c:\\a.exe|beaconing|c2.example"));
+        let id = store.add_alert(&alert, at(10)).unwrap().unwrap();
+        let allow = alert.allow_key.as_deref().unwrap();
+        assert!(!store.is_allowed(allow).unwrap());
+        assert!(store.dismiss_alert(id, true, at(11)).unwrap());
+        assert!(store.is_allowed(allow).unwrap());
+        assert!(
+            !store
+                .is_allowed("behaviour|c:\\a.exe|beaconing|other")
+                .unwrap()
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -1,0 +1,490 @@
+//! The Learner turns traffic into profiles and explained behaviour alerts.
+
+use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use whereabouts_detect::learner::{AppFacts, Finished, Learner};
+use whereabouts_detect::meter::Delta;
+use whereabouts_detect::signals::Toggles;
+use whereabouts_enrich::{CompanyList, Enricher, GeoDatabases, TrackerList};
+use whereabouts_store::{
+    AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, Key, ProfileItem, ProfileRow, Severity,
+    Signal, Store, StoredAlert, known_app_key,
+};
+
+/// 2027-01-15 08:00 UTC, on the hour.
+const T0: u64 = 1_800_000_000;
+const HOUR: u64 = 3_600;
+const DAY: u64 = 86_400;
+const MB: u64 = 1_000_000;
+const PATH: &str = r"C:\Apps\Chat.exe";
+
+/// A temporary encrypted store, deleted (after closing it) when dropped.
+struct TestStore {
+    store: Option<Store>,
+    dir: PathBuf,
+}
+
+impl TestStore {
+    fn open(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("whereabouts-learner-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db"), &Key::from_bytes([9; 32])).unwrap();
+        Self {
+            store: Some(store),
+            dir,
+        }
+    }
+}
+
+impl Deref for TestStore {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        self.store.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for TestStore {
+    fn deref_mut(&mut self) -> &mut Store {
+        self.store.as_mut().unwrap()
+    }
+}
+
+impl Drop for TestStore {
+    fn drop(&mut self) {
+        drop(self.store.take());
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn at(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+fn key() -> String {
+    known_app_key(PATH)
+}
+
+fn enricher() -> Enricher {
+    Enricher::from_parts(
+        TrackerList::parse(""),
+        CompanyList::default(),
+        GeoDatabases::default(),
+    )
+}
+
+fn app() -> AppFacts<'static> {
+    AppFacts {
+        app_name: "Chat.exe",
+        path: PATH,
+        sha256: Some("aaaa"),
+        publisher: Some("Chat Inc"),
+        signature_valid: true,
+        installed_by_admins: true,
+    }
+}
+
+/// A finished flow to `domain` (owned by `company`, in `country`) on port 443.
+fn flow<'a>(
+    domain: Option<&'a str>,
+    company: Option<&'a str>,
+    country: Option<&'a str>,
+    secs: u64,
+) -> Finished<'a> {
+    Finished {
+        app: app(),
+        domain,
+        company,
+        country,
+        port: 443,
+        first_seen: at(secs.saturating_sub(30)),
+        last_seen: at(secs),
+    }
+}
+
+/// The usual destinations of the seeded app.
+fn usual(secs: u64) -> Finished<'static> {
+    flow(Some("chat.example"), Some("Chat Inc"), Some("DE"), secs)
+}
+
+fn item(kind: ItemKind, value: &str) -> ProfileItem {
+    ProfileItem {
+        kind,
+        value: value.to_owned(),
+        first_seen: at(T0 - 8 * DAY),
+        last_seen: at(T0 - DAY),
+        seen_on_day: 8,
+        state: ItemState::Learned,
+    }
+}
+
+/// Saves a profile that finished learning (first data 8 days before
+/// `T0`), knowing chat.example, Chat Inc, DE and port 443, with `hours`.
+fn seed(store: &mut Store, goes_anywhere: GoesAnywhere, hours: &[HourRow]) {
+    let row = ProfileRow {
+        key: key(),
+        path: PATH.to_owned(),
+        app_name: "Chat.exe".to_owned(),
+        first_data: at(T0 - 8 * DAY),
+        learned_since: at(T0 - 8 * DAY),
+        last_data: at(T0 - DAY),
+        active_days: 8,
+        last_active_day: Some(((T0 - DAY) / DAY) as i64),
+        last_sha256: Some("aaaa".to_owned()),
+        last_publisher: Some("Chat Inc".to_owned()),
+        goes_anywhere,
+        reset_at: None,
+    };
+    store.save_profile_row(&row).unwrap();
+    store
+        .save_items(
+            &key(),
+            &[
+                item(ItemKind::Domain, "chat.example"),
+                item(ItemKind::Company, "Chat Inc"),
+                item(ItemKind::Country, "DE"),
+                item(ItemKind::Port, "443"),
+            ],
+        )
+        .unwrap();
+    store.add_hours(&key(), hours).unwrap();
+}
+
+/// `count` hours of `sent` bytes each, the last ending where `T0`'s hour begins.
+fn history(count: u64, sent: u64) -> Vec<HourRow> {
+    let last = (T0 / HOUR) as i64 - 1;
+    (0..count as i64)
+        .map(|i| HourRow {
+            hour: last - i,
+            bytes_sent: sent,
+            bytes_received: 0,
+            connections: 1,
+        })
+        .collect()
+}
+
+fn behaviour(store: &Store) -> Vec<StoredAlert> {
+    store
+        .alerts(UNIX_EPOCH, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.kind == AlertKind::Behaviour)
+        .collect()
+}
+
+fn state(store: &Store, kind: ItemKind, value: &str) -> Option<ItemState> {
+    store
+        .profile(&key())
+        .unwrap()
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|i| i.kind == kind && i.value == value)
+        .map(|i| i.state)
+}
+
+fn delta(secs: u64, destination: &str, sent: u64, connections: u32) -> Delta {
+    Delta {
+        app_key: key(),
+        destination: Some(destination.to_owned()),
+        hour: (secs / HOUR) as i64,
+        sent,
+        received: 0,
+        new_connections: connections,
+    }
+}
+
+#[test]
+fn nothing_raised_while_learning() {
+    let mut db = TestStore::open("learning");
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
+    let day2 = flow(
+        Some("other.example"),
+        Some("Other Co"),
+        Some("FR"),
+        T0 + DAY,
+    );
+    assert!(
+        learner
+            .finished(&day2, &e, &mut db, at(T0 + DAY))
+            .is_empty()
+    );
+    assert!(learner.take_errors().is_empty());
+    assert!(behaviour(&db).is_empty());
+
+    let profile = db.profile(&key()).unwrap().unwrap();
+    assert_eq!(profile.row.first_data, at(T0));
+    assert_eq!(profile.row.learned_since, at(T0));
+    assert_eq!(profile.row.active_days, 2);
+    assert_eq!(profile.row.last_sha256.as_deref(), Some("aaaa"));
+    assert_eq!(
+        state(&db, ItemKind::Country, "FR"),
+        Some(ItemState::Learned)
+    );
+    assert_eq!(
+        state(&db, ItemKind::Company, "Other Co"),
+        Some(ItemState::Learned)
+    );
+    assert_eq!(state(&db, ItemKind::Port, "443"), Some(ItemState::Learned));
+}
+
+#[test]
+fn new_country_after_learning_is_pending() {
+    let mut db = TestStore::open("pending");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let ru = flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), T0);
+    let raised = learner.finished(&ru, &enricher(), &mut db, at(T0));
+    assert!(learner.take_errors().is_empty());
+
+    assert_eq!(raised.len(), 1);
+    let alert = &raised[0].alert;
+    assert_eq!(alert.kind, AlertKind::Behaviour);
+    assert_eq!(alert.severity, Severity::Medium);
+    assert_eq!(alert.key, format!("behaviour|{}|{T0}", key()));
+    assert_eq!(alert.allow_key, None);
+    assert_eq!(alert.target.as_deref(), Some("RU"));
+    assert_eq!(alert.detail, None);
+    assert_eq!(alert.app_path.as_deref(), Some(PATH));
+
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].id, raised[0].id);
+    assert_eq!(saved[0].severity, Severity::Medium);
+    assert_eq!(saved[0].reasons.len(), 1);
+    assert_eq!(saved[0].reasons[0].signal, Signal::NewCountry);
+    assert_eq!(saved[0].reasons[0].value.as_deref(), Some("RU"));
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Pending)
+    );
+    assert_eq!(
+        state(&db, ItemKind::Country, "DE"),
+        Some(ItemState::Learned)
+    );
+}
+
+#[test]
+fn pending_seen_again_updates_alert() {
+    let mut db = TestStore::open("seen-again");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let ru = |secs| flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), secs);
+    assert_eq!(learner.finished(&ru(T0), &e, &mut db, at(T0)).len(), 1);
+    for i in 1..=3 {
+        let secs = T0 + i * HOUR;
+        assert!(
+            learner
+                .finished(&ru(secs), &e, &mut db, at(secs))
+                .is_empty()
+        );
+    }
+    assert!(learner.take_errors().is_empty());
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].seen_again, 3);
+    assert_eq!(saved[0].severity, Severity::Medium);
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Pending)
+    );
+}
+
+#[test]
+fn signals_in_ten_minutes_combine() {
+    let mut db = TestStore::open("combine");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let company = flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), T0);
+    let first = learner.finished(&company, &e, &mut db, at(T0));
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].alert.severity, Severity::Medium);
+
+    // Five minutes later, a new country: two mediums make it high.
+    let country = flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), T0 + 300);
+    let second = learner.finished(&country, &e, &mut db, at(T0 + 300));
+    assert_eq!(second.len(), 1, "a severity raise is notified");
+    assert_eq!(second[0].id, first[0].id);
+    assert_eq!(second[0].alert.severity, Severity::High);
+    assert_eq!(second[0].alert.reasons.len(), 2);
+
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].severity, Severity::High);
+    let signals: Vec<Signal> = saved[0].reasons.iter().map(|r| r.signal).collect();
+    assert_eq!(signals, [Signal::NewCompany, Signal::NewCountry]);
+
+    // After the window closes, a new signal is a new alert.
+    let later = flow(Some("chat.example"), Some("Other Co"), Some("DE"), T0 + 700);
+    assert_eq!(learner.finished(&later, &e, &mut db, at(T0 + 700)).len(), 1);
+    assert_eq!(behaviour(&db).len(), 2);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn upload_spike_raised_while_upload_runs() {
+    let mut db = TestStore::open("upload");
+    seed(&mut db, GoesAnywhere::Auto, &history(24, MB));
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let mut raised = Vec::new();
+    for i in 0..10 {
+        let secs = T0 + i * 60;
+        let deltas = [delta(secs, "upload.example", 50 * MB, 0)];
+        raised.extend(learner.traffic(&app(), &deltas, &e, &mut db, at(secs)));
+    }
+    assert!(learner.take_errors().is_empty());
+    assert_eq!(raised.len(), 1, "raised once, on the first big tick");
+    assert_eq!(raised[0].alert.severity, Severity::High);
+    assert_eq!(raised[0].alert.reasons[0].signal, Signal::UploadSpike);
+    assert_eq!(raised[0].alert.reasons[0].observed, Some(5e7));
+    assert_eq!(behaviour(&db).len(), 1);
+    // Nothing was flushed yet: the running hour is not in the store.
+    let hours = db.profile(&key()).unwrap().unwrap().hours;
+    assert!(hours.iter().all(|h| h.hour < (T0 / HOUR) as i64));
+}
+
+#[test]
+fn flush_then_restart_adds_to_same_hour() {
+    let mut db = TestStore::open("flush");
+    let e = enricher();
+    let hour = (T0 / HOUR) as i64;
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let deltas = [delta(T0 + 60, "chat.example", 5 * MB, 1)];
+    assert!(
+        learner
+            .traffic(&app(), &deltas, &e, &mut db, at(T0 + 60))
+            .is_empty()
+    );
+    // Shutting down: the service flushes an hour ahead to write the open hour.
+    learner.flush(&mut db, at(T0 + 60 + HOUR)).unwrap();
+    assert!(learner.take_errors().is_empty());
+    let stored = db.profile(&key()).unwrap().unwrap();
+    assert_eq!(stored.row.first_data, at(T0 + 60));
+    assert_eq!(stored.hours.len(), 1);
+    assert_eq!(stored.hours[0].bytes_sent, 5 * MB);
+
+    let mut restarted = Learner::new(Toggles::default(), 0);
+    let deltas = [delta(T0 + 120, "chat.example", 5 * MB, 1)];
+    restarted.traffic(&app(), &deltas, &e, &mut db, at(T0 + 120));
+    // Still inside the hour: nothing is written yet.
+    restarted.flush(&mut db, at(T0 + 180)).unwrap();
+    assert_eq!(
+        db.profile(&key()).unwrap().unwrap().hours[0].bytes_sent,
+        5 * MB
+    );
+    restarted.flush(&mut db, at(T0 + HOUR)).unwrap();
+    assert!(restarted.take_errors().is_empty());
+    let hours = db.profile(&key()).unwrap().unwrap().hours;
+    assert_eq!(hours.len(), 1);
+    assert_eq!(hours[0].hour, hour);
+    assert_eq!(hours[0].bytes_sent, 10 * MB);
+    assert_eq!(hours[0].connections, 2);
+}
+
+#[test]
+fn goes_anywhere_app_gets_no_destination_alerts() {
+    let mut db = TestStore::open("anywhere");
+    seed(&mut db, GoesAnywhere::UserOn, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let new = flow(Some("other.example"), Some("Other Co"), Some("RU"), T0);
+    assert!(
+        learner
+            .finished(&new, &enricher(), &mut db, at(T0))
+            .is_empty()
+    );
+    assert!(learner.take_errors().is_empty());
+    assert!(behaviour(&db).is_empty());
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Learned)
+    );
+    assert_eq!(
+        state(&db, ItemKind::Company, "Other Co"),
+        Some(ItemState::Learned)
+    );
+    assert_eq!(
+        state(&db, ItemKind::Domain, "other.example"),
+        Some(ItemState::Learned)
+    );
+}
+
+#[test]
+fn allowed_beacon_not_raised_again() {
+    let mut db = TestStore::open("beacon");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::all_on(), 0);
+    let e = enricher();
+    let beacon = |learner: &mut Learner, db: &mut TestStore, start: u64| {
+        let mut raised = Vec::new();
+        for i in 0..8 {
+            let secs = start + i * 60;
+            let deltas = [delta(secs, "c2.example", 500, 1)];
+            raised.extend(learner.traffic(&app(), &deltas, &e, db, at(secs)));
+        }
+        raised
+    };
+
+    let raised = beacon(&mut learner, &mut db, T0);
+    assert_eq!(raised.len(), 1);
+    let alert = &raised[0].alert;
+    assert_eq!(alert.severity, Severity::Medium);
+    assert_eq!(alert.reasons[0].signal, Signal::Beaconing);
+    assert_eq!(alert.target.as_deref(), Some("c2.example"));
+    let allow = format!("behaviour|{}|beaconing|c2.example", key());
+    assert_eq!(alert.allow_key.as_deref(), Some(allow.as_str()));
+
+    // "This is fine" saves the allow key.
+    assert!(db.dismiss_alert(raised[0].id, true, at(T0 + 600)).unwrap());
+    assert!(db.is_allowed(&allow).unwrap());
+
+    // The next day: a new company opens a window, and the beacon, though
+    // inside that window, is not added to it.
+    let day2 = T0 + DAY;
+    let company = flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), day2);
+    assert_eq!(learner.finished(&company, &e, &mut db, at(day2)).len(), 1);
+    assert!(beacon(&mut learner, &mut db, day2 + 10).is_empty());
+    assert!(learner.take_errors().is_empty());
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 2);
+    let newest = saved.iter().find(|a| a.id != raised[0].id).unwrap();
+    let signals: Vec<Signal> = newest.reasons.iter().map(|r| r.signal).collect();
+    assert_eq!(signals, [Signal::NewCompany]);
+}
+
+#[test]
+fn reset_profile_learns_again() {
+    let mut db = TestStore::open("reset");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    // The learner caches the finished profile.
+    assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
+
+    assert!(db.reset_profile(&key(), at(T0 + 60)).unwrap());
+    learner.forget(&key());
+
+    let ru = flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), T0 + 120);
+    assert!(learner.finished(&ru, &e, &mut db, at(T0 + 120)).is_empty());
+    let day6 = T0 + 6 * DAY;
+    let company = flow(Some("chat.example"), Some("Evil Corp"), Some("RU"), day6);
+    assert!(learner.finished(&company, &e, &mut db, at(day6)).is_empty());
+    assert!(behaviour(&db).is_empty());
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Learned)
+    );
+
+    // Once the new learning period is over, something new alerts again.
+    let day8 = T0 + 8 * DAY;
+    let cn = flow(Some("chat.example"), Some("Chat Inc"), Some("CN"), day8);
+    assert_eq!(learner.finished(&cn, &e, &mut db, at(day8)).len(), 1);
+    assert!(learner.take_errors().is_empty());
+}

@@ -19,6 +19,7 @@
 
 pub mod beacon;
 pub mod browsers;
+pub mod learner;
 pub mod meter;
 pub mod profile;
 pub mod signals;
