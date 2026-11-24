@@ -9,6 +9,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - Storage: on upgrade, the store can now build each app's behaviour profile from the history already saved, a batch at a time.
 - Detection: the detector can now tell whether an app is still in its first week of learning, what it is known to talk to, and recognise a genuine web browser by its publisher (a program that only borrows a browser's file name does not count).
 - Detection: the detector now has its behaviour signals (new site, company or country, upload spike, ratio flip, unusual hour, random-looking name, changed program file), with starting thresholds from the lab. Not switched on yet.
+- Detection: the detector can now measure each app's traffic per hour and spot steady, regular check-ins to one destination (beaconing).
 
 ## [0.2.1] - 2026-11-24
 

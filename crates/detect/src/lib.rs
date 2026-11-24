@@ -17,7 +17,9 @@
 //! "This is fine" (stored by the store as an allow key) stops alerts for the
 //! same app and tracker, or the same app and listed range.
 
+pub mod beacon;
 pub mod browsers;
+pub mod meter;
 pub mod profile;
 pub mod signals;
 
