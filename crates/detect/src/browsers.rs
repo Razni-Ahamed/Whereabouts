@@ -21,11 +21,23 @@ const BROWSER_PUBLISHERS: [(&str, &str); 7] = [
 ];
 
 /// Returns `true` if `app_name` is a listed browser, its signature is valid
-/// and the publisher is the one expected for that browser. A program that
-/// only has a browser's file name does not qualify. Comparison ignores ASCII
-/// case.
-pub fn auto_goes_anywhere(app_name: &str, publisher: Option<&str>, signature_valid: bool) -> bool {
-    if !signature_valid {
+/// the publisher is the one expected for that browser, and the file is
+/// installed by administrators (`installed_by_admins`, worked out by the
+/// caller). A program that only has a browser's file name, or that another
+/// program of the same publisher was copied over (a Microsoft-signed
+/// `curl.exe` renamed `msedge.exe`), does not qualify. Comparison ignores
+/// ASCII case.
+///
+/// Per-user browser installs (for example in `LocalAppData`) are not
+/// recognised automatically, because a normal program could plant a file
+/// there; the user can switch "goes anywhere" on for such a browser.
+pub fn auto_goes_anywhere(
+    app_name: &str,
+    publisher: Option<&str>,
+    signature_valid: bool,
+    installed_by_admins: bool,
+) -> bool {
+    if !signature_valid || !installed_by_admins {
         return false;
     }
     let Some(publisher) = publisher else {
@@ -42,24 +54,61 @@ mod tests {
 
     #[test]
     fn fake_browser_does_not_go_anywhere() {
-        assert!(!auto_goes_anywhere("chrome.exe", Some("Evil Ltd"), true));
-        assert!(!auto_goes_anywhere("chrome.exe", Some("Google LLC"), false));
-        assert!(!auto_goes_anywhere("chrome.exe", None, true));
+        assert!(!auto_goes_anywhere(
+            "chrome.exe",
+            Some("Evil Ltd"),
+            true,
+            true
+        ));
+        assert!(!auto_goes_anywhere(
+            "chrome.exe",
+            Some("Google LLC"),
+            false,
+            true
+        ));
+        assert!(!auto_goes_anywhere("chrome.exe", None, true, true));
     }
 
     #[test]
     fn real_browser_goes_anywhere() {
-        assert!(auto_goes_anywhere("CHROME.EXE", Some("google llc"), true));
+        assert!(auto_goes_anywhere(
+            "CHROME.EXE",
+            Some("google llc"),
+            true,
+            true
+        ));
         assert!(auto_goes_anywhere(
             "msedge.exe",
             Some("Microsoft Corporation"),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn browser_not_installed_by_admins_does_not_go_anywhere() {
+        assert!(!auto_goes_anywhere(
+            "chrome.exe",
+            Some("Google LLC"),
+            true,
+            false
+        ));
+        assert!(auto_goes_anywhere(
+            "chrome.exe",
+            Some("Google LLC"),
+            true,
             true
         ));
     }
 
     #[test]
     fn other_programs_do_not_go_anywhere() {
-        assert!(!auto_goes_anywhere("notepad.exe", Some("Google LLC"), true));
+        assert!(!auto_goes_anywhere(
+            "notepad.exe",
+            Some("Google LLC"),
+            true,
+            true
+        ));
     }
 
     #[test]

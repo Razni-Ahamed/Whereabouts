@@ -18,6 +18,7 @@ const SECS_PER_DAY: i64 = 86_400;
 /// One app's profile as stored, with the questions the detectors ask of it.
 #[derive(Debug, Clone)]
 pub struct Profile {
+    /// The profile as read from the store.
     pub stored: StoredProfile,
 }
 
@@ -92,8 +93,13 @@ impl Profile {
 
     /// Whether this app may contact any site without it being unusual: the
     /// user's choice if they made one, otherwise automatic recognition of a
-    /// genuine browser from its signature.
-    pub fn goes_anywhere(&self, signature_publisher: Option<&str>, signature_valid: bool) -> bool {
+    /// genuine, administrator-installed browser from its signature.
+    pub fn goes_anywhere(
+        &self,
+        signature_publisher: Option<&str>,
+        signature_valid: bool,
+        installed_by_admins: bool,
+    ) -> bool {
         match self.stored.row.goes_anywhere {
             GoesAnywhere::UserOn => true,
             GoesAnywhere::UserOff => false,
@@ -101,6 +107,7 @@ impl Profile {
                 &self.stored.row.app_name,
                 signature_publisher,
                 signature_valid,
+                installed_by_admins,
             ),
         }
     }
@@ -117,7 +124,7 @@ impl Profile {
         self.stored
             .hours
             .iter()
-            .filter(|h| h.bytes_sent + h.bytes_received + h.connections > 0)
+            .filter(|h| h.bytes_sent > 0 || h.bytes_received > 0 || h.connections > 0)
     }
 }
 
@@ -136,8 +143,8 @@ mod tests {
                     path: format!("C:\\x\\{app}"),
                     app_name: app.into(),
                     first_data: t,
-                    learned_since: t,
-                    last_data: t,
+                    learned_since: t + Duration::from_secs(3 * 86_400),
+                    last_data: t + Duration::from_secs(5 * 86_400),
                     active_days: 1,
                     last_active_day: None,
                     last_sha256: None,
@@ -199,12 +206,12 @@ mod tests {
     #[test]
     fn user_choice_wins_over_auto() {
         let off = profile("chrome.exe", GoesAnywhere::UserOff);
-        assert!(!off.goes_anywhere(Some("Google LLC"), true));
+        assert!(!off.goes_anywhere(Some("Google LLC"), true, true));
         let on = profile("notepad.exe", GoesAnywhere::UserOn);
-        assert!(on.goes_anywhere(None, false));
+        assert!(on.goes_anywhere(None, false, false));
         let auto = profile("chrome.exe", GoesAnywhere::Auto);
-        assert!(auto.goes_anywhere(Some("Google LLC"), true));
-        assert!(!auto.goes_anywhere(Some("Evil Ltd"), true));
+        assert!(auto.goes_anywhere(Some("Google LLC"), true, true));
+        assert!(!auto.goes_anywhere(Some("Evil Ltd"), true, true));
     }
 
     #[test]
