@@ -92,7 +92,11 @@ the screen's top level or `App.svelte`.
   process 28112 only) and the fake (Microsoft 3rd Party Application Component, its Temp path, its own
   process), each with its folder. Code: `ui/src/lib/apps.ts` (tested in `apps.test.ts`).
   Left over: the card's "Last 24 hours" line comes from saved history, which the service still totals
-  by file name.
+  by file name. **Fixed 2026-11-24** (not yet re-tested live): `Store::top_apps` totals saved flows
+  per program path (by name only when no path was saved), `AppTotals` carries the `path`, and the card
+  shows the totals of its own path (`savedTotals` in `ui/src/lib/apps.ts`). `--status` shows the folder
+  under "Top apps" rows that share a name. Tests: `programs_that_share_a_name_get_separate_totals`
+  (store), `apps.test.ts`.
 - **H3:** the Block menu opens centred over the 60-row Connections list. Code: `ui/src/lib/portal.ts`,
   used by `BlockMenu.svelte`.
 

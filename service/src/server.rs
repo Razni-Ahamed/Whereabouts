@@ -656,6 +656,7 @@ fn history(store: &Store, hours: u32, limit: u32) -> Response {
                 .into_iter()
                 .map(|app| AppTotals {
                     app: app.app_name,
+                    path: app.app_path,
                     publisher: app.publisher,
                     flows: app.flows,
                     destinations: app.destinations,

@@ -144,11 +144,16 @@ pub struct FlowRecord {
     pub connections: u32,
 }
 
-/// Totals for one app over a period.
+/// Totals for one app over a period. An app is one program file: flows are
+/// grouped by the program's full path (ignoring case), or by its file name
+/// when no path was saved, so programs that share a name in different folders
+/// get separate totals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppSummary {
     /// Executable file name.
     pub app_name: String,
+    /// Full path of the program, if it was saved.
+    pub app_path: Option<String>,
     /// Publisher of the most recent stored flow, if signed.
     pub publisher: Option<String>,
     /// Number of stored flows.
@@ -632,17 +637,19 @@ impl Store {
     }
 
     /// Per-app totals of flows last seen at or after `since`, largest
-    /// first.
+    /// first. See [`AppSummary`] for what counts as one app.
     pub fn top_apps(&self, since: SystemTime, limit: usize) -> Result<Vec<AppSummary>, StoreError> {
+        // With a single max() in the query, SQLite takes the bare columns
+        // (name, path, publisher) from the row holding that maximum: the
+        // app's most recent flow.
         let mut query = self.conn.prepare(
-            "SELECT app_name,
-                    (SELECT publisher FROM flows f2 WHERE f2.app_name = flows.app_name
-                        ORDER BY last_seen DESC LIMIT 1),
+            "SELECT app_name, app_path, publisher, max(last_seen),
                     count(*),
                     count(DISTINCT coalesce(domain, remote_ip)),
                     sum(bytes_sent), sum(bytes_received)
              FROM flows WHERE last_seen >= ?1
-             GROUP BY app_name
+             GROUP BY CASE WHEN app_path IS NULL THEN 'name:' || lower(app_name)
+                           ELSE 'path:' || lower(app_path) END
              ORDER BY sum(bytes_sent) + sum(bytes_received) DESC
              LIMIT ?2",
         )?;
@@ -651,11 +658,12 @@ impl Store {
             |row| {
                 Ok(AppSummary {
                     app_name: row.get(0)?,
-                    publisher: row.get(1)?,
-                    flows: to_u64(row.get(2)?),
-                    destinations: to_u64(row.get(3)?),
-                    bytes_sent: to_u64(row.get(4)?),
-                    bytes_received: to_u64(row.get(5)?),
+                    app_path: row.get(1)?,
+                    publisher: row.get(2)?,
+                    flows: to_u64(row.get(4)?),
+                    destinations: to_u64(row.get(5)?),
+                    bytes_sent: to_u64(row.get(6)?),
+                    bytes_received: to_u64(row.get(7)?),
                 })
             },
         )?;
@@ -1231,6 +1239,73 @@ mod tests {
         assert_eq!(top[0].bytes_sent, 30);
         assert_eq!(top[0].bytes_received, 300);
         assert_eq!(top[0].publisher.as_deref(), Some("Example Corp"));
+        assert_eq!(top[0].app_path.as_deref(), Some(r"C:\Apps\a.exe"));
+    }
+
+    #[test]
+    fn programs_that_share_a_name_get_separate_totals() {
+        let path = temp_db("same-name");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let real = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        let fake = r"C:\Users\me\AppData\Local\Temp\chrome.exe";
+        let flow = |app_path: Option<&str>, secs: u64, sent: u64, signature: Signature| {
+            let mut flow = record("chrome.exe", "one.example", secs, sent);
+            flow.app_path = app_path.map(str::to_owned);
+            flow.signature = Some(signature);
+            flow
+        };
+        let google = || Signature::Signed {
+            publisher: String::from("Google LLC"),
+            via_catalog: false,
+        };
+        store
+            .insert_flows(&[
+                flow(Some(real), 100, 100, google()),
+                // The same file, spelled with different case.
+                flow(Some(&real.to_uppercase()), 200, 100, google()),
+                flow(Some(fake), 300, 10, Signature::Unsigned),
+                flow(None, 400, 1, Signature::Unsigned),
+            ])
+            .unwrap();
+
+        let top = store.top_apps(at(0), 10).unwrap();
+        assert_eq!(top.len(), 3, "{top:?}");
+        assert!(top.iter().all(|app| app.app_name == "chrome.exe"));
+
+        let real_path = top[0].app_path.as_deref().map(str::to_lowercase);
+        assert_eq!(real_path, Some(real.to_lowercase()));
+        assert_eq!(top[0].flows, 2);
+        assert_eq!(top[0].bytes_sent, 200);
+        assert_eq!(top[0].publisher.as_deref(), Some("Google LLC"));
+
+        assert_eq!(top[1].app_path.as_deref(), Some(fake));
+        assert_eq!(top[1].flows, 1);
+        assert_eq!(top[1].bytes_sent, 10);
+        assert_eq!(
+            top[1].publisher, None,
+            "the copy must not borrow Google's name"
+        );
+
+        // Flows saved without a path are totalled by name, on their own.
+        assert_eq!(top[2].app_path, None);
+        assert_eq!(top[2].bytes_sent, 1);
+    }
+
+    #[test]
+    fn app_totals_name_the_most_recent_flow() {
+        let path = temp_db("most-recent");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let mut old = record("tool.exe", "one.example", 100, 10);
+        old.signature = Some(Signature::Signed {
+            publisher: String::from("Old Name Ltd"),
+            via_catalog: false,
+        });
+        let new = record("tool.exe", "one.example", 200, 10);
+        store.insert_flows(&[new, old]).unwrap();
+        let top = store.top_apps(at(0), 10).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].publisher.as_deref(), Some("Example Corp"));
+        assert_eq!(top[0].flows, 2);
     }
 
     #[test]

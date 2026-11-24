@@ -556,11 +556,16 @@ pub struct FlowView {
     pub web_content: bool,
 }
 
-/// Saved totals for one app.
+/// Saved totals for one app: one program file, told apart by its full
+/// path (or by its name when no path was saved).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppTotals {
     /// Executable file name.
     pub app: String,
+    /// Full path of the program, if saved. Missing from older services,
+    /// which totalled programs by file name.
+    #[serde(default)]
+    pub path: Option<String>,
     /// Publisher, if signed.
     pub publisher: Option<String>,
     /// Number of flows.
@@ -827,6 +832,17 @@ mod tests {
         let status: Status = serde_json::from_str(old).unwrap();
         assert_eq!(status.block_rules, 0);
         assert!(!status.blocking_paused);
+    }
+
+    #[test]
+    fn history_from_an_older_service_still_reads() {
+        let old = r#"{"type":"history","apps":[{"app":"chrome.exe","publisher":null,"flows":1,
+            "destinations":1,"bytes_sent":2,"bytes_received":3}]}"#;
+        let Response::History { apps } = serde_json::from_str(old).unwrap() else {
+            panic!("not a history answer");
+        };
+        assert_eq!(apps[0].app, "chrome.exe");
+        assert_eq!(apps[0].path, None);
     }
 
     #[test]

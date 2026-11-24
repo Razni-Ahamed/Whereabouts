@@ -5,7 +5,7 @@
 // "chrome.exe", and a copy in a temporary folder must not borrow the real
 // program's publisher, its "signed" badge or its Block button.
 
-import type { FlowView } from './types';
+import type { AppTotals, FlowView } from './types';
 
 export interface AppGroup {
   /** Identifies the group: its program's path, or its name when the path is unknown. */
@@ -85,6 +85,16 @@ export function groupByApp(flows: FlowView[]): AppGroup[] {
 export function findApp(groups: AppGroup[], pick: string | null): AppGroup | undefined {
   if (!pick) return undefined;
   return groups.find((g) => g.key === pick) ?? groups.find((g) => g.app === pick);
+}
+
+/**
+ * The saved totals of `group`'s program. Matched by path, like the live
+ * groups, so a program never shows the totals of another one that shares
+ * its name; totals without a path (older services) match only an app whose
+ * path is unknown too.
+ */
+export function savedTotals(history: AppTotals[], group: AppGroup): AppTotals | undefined {
+  return history.find((h) => appKey(h.app, h.path) === group.key);
 }
 
 /** The folder of a full path, for telling apart programs with the same name. */

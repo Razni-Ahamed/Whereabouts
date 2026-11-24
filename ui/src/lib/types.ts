@@ -58,8 +58,11 @@ export interface FlowView {
   web_content?: boolean;
 }
 
+/** Saved totals for one program file (told apart by its path). */
 export interface AppTotals {
   app: string;
+  /** The program's full path, if saved. Missing from older services, which totalled by file name. */
+  path?: string | null;
   publisher: string | null;
   flows: number;
   destinations: number;

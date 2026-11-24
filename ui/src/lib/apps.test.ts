@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appKey, findApp, folderOf, groupByApp } from './apps.ts';
-import type { FlowView } from './types.ts';
+import { appKey, findApp, folderOf, groupByApp, savedTotals } from './apps.ts';
+import type { AppTotals, FlowView } from './types.ts';
 
 function flow(app: string, path: string | null, publisher: string, confirmed: boolean, bytes: number): FlowView {
   return {
@@ -75,4 +75,30 @@ test('an app is found by its key, or by name from places that only know the name
 test('folders are cut from full paths', () => {
   assert.equal(folderOf(FAKE), 'C:\\Users\\me\\AppData\\Local\\Temp');
   assert.equal(folderOf('chrome.exe'), 'chrome.exe');
+});
+
+function totals(app: string, path: string | null | undefined, sent: number): AppTotals {
+  return { app, path, publisher: null, flows: 1, destinations: 1, bytes_sent: sent, bytes_received: 0 };
+}
+
+test("each app shows its own program's saved totals, never another's of the same name", () => {
+  const [real, fake] = groupByApp([
+    flow('chrome.exe', REAL, 'Google LLC', true, 1000),
+    flow('chrome.exe', FAKE, 'UNSIGNED', false, 10),
+  ]);
+  const history = [totals('chrome.exe', REAL.toUpperCase(), 500), totals('chrome.exe', FAKE, 5)];
+  assert.equal(savedTotals(history, real)?.bytes_sent, 500, 'paths compare without case');
+  assert.equal(savedTotals(history, fake)?.bytes_sent, 5);
+  assert.equal(savedTotals([totals('chrome.exe', REAL, 500)], fake), undefined);
+});
+
+test('saved totals without a path only match an app whose path is unknown', () => {
+  const [known, unknown] = groupByApp([
+    flow('chrome.exe', REAL, 'Google LLC', true, 1000),
+    flow('chrome.exe', null, '-', false, 10),
+  ]);
+  // An older service sends no path: its totals were by name, so they may not be this program's.
+  const old = [totals('chrome.exe', undefined, 500)];
+  assert.equal(savedTotals(old, known), undefined);
+  assert.equal(savedTotals(old, unknown)?.bytes_sent, 500);
 });
