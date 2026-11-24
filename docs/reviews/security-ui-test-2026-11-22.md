@@ -92,11 +92,18 @@ the screen's top level or `App.svelte`.
   process 28112 only) and the fake (Microsoft 3rd Party Application Component, its Temp path, its own
   process), each with its folder. Code: `ui/src/lib/apps.ts` (tested in `apps.test.ts`).
   Left over: the card's "Last 24 hours" line comes from saved history, which the service still totals
-  by file name. **Fixed 2026-11-24** (not yet re-tested live): `Store::top_apps` totals saved flows
+  by file name. **Fixed 2026-11-24**: `Store::top_apps` totals saved flows
   per program path (by name only when no path was saved), `AppTotals` carries the `path`, and the card
   shows the totals of its own path (`savedTotals` in `ui/src/lib/apps.ts`). `--status` and `--history` show the folder
   under "Top apps" rows that share a name. Tests: `programs_that_share_a_name_get_separate_totals`
   (store), `apps.test.ts`.
+  Re-tested 2026-11-24 with an installer built from the fix and installed over the previous build: run as
+  a normal user, `--status` listed two `claude.exe` programs from different folders (Claude Code and the
+  Claude desktop app) as two "Top apps" rows with their own totals (37 and 24 flows), each with an
+  `in <folder>` line under it. (The first re-test build printed the folder lines only in `--history`, so
+  the two rows looked the same; fixed in `console::folder_lines`, used by both tables.) Not re-tested:
+  the fake `chrome.exe` itself and the app card's "Last 24 hours" line, because history saving was
+  off on the test PC.
 - **H3:** the Block menu opens centred over the 60-row Connections list. Code: `ui/src/lib/portal.ts`,
   used by `BlockMenu.svelte`.
 
