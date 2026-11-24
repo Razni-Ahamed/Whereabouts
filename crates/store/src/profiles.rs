@@ -271,7 +271,12 @@ fn write_row(conn: &Connection, row: &ProfileRow) -> Result<(), StoreError> {
 
 /// Upserts items and trims each kind to [`MAX_ITEMS_PER_KIND`]; see
 /// [`Store::save_items`].
-fn write_items(conn: &Connection, key: &str, items: &[ProfileItem]) -> Result<(), StoreError> {
+fn write_items(
+    conn: &Connection,
+    key: &str,
+    items: &[ProfileItem],
+    keep_state: bool,
+) -> Result<(), StoreError> {
     let mut upsert = conn.prepare_cached(
         "INSERT INTO profile_items \
            (key, kind, value, first_seen, last_seen, seen_on_day, state) \
@@ -280,7 +285,7 @@ fn write_items(conn: &Connection, key: &str, items: &[ProfileItem]) -> Result<()
            first_seen = MIN(first_seen, excluded.first_seen), \
            last_seen = MAX(last_seen, excluded.last_seen), \
            seen_on_day = MAX(seen_on_day, excluded.seen_on_day), \
-           state = CASE WHEN state = 'allowed' THEN 'allowed' ELSE excluded.state END",
+           state = CASE WHEN ?8 OR state = 'allowed' THEN state ELSE excluded.state END",
     )?;
     for item in items {
         upsert.execute(params![
@@ -291,6 +296,7 @@ fn write_items(conn: &Connection, key: &str, items: &[ProfileItem]) -> Result<()
             unix_ms(item.last_seen),
             i64::from(item.seen_on_day),
             item.state.as_str(),
+            keep_state,
         ])?;
     }
     let mut counted =
@@ -561,7 +567,7 @@ impl Store {
     /// seen longest ago. Allowed items are never dropped.
     pub fn save_items(&mut self, key: &str, items: &[ProfileItem]) -> Result<(), StoreError> {
         let transaction = self.conn.transaction()?;
-        write_items(&transaction, key, items)?;
+        write_items(&transaction, key, items, false)?;
         transaction.commit()?;
         Ok(())
     }
@@ -687,6 +693,14 @@ impl Store {
     /// its place in one transaction, so an interrupted call is not counted
     /// twice. Flows without a program path are skipped. `local_offset_secs`
     /// is the local time zone's offset from UTC, used to count active days.
+    ///
+    /// Items that already exist keep their state (a pending warning stays
+    /// pending); flows from before a profile's reset are ignored.
+    ///
+    /// There is no upper flow ID: it reads to the end of `flows`, including
+    /// flows saved while it runs. So it must reach `done` before live learning
+    /// writes profiles; the caller enforces this, otherwise flows could be
+    /// counted twice.
     pub fn backfill_profiles(
         &mut self,
         batch: usize,
@@ -705,7 +719,7 @@ impl Store {
         let batch = batch.max(1);
 
         let transaction = self.conn.transaction()?;
-        let flows = transaction
+        let mut flows = transaction
             .prepare(
                 "SELECT id, app_path, app_name, app_sha256, publisher, domain, owner, country, \
                         remote_port, first_seen, last_seen, bytes_sent, bytes_received, \
@@ -716,7 +730,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut apps: BTreeMap<String, Learning> = BTreeMap::new();
-        for flow in &flows {
+        for flow in &mut flows {
             let Some(path) = flow.path.as_deref().filter(|p| !p.is_empty()) else {
                 continue;
             };
@@ -746,6 +760,13 @@ impl Store {
                 apps.insert(key.clone(), Learning::new(row));
             }
             if let Some(app) = apps.get_mut(&key) {
+                // Never relearn what a reset forgot.
+                if let Some(reset) = app.row.reset_at.map(unix_ms) {
+                    if flow.last_ms < reset {
+                        continue;
+                    }
+                    flow.first_ms = flow.first_ms.max(reset);
+                }
                 app.add_flow(flow, local_offset_secs);
             }
         }
@@ -753,7 +774,7 @@ impl Store {
         for (key, app) in &apps {
             write_row(&transaction, &app.row)?;
             let items: Vec<_> = app.items.values().cloned().collect();
-            write_items(&transaction, key, &items)?;
+            write_items(&transaction, key, &items, true)?;
             let hours: Vec<_> = app.hours.values().cloned().collect();
             write_hours(&transaction, key, &hours)?;
         }
@@ -1299,5 +1320,92 @@ mod tests {
         let profile = store.profile(&crate::known_app_key(APP)).unwrap().unwrap();
         assert_eq!(profile.row.active_days, 2);
         assert_eq!(profile.row.last_active_day, Some(20_001));
+    }
+
+    #[test]
+    fn backfill_reads_flows_saved_between_batches() {
+        let mut store = store("backfill-growing");
+        let flows: Vec<_> = (0..4)
+            .map(|i| flow(Some(APP), "a.com", BASE + i * 100, BASE + i * 100, 10))
+            .collect();
+        store.insert_flows(&flows[..2]).unwrap();
+        assert!(!store.backfill_profiles(2, 0).unwrap().done);
+        store.insert_flows(&flows[2..]).unwrap();
+        let progress = store.backfill_profiles(2, 0).unwrap();
+        assert_eq!(progress.flows_read, 2);
+        assert!(!progress.done);
+        assert!(store.backfill_profiles(2, 0).unwrap().done);
+        let hours = store
+            .profile(&crate::known_app_key(APP))
+            .unwrap()
+            .unwrap()
+            .hours;
+        assert_eq!(hours.iter().map(|h| h.bytes_sent).sum::<u64>(), 40);
+    }
+
+    #[test]
+    fn backfill_keeps_state_of_existing_items() {
+        let mut store = store("backfill-pending");
+        let key = crate::known_app_key(APP);
+        let mut existing = row(&key);
+        existing.path = APP.to_owned();
+        store.save_profile_row(&existing).unwrap();
+        store
+            .save_items(
+                &key,
+                &[
+                    item(ItemKind::Domain, "a.com", 1_000, ItemState::Pending),
+                    item(ItemKind::Country, "US", 1_000, ItemState::Allowed),
+                ],
+            )
+            .unwrap();
+        store
+            .insert_flows(&[flow(Some(APP), "a.com", BASE, BASE + 10, 1)])
+            .unwrap();
+        store.backfill_profiles(1_000, 0).unwrap();
+        let items = store.profile(&key).unwrap().unwrap().items;
+        let state = |kind, value: &str| {
+            items
+                .iter()
+                .find(|i| i.kind == kind && i.value == value)
+                .map(|i| (i.state, i.last_seen))
+                .unwrap()
+        };
+        assert_eq!(
+            state(ItemKind::Domain, "a.com"),
+            (ItemState::Pending, at(BASE + 10))
+        );
+        assert_eq!(state(ItemKind::Country, "US").0, ItemState::Allowed);
+        assert_eq!(state(ItemKind::Company, "X").0, ItemState::Learned);
+    }
+
+    #[test]
+    fn backfill_does_not_undo_a_reset() {
+        let mut store = store("backfill-reset");
+        let key = crate::known_app_key(APP);
+        let mut existing = row(&key);
+        existing.path = APP.to_owned();
+        store.save_profile_row(&existing).unwrap();
+        let reset = at(BASE + 5_000);
+        assert!(store.reset_profile(&key, reset).unwrap());
+        store
+            .insert_flows(&[
+                flow(Some(APP), "old.com", BASE, BASE + 100, 10),
+                // Straddles the reset: counted only from the reset on.
+                flow(Some(APP), "new.com", BASE + 4_000, BASE + 6_000, 10),
+            ])
+            .unwrap();
+        store.backfill_profiles(1_000, 0).unwrap();
+        let profile = store.profile(&key).unwrap().unwrap();
+        assert_eq!(profile.row.first_data, reset);
+        assert_eq!(profile.row.learned_since, reset);
+        let domains: Vec<_> = profile
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Domain)
+            .map(|i| i.value.as_str())
+            .collect();
+        assert_eq!(domains, ["new.com"]);
+        assert!(profile.items.iter().all(|i| i.first_seen >= reset));
     }
 }
