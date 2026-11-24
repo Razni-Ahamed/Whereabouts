@@ -5119,6 +5119,8 @@ name = "whereabouts-store"
 version = "0.2.1"
 dependencies = [
  "rusqlite",
+ "serde",
+ "serde_json",
  "whereabouts-core",
 ]
 

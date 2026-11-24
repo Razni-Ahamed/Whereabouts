@@ -4,6 +4,8 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+- Storage: the database moves to layout version 5, which can keep why an alert was raised and the per-app behaviour profiles that the coming "Learn" feature builds. Existing alerts are kept.
+
 ## [0.2.1] - 2026-11-24
 
 *Security update.* Fixes every attack found in the [security test of 2026-11-22](docs/reviews/security-ui-test-2026-11-22.md), which work against 0.2.0 and earlier (see **Security** below); please update. Also: a choice to save no history, much less writing to disk, and a lighter, living background.

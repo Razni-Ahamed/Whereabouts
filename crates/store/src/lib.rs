@@ -25,8 +25,12 @@ use rusqlite::{Connection, ErrorCode, params};
 use whereabouts_core::dns::LabelSource;
 use whereabouts_core::model::{Protocol, Signature};
 
+mod reasons;
+
+pub use reasons::{REASON_VALUE_MAX_CHARS, Reason, Signal};
+
 /// Version of the database layout this code writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Setting holding the highest blocking-rule ID ever given out.
 const RULE_ID_SETTING: &str = "rule_id_used";
@@ -295,7 +299,10 @@ impl Store {
                 if version < 3 {
                     self.conn.execute_batch(SCHEMA_V3)?;
                 }
-                self.conn.execute_batch(SCHEMA_V4)?;
+                if version < 4 {
+                    self.conn.execute_batch(SCHEMA_V4)?;
+                }
+                self.conn.execute_batch(SCHEMA_V5)?;
                 Ok(())
             }
             None => {
@@ -303,6 +310,7 @@ impl Store {
                 self.conn.execute_batch(SCHEMA_V2)?;
                 self.conn.execute_batch(SCHEMA_V3)?;
                 self.conn.execute_batch(SCHEMA_V4)?;
+                self.conn.execute_batch(SCHEMA_V5)?;
                 Ok(())
             }
         }
@@ -327,7 +335,7 @@ impl Store {
         }
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO alerts (key, allow_key, created, kind, severity, app_name, \
-             app_path, target, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             app_path, target, detail, reasons) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 alert.key,
                 alert.allow_key,
@@ -337,10 +345,65 @@ impl Store {
                 alert.app_name,
                 alert.app_path,
                 alert.target,
-                alert.detail
+                alert.detail,
+                reasons_to_json(&alert.reasons)
             ],
         )?;
         Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Adds `reasons` to an open alert (a reason with the same signal and
+    /// value is not added twice), keeps the higher of the old and new
+    /// severity, sets how many times the behaviour was seen again, and
+    /// records the time as the alert's last update. `false` if there was no
+    /// such alert.
+    pub fn update_alert(
+        &mut self,
+        id: i64,
+        reasons: &[Reason],
+        severity: Severity,
+        seen_again: u32,
+        now: SystemTime,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.conn.transaction()?;
+        let current: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT severity, reasons FROM alerts WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let Some((old_severity, old_reasons)) = current else {
+            return Ok(false);
+        };
+        let mut merged = reasons_from_json(&old_reasons);
+        for reason in reasons {
+            let reason = reason.clone().capped();
+            if !merged
+                .iter()
+                .any(|r| r.signal == reason.signal && r.value == reason.value)
+            {
+                merged.push(reason);
+            }
+        }
+        let severity = Severity::parse(&old_severity).map_or(severity, |old| old.max(severity));
+        transaction.execute(
+            "UPDATE alerts SET reasons = ?1, severity = ?2, seen_again = ?3, updated = ?4 \
+             WHERE id = ?5",
+            params![
+                reasons_to_json(&merged),
+                severity.as_str(),
+                seen_again,
+                unix_ms(now),
+                id
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Alerts created since `since`, at most `limit`: those that need a
@@ -349,7 +412,7 @@ impl Store {
     pub fn alerts(&self, since: SystemTime, limit: usize) -> Result<Vec<StoredAlert>, StoreError> {
         let mut query = self.conn.prepare(
             "SELECT id, created, kind, severity, app_name, app_path, target, detail, dismissed, \
-             allow_key IS NOT NULL FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2",
+             allow_key IS NOT NULL, reasons, seen_again FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2",
         )?;
         let rows = query.query_map(
             params![unix_ms(since), i64::try_from(limit).unwrap_or(i64::MAX)],
@@ -365,6 +428,8 @@ impl Store {
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, bool>(8)?,
                     row.get::<_, bool>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, u32>(11)?,
                 ))
             },
         )?;
@@ -381,6 +446,8 @@ impl Store {
                 detail,
                 dismissed,
                 can_allow,
+                reasons,
+                seen_again,
             ) = row?;
             let (Some(kind), Some(severity)) =
                 (AlertKind::parse(&kind), Severity::parse(&severity))
@@ -398,6 +465,8 @@ impl Store {
                 detail,
                 dismissed,
                 can_allow,
+                reasons: reasons_from_json(&reasons),
+                seen_again,
             });
         }
         Ok(alerts)
@@ -771,7 +840,8 @@ impl Store {
     /// the deleted data is not left behind in free pages or in the log.
     pub fn wipe(&mut self) -> Result<(), StoreError> {
         self.conn.execute_batch(
-            "DELETE FROM flows; DELETE FROM hourly; DELETE FROM known_apps; DELETE FROM alerts; VACUUM;",
+            "DELETE FROM flows; DELETE FROM hourly; DELETE FROM known_apps; DELETE FROM alerts; \
+             DELETE FROM profiles; DELETE FROM profile_items; DELETE FROM profile_hours; VACUUM;",
         )?;
         self.empty_log()
     }
@@ -861,6 +931,8 @@ pub enum AlertKind {
     FakedDns,
     /// Traffic could not be tied to any process.
     Unattributed,
+    /// An app behaved differently from its own usual pattern.
+    Behaviour,
 }
 
 impl AlertKind {
@@ -871,6 +943,7 @@ impl AlertKind {
             Self::BadNetwork => "bad_network",
             Self::FakedDns => "faked_dns",
             Self::Unattributed => "unattributed",
+            Self::Behaviour => "behaviour",
         }
     }
 
@@ -880,6 +953,7 @@ impl AlertKind {
             Self::BadNetwork,
             Self::FakedDns,
             Self::Unattributed,
+            Self::Behaviour,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == text)
@@ -918,7 +992,7 @@ impl Severity {
 }
 
 /// An alert to save.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewAlert {
     /// Identifies the alert: a second alert with the same key is not saved
     /// (e.g. one per app, tracker and day).
@@ -936,10 +1010,12 @@ pub struct NewAlert {
     pub target: Option<String>,
     /// More detail: a company, a listing, a count.
     pub detail: Option<String>,
+    /// Why it was raised (behaviour alerts; empty for the others).
+    pub reasons: Vec<Reason>,
 }
 
 /// A saved alert.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredAlert {
     pub id: i64,
     pub created: SystemTime,
@@ -953,7 +1029,83 @@ pub struct StoredAlert {
     pub dismissed: bool,
     /// Whether "this is fine" can also stop alerts like it.
     pub can_allow: bool,
+    /// Why it was raised (behaviour alerts; empty for the others).
+    pub reasons: Vec<Reason>,
+    /// How many more times the same behaviour was seen after the alert.
+    pub seen_again: u32,
 }
+
+/// Reasons as stored: JSON text.
+fn reasons_to_json(reasons: &[Reason]) -> String {
+    let capped: Vec<Reason> = reasons.iter().cloned().map(Reason::capped).collect();
+    serde_json::to_string(&capped).unwrap_or_else(|_| String::from("[]"))
+}
+
+/// Reasons from their stored text; text that cannot be read gives none.
+fn reasons_from_json(text: &str) -> Vec<Reason> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Schema version 5 (Whereabouts 0.3): alerts get reasons, and per-app
+/// behaviour profiles are stored.
+const SCHEMA_V5: &str = "
+BEGIN;
+CREATE TABLE alerts_v5 (
+    id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL UNIQUE,
+    allow_key TEXT,
+    created INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('tracker', 'bad_network', 'faked_dns', 'unattributed', 'behaviour')),
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'medium', 'high', 'critical')),
+    app_name TEXT,
+    app_path TEXT,
+    target TEXT,
+    detail TEXT,
+    dismissed INTEGER NOT NULL DEFAULT 0,
+    reasons TEXT NOT NULL DEFAULT '[]',
+    seen_again INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER
+) STRICT;
+INSERT INTO alerts_v5 (id, key, allow_key, created, kind, severity, app_name, app_path, target, detail, dismissed)
+    SELECT id, key, allow_key, created, kind, severity, app_name, app_path, target, detail, dismissed FROM alerts;
+DROP TABLE alerts;
+ALTER TABLE alerts_v5 RENAME TO alerts;
+CREATE INDEX alerts_created ON alerts (created);
+CREATE TABLE profiles (
+    key TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    app_name TEXT NOT NULL,
+    first_data INTEGER NOT NULL,
+    learned_since INTEGER NOT NULL,
+    last_data INTEGER NOT NULL,
+    active_days INTEGER NOT NULL DEFAULT 0,
+    last_active_day INTEGER,
+    last_sha256 TEXT,
+    last_publisher TEXT,
+    goes_anywhere TEXT NOT NULL DEFAULT 'auto' CHECK (goes_anywhere IN ('auto', 'user_on', 'user_off')),
+    reset_at INTEGER
+) STRICT;
+CREATE TABLE profile_items (
+    key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('domain', 'company', 'country', 'port')),
+    value TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    seen_on_day INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('learned', 'allowed', 'pending')),
+    PRIMARY KEY (key, kind, value)
+) STRICT;
+CREATE TABLE profile_hours (
+    key TEXT NOT NULL,
+    hour INTEGER NOT NULL,
+    bytes_sent INTEGER NOT NULL,
+    bytes_received INTEGER NOT NULL,
+    connections INTEGER NOT NULL,
+    PRIMARY KEY (key, hour)
+) STRICT;
+UPDATE meta SET value = '5' WHERE key = 'schema_version';
+COMMIT;
+";
 
 /// Schema version 4 (Whereabouts 0.2): alerts, and what the user said is
 /// fine.
@@ -1473,6 +1625,7 @@ mod tests {
             app_path: Some(String::from(app)),
             target: Some(String::from("ads.example")),
             detail: Some(String::from("Example Ads")),
+            reasons: Vec::new(),
         }
     }
 
@@ -1528,6 +1681,7 @@ mod tests {
             app_path: None,
             target: None,
             detail: None,
+            reasons: Vec::new(),
         };
         store.add_alert(&serious, at(5)).unwrap().unwrap();
         let top = store.alerts(at(0), 3).unwrap();
@@ -1602,7 +1756,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         store
             .add_rule(
                 &RuleTarget::App {
@@ -1918,5 +2072,188 @@ mod tests {
     #[test]
     fn keys_are_never_printed() {
         assert_eq!(format!("{:?}", key(7)), "Key(<hidden>)");
+    }
+
+    fn behaviour_alert(reasons: Vec<Reason>) -> NewAlert {
+        NewAlert {
+            key: String::from("behaviour|c:\\a.exe|1"),
+            allow_key: None,
+            kind: AlertKind::Behaviour,
+            severity: Severity::Medium,
+            app_name: Some(String::from("a.exe")),
+            app_path: Some(String::from(r"C:\a.exe")),
+            target: None,
+            detail: None,
+            reasons,
+        }
+    }
+
+    fn country(code: &str) -> Reason {
+        Reason {
+            signal: Signal::NewCountry,
+            value: Some(code.to_owned()),
+            observed: None,
+            usual: None,
+            count: None,
+        }
+    }
+
+    #[test]
+    fn v4_alerts_survive_v5_migration() {
+        let path = temp_db("v4-to-v5");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", key(3).sqlcipher_literal())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;",
+            )
+            .unwrap();
+            for schema in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO alerts (key, allow_key, created, kind, severity, app_name, \
+                 app_path, target, detail, dismissed) VALUES ('k', 'ak', 5000, 'tracker', \
+                 'info', 'a.exe', 'c:\\a.exe', 'ads.example', 'Example Ads', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path, &key(3)).unwrap();
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
+        let alerts = store.alerts(UNIX_EPOCH, 10).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, AlertKind::Tracker);
+        assert_eq!(alerts[0].severity, Severity::Info);
+        assert!(alerts[0].dismissed);
+        assert!(alerts[0].can_allow);
+        assert!(alerts[0].reasons.is_empty());
+        assert_eq!(alerts[0].seen_again, 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn behaviour_alert_round_trips_reasons() {
+        let path = temp_db("behaviour-alert");
+        let mut store = Store::open(&path, &key(4)).unwrap();
+        let reasons = vec![country("RU")];
+        store
+            .add_alert(&behaviour_alert(reasons.clone()), at(10))
+            .unwrap()
+            .unwrap();
+        let alerts = store.alerts(UNIX_EPOCH, 10).unwrap();
+        assert_eq!(alerts[0].kind, AlertKind::Behaviour);
+        assert_eq!(alerts[0].reasons, reasons);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn update_alert_merges_reasons_and_keeps_higher_severity() {
+        let path = temp_db("update-alert");
+        let mut store = Store::open(&path, &key(6)).unwrap();
+        let id = store
+            .add_alert(&behaviour_alert(vec![country("RU")]), at(10))
+            .unwrap()
+            .unwrap();
+        let spike = Reason {
+            signal: Signal::UploadSpike,
+            value: None,
+            observed: Some(3.4e8),
+            usual: Some(5e6),
+            count: None,
+        };
+        assert!(
+            store
+                .update_alert(id, &[spike], Severity::High, 2, at(20))
+                .unwrap()
+        );
+        let alert = &store.alerts(UNIX_EPOCH, 10).unwrap()[0];
+        assert_eq!(alert.reasons.len(), 2);
+        assert_eq!(alert.severity, Severity::High);
+        assert_eq!(alert.seen_again, 2);
+        assert!(
+            store
+                .update_alert(id, &[country("RU")], Severity::Medium, 3, at(30))
+                .unwrap()
+        );
+        let alert = &store.alerts(UNIX_EPOCH, 10).unwrap()[0];
+        assert_eq!(alert.reasons.len(), 2);
+        assert_eq!(alert.severity, Severity::High);
+        assert_eq!(alert.seen_again, 3);
+        assert!(
+            !store
+                .update_alert(999, &[], Severity::Info, 0, at(40))
+                .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unreadable_or_oversized_reasons_are_handled() {
+        let path = temp_db("reason-edges");
+        let mut store = Store::open(&path, &key(8)).unwrap();
+        let long = Reason {
+            value: Some("a".repeat(400)),
+            ..country("RU")
+        };
+        let id = store
+            .add_alert(&behaviour_alert(vec![long]), at(10))
+            .unwrap()
+            .unwrap();
+        let alert = &store.alerts(UNIX_EPOCH, 10).unwrap()[0];
+        assert_eq!(
+            alert.reasons[0].value.as_ref().map(|v| v.chars().count()),
+            Some(REASON_VALUE_MAX_CHARS)
+        );
+        store
+            .conn
+            .execute("UPDATE alerts SET reasons = 'not json' WHERE id = ?1", [id])
+            .unwrap();
+        assert!(store.alerts(UNIX_EPOCH, 10).unwrap()[0].reasons.is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn wipe_clears_profiles_but_delete_history_keeps_them() {
+        let path = temp_db("wipe-profiles");
+        let mut store = Store::open(&path, &key(2)).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO profiles (key, path, app_name, first_data, learned_since, last_data) \
+                 VALUES ('c:\\a.exe', 'C:\\a.exe', 'a.exe', 1, 1, 1); \
+                 INSERT INTO profile_items (key, kind, value, first_seen, last_seen, seen_on_day, state) \
+                 VALUES ('c:\\a.exe', 'domain', 'example.com', 1, 1, 1, 'learned'); \
+                 INSERT INTO profile_hours (key, hour, bytes_sent, bytes_received, connections) \
+                 VALUES ('c:\\a.exe', 1, 1, 1, 1);",
+            )
+            .unwrap();
+        let counts = |store: &Store| -> Vec<i64> {
+            ["profiles", "profile_items", "profile_hours"]
+                .iter()
+                .map(|table| {
+                    store
+                        .conn
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap()
+                })
+                .collect()
+        };
+        store.delete_history().unwrap();
+        assert_eq!(counts(&store), vec![1, 1, 1]);
+        store.wipe().unwrap();
+        assert_eq!(counts(&store), vec![0, 0, 0]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

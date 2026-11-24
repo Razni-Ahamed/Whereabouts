@@ -29,6 +29,10 @@ pub fn kind_view(kind: AlertKind) -> whereabouts_ipc::AlertKind {
         AlertKind::BadNetwork => whereabouts_ipc::AlertKind::BadNetwork,
         AlertKind::FakedDns => whereabouts_ipc::AlertKind::FakedDns,
         AlertKind::Unattributed => whereabouts_ipc::AlertKind::Unattributed,
+        // Nothing raises behaviour alerts yet, and clients have no kind for
+        // them until the IPC changes of v0.3 land; show them as the
+        // closest existing kind meanwhile.
+        AlertKind::Behaviour => whereabouts_ipc::AlertKind::Unattributed,
     }
 }
 

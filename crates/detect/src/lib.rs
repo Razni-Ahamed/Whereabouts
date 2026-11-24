@@ -45,7 +45,7 @@ pub struct FlowFacts<'a> {
 }
 
 /// A saved alert worth telling the user about now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Raised {
     pub id: i64,
     pub alert: NewAlert,
@@ -163,6 +163,7 @@ impl Detector {
                 app_name: Some(flow.app.to_owned()),
                 app_path: flow.path.map(str::to_owned),
                 target: Some(ip.to_string()),
+                reasons: Vec::new(),
                 detail: Some(format!("{} ({})", entry.cidr, entry.sblid)),
             };
             if let Some(raised) = save(&mut self.errors, store, alert, now) {
@@ -195,6 +196,7 @@ impl Detector {
                     severity: Severity::Info,
                     app_name: Some(flow.app.to_owned()),
                     app_path: flow.path.map(str::to_owned),
+                    reasons: Vec::new(),
                     detail: Some(match hidden_behind {
                         Some(name) => format!("{who}, hidden behind {name}"),
                         None => who,
@@ -229,6 +231,7 @@ impl Detector {
                 app_name: None,
                 app_path: None,
                 target: None,
+                reasons: Vec::new(),
                 detail: Some(format!("{new} events")),
             };
             raised.extend(save(&mut self.errors, store, alert, now));
@@ -244,6 +247,7 @@ impl Detector {
                 app_name: None,
                 app_path: None,
                 target: None,
+                reasons: Vec::new(),
                 detail: Some(format!("{new} events")),
             };
             raised.extend(save(&mut self.errors, store, alert, now));
