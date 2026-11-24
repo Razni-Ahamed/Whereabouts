@@ -168,7 +168,8 @@ pub fn ratio_flip(profile: &Profile, hour_sent: u64, hour_received: u64) -> Opti
 }
 
 /// Traffic in a local hour the app is almost never active in. The reason's
-/// value is the hour as two digits.
+/// value is the hour as two digits. `local_hour` must be derived from the
+/// same `local_offset_secs`.
 pub fn unusual_time(profile: &Profile, local_hour: u8, local_offset_secs: i32) -> Option<Reason> {
     if profile.hourly_sent().len() < UPLOAD_MIN_HOURS {
         return None;
@@ -183,9 +184,11 @@ pub fn unusual_time(profile: &Profile, local_hour: u8, local_offset_secs: i32) -
     })
 }
 
-/// A domain whose name looks machine-generated. The name is judged without
-/// its public suffix (or by its first label if nothing else is left); known
-/// trackers and companies are skipped.
+/// A domain with a label that looks machine-generated. Each label left of
+/// the public suffix is judged on its own (dots do not count), and any one
+/// label of enough length and entropy is enough. If no label is left of the
+/// suffix, the first label is judged. Known trackers and companies are
+/// skipped. The reason's value is the whole domain.
 pub fn random_name(domain: &str, enricher: &Enricher) -> Option<Reason> {
     let name = domain.trim_end_matches('.').to_ascii_lowercase();
     let info = enricher.domain(&name);
@@ -197,23 +200,33 @@ pub fn random_name(domain: &str, enricher: &Enricher) -> Option<Reason> {
         .as_deref()
         .and_then(|registrable| registrable.split_once('.'))
         .map(|(_, suffix)| suffix);
-    let label = suffix
+    let rest = suffix
         .and_then(|suffix| name.strip_suffix(suffix))
-        .map(|rest| rest.trim_end_matches('.'))
-        .filter(|rest| !rest.is_empty())
-        .or_else(|| name.split('.').next())?;
-    let entropy = shannon_entropy(label);
-    (label.chars().count() >= RANDOM_NAME_MIN_LEN && entropy >= RANDOM_NAME_ENTROPY).then(|| {
-        Reason {
-            value: Some(name.clone()),
-            observed: Some(entropy),
-            ..reason(Signal::RandomName)
-        }
+        .map_or("", |rest| rest.trim_end_matches('.'));
+    let rest = if rest.is_empty() {
+        name.split('.').next().unwrap_or("")
+    } else {
+        rest
+    };
+    let entropy = rest
+        .split('.')
+        .filter(|label| label.chars().count() >= RANDOM_NAME_MIN_LEN)
+        .map(shannon_entropy)
+        .filter(|&entropy| entropy >= RANDOM_NAME_ENTROPY)
+        .fold(None, |best: Option<f64>, e| {
+            Some(best.map_or(e, |b| b.max(e)))
+        })?;
+    Some(Reason {
+        value: Some(name),
+        observed: Some(entropy),
+        ..reason(Signal::RandomName)
     })
 }
 
-/// The program file changed, it is now unsigned or from another publisher,
-/// and it contacts something new. Never fires when the profile has no file
+/// The program file changed, it lost a signature it had (the profile stored
+/// a publisher, it is now unsigned or invalid) or is signed by another
+/// publisher, and it contacts something new. An app that was never signed
+/// does not fire on being unsigned. Never fires when the profile has no file
 /// hash to compare with yet.
 pub fn binary_changed(
     profile: &Profile,
@@ -228,7 +241,8 @@ pub fn binary_changed(
         return None;
     }
     let publisher_differs = publisher != row.last_publisher.as_deref();
-    (!signature_valid || publisher_differs).then(|| reason(Signal::BinaryChanged))
+    let lost_signature = !signature_valid && row.last_publisher.is_some();
+    (lost_signature || publisher_differs).then(|| reason(Signal::BinaryChanged))
 }
 
 #[cfg(test)]
@@ -426,14 +440,41 @@ mod tests {
     #[test]
     fn random_name_flags_noise_not_words() {
         let e = enricher();
-        let r = random_name("x7kq9zp2vt.example.net", &e).unwrap();
+        let r = random_name("x7kq9zp2vtmw4.example.net", &e).unwrap();
         assert_eq!(r.signal, Signal::RandomName);
-        assert_eq!(r.value.as_deref(), Some("x7kq9zp2vt.example.net"));
+        assert_eq!(r.value.as_deref(), Some("x7kq9zp2vtmw4.example.net"));
         assert!(random_name("wikipedia.org", &e).is_none());
         assert!(random_name("cdn-akamai.net", &e).is_none());
         // Short names are never flagged; known trackers are skipped.
         assert!(random_name("x7kq9z.com", &e).is_none());
+        // Ordinary multi-label names are not noise.
+        for name in [
+            "static.cdn.someshop.com",
+            "update.fabrikam.com",
+            "d1a2b3c4.cloudfront.net",
+        ] {
+            assert!(random_name(name, &e).is_none(), "{name}");
+        }
+        // One random label is enough, wherever it sits.
+        assert!(random_name("x7kq9zp2vtmw4.static.cdn.someshop.com", &e).is_some());
+        // A name with no label left of the suffix uses its first label.
+        assert!(random_name("co.uk", &e).is_none());
         assert!(random_name("tracker-abcdefgh7.net", &e).is_none());
+    }
+
+    #[test]
+    fn random_name_skips_known_companies() {
+        let e = Enricher::from_parts(
+            TrackerList::parse(""),
+            CompanyList::parse(
+                "known.example	Known Co	ads
+",
+            )
+            .unwrap(),
+            GeoDatabases::default(),
+        );
+        assert!(random_name("x7kq9zp2vtmw4.known.example", &e).is_none());
+        assert!(random_name("x7kq9zp2vtmw4.other.example", &e).is_some());
     }
 
     #[test]
@@ -449,6 +490,10 @@ mod tests {
         let r = binary_changed(&p, Some("bbbb"), None, false, true).unwrap();
         assert_eq!(r.signal, Signal::BinaryChanged);
         assert!(binary_changed(&p, Some("bbbb"), Some("Evil Ltd"), true, true).is_some());
+        // An app that was never signed is not "losing" a signature.
+        let mut unsigned = profile_with(vec![], vec![]);
+        unsigned.stored.row.last_publisher = None;
+        assert!(binary_changed(&unsigned, Some("bbbb"), None, false, true).is_none());
         // Unknown hash now, or none stored yet: nothing to compare.
         assert!(binary_changed(&p, None, None, false, true).is_none());
         let mut fresh = profile_with(vec![], vec![]);
