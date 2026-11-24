@@ -22,8 +22,6 @@ const MAX_TIMES: usize = 64;
 struct Pair {
     /// `(time in seconds, bytes)` of each connection, oldest first.
     connections: Vec<(u64, u64)>,
-    /// Sum of the bytes in `connections`.
-    bytes: u64,
     /// When the pair was last recorded (a tick counter, for eviction).
     last_used: u64,
 }
@@ -39,8 +37,6 @@ impl Pair {
             .partition_point(|&(time, _)| time.saturating_add(BEACON_WINDOW) < newest);
         let excess = self.connections.len().saturating_sub(MAX_TIMES);
         let drop = outside.max(excess);
-        let dropped: u64 = self.connections[..drop].iter().map(|&(_, b)| b).sum();
-        self.bytes = self.bytes.saturating_sub(dropped);
         self.connections.drain(..drop);
     }
 }
@@ -56,8 +52,9 @@ pub struct BeaconTracker {
 impl BeaconTracker {
     /// Records `count` connections to `destination` at `at_secs` that moved
     /// `bytes` in total. Several connections in one tick share one time, so
-    /// they cannot form a pattern on their own. A record older than the
-    /// newest one held by more than [`BEACON_WINDOW`] is ignored.
+    /// they cannot form a pattern on their own. A record more than
+    /// [`BEACON_WINDOW`] behind the newest one held means the clock went
+    /// back: the pair's history is cleared and starts again from this record.
     pub fn record(
         &mut self,
         app_key: &str,
@@ -70,11 +67,6 @@ impl BeaconTracker {
             return;
         }
         let key = (app_key.to_owned(), destination.to_owned());
-        if let Some(&(newest, _)) = self.pairs.get(&key).and_then(|p| p.connections.last())
-            && at_secs.saturating_add(BEACON_WINDOW) < newest
-        {
-            return;
-        }
         if !self.pairs.contains_key(&key) && self.pairs.len() >= MAX_TRACKED {
             let oldest = self
                 .pairs
@@ -88,18 +80,23 @@ impl BeaconTracker {
         self.tick += 1;
         let pair = self.pairs.entry(key).or_default();
         pair.last_used = self.tick;
+        if let Some(&(newest, _)) = pair.connections.last()
+            && at_secs.saturating_add(BEACON_WINDOW) < newest
+        {
+            pair.connections.clear();
+        }
 
         // Spread the bytes over the connections; the first takes the remainder.
         let share = bytes / u64::from(count);
         let remainder = bytes % u64::from(count);
-        for index in 0..count {
+        // Keeping more than MAX_TIMES copies would only be trimmed again.
+        for index in 0..count.min(MAX_TIMES as u32) {
             let own = share + if index == 0 { remainder } else { 0 };
             // Insert after any entry with the same or an earlier time.
             let at = pair
                 .connections
                 .partition_point(|&(time, _)| time <= at_secs);
             pair.connections.insert(at, (at_secs, own));
-            pair.bytes = pair.bytes.saturating_add(own);
         }
         pair.trim();
     }
@@ -142,7 +139,7 @@ fn beacon_gap(connections: &[(u64, u64)]) -> Option<f64> {
     }
     let gaps: Vec<u64> = connections
         .windows(2)
-        .map(|pair| pair[1].0 - pair[0].0)
+        .map(|pair| pair[1].0.saturating_sub(pair[0].0))
         .collect();
     if gaps
         .iter()
@@ -224,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_and_stale_records_are_handled() {
+    fn out_of_order_records_are_sorted_and_far_earlier_ones_restart() {
         let mut tracker = BeaconTracker::default();
         for time in [
             T0,
@@ -238,23 +235,48 @@ mod tests {
             tracker.record("app", "c2.example", time, 1, 500);
         }
         assert_eq!(tracker.check("app", "c2.example").unwrap().count, Some(7));
-        // Far older than the newest time: ignored.
+        // Far behind the newest time: the clock went back, so start again.
         tracker.record("app", "c2.example", T0 - BEACON_WINDOW, 1, 500);
-        assert_eq!(tracker.check("app", "c2.example").unwrap().count, Some(7));
+        assert!(tracker.check("app", "c2.example").is_none());
+        assert_eq!(pair(&tracker, "c2.example").connections.len(), 1);
     }
 
     #[test]
     fn old_times_and_bytes_age_out() {
         let mut tracker = BeaconTracker::default();
-        tracker.record("app", "d", T0, 1, 1_000_000);
-        tracker.record("app", "d", T0 + BEACON_WINDOW + 1, 1, 10);
-        assert_eq!(pair(&tracker, "d").connections.len(), 1);
-        assert_eq!(pair(&tracker, "d").bytes, 10);
+        // A big early transfer leaves the window and stops counting.
+        tracker.record("app", "d", T0, 1, 10_000_000);
+        for i in 0..7 {
+            tracker.record("app", "d", T0 + BEACON_WINDOW + 1 + i * 60, 1, 10);
+        }
+        assert_eq!(pair(&tracker, "d").connections.len(), 7);
+        assert!(tracker.check("app", "d").is_some());
         for i in 0..100 {
-            tracker.record("app", "d", T0 + BEACON_WINDOW + 2 + i, 1, 1);
+            tracker.record("app", "d", T0 + BEACON_WINDOW + 500 + i, 1, 1);
         }
         assert_eq!(pair(&tracker, "d").connections.len(), MAX_TIMES);
-        assert_eq!(pair(&tracker, "d").bytes, MAX_TIMES as u64);
+    }
+
+    #[test]
+    fn huge_count_stays_bounded() {
+        let mut tracker = BeaconTracker::default();
+        tracker.record("app", "d", T0, 1_000_000, 5_000);
+        assert_eq!(pair(&tracker, "d").connections.len(), MAX_TIMES);
+    }
+
+    #[test]
+    fn clock_going_back_starts_the_pair_again() {
+        let mut tracker = BeaconTracker::default();
+        feed(&mut tracker, &[60; 7], 500);
+        assert!(tracker.check("app", "c2.example").is_some());
+        // The clock jumps back 5 hours; a new steady pattern follows.
+        let mut at = T0 - 5 * 3600;
+        for _ in 0..8 {
+            tracker.record("app", "c2.example", at, 1, 500);
+            at += 60;
+        }
+        let reason = tracker.check("app", "c2.example").unwrap();
+        assert_eq!(reason.count, Some(8));
     }
 
     #[test]
