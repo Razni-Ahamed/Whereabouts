@@ -12,7 +12,7 @@ use whereabouts_ipc::{
     DomainTrust, FlowView, PIPE_NAME, Request, Response, RuleSpec, RuleView, Status,
 };
 
-use crate::console::{format_bytes, marked, truncate};
+use crate::console::{folder_lines, format_bytes, marked, truncate};
 
 /// Flows shown by `--status`.
 const SHOW_FLOWS: u32 = 10;
@@ -107,7 +107,13 @@ fn show_status(name: &str) -> Result<(), String> {
                 "{:<24} {:<26} {:>6} {:>13} {:>10} {:>10}",
                 "APP", "PUBLISHER", "FLOWS", "DESTINATIONS", "SENT", "RECEIVED"
             );
-            for app in apps {
+            let folders = folder_lines(
+                &apps
+                    .iter()
+                    .map(|app| (app.app.as_str(), app.path.as_deref()))
+                    .collect::<Vec<_>>(),
+            );
+            for (app, folder) in apps.iter().zip(folders) {
                 println!(
                     "{:<24} {:<26} {:>6} {:>13} {:>10} {:>10}",
                     truncate(&app.app, 24),
@@ -117,6 +123,9 @@ fn show_status(name: &str) -> Result<(), String> {
                     format_bytes(app.bytes_sent),
                     format_bytes(app.bytes_received)
                 );
+                if let Some(folder) = folder {
+                    println!("{folder}");
+                }
             }
         }
         // History may be unavailable (e.g. not saving); still a success.

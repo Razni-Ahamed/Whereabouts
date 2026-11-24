@@ -1427,6 +1427,29 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     }
 }
 
+/// For each row of an app table, given as (file name, full path if known):
+/// when another row has the same file name (ignoring case), a line to print
+/// under the row naming its folder, so programs that share a name can be told
+/// apart. Invisible characters in the folder are shown as `?`.
+pub(crate) fn folder_lines(apps: &[(&str, Option<&str>)]) -> Vec<Option<String>> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (name, _) in apps {
+        *counts.entry(name.to_lowercase()).or_default() += 1;
+    }
+    apps.iter()
+        .map(|&(name, path)| {
+            if counts.get(&name.to_lowercase()).copied().unwrap_or(0) < 2 {
+                return None;
+            }
+            let folder = match path {
+                Some(path) => path.rsplit_once('\\').map_or(path, |(folder, _)| folder),
+                None => "(folder not saved)",
+            };
+            Some(format!("  in {}", display_safe(folder)))
+        })
+        .collect()
+}
+
 /// Formats a byte count for people, e.g. `1.5 MB`.
 pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
@@ -1791,6 +1814,42 @@ mod tests {
         assert_eq!(file_name(r"C:\Program Files\App\app.exe"), "app.exe");
         assert_eq!(file_name("System"), "System");
         assert_eq!(file_name("/usr/bin/curl"), "curl");
+    }
+
+    #[test]
+    fn apps_that_share_a_name_show_their_folder() {
+        let lines = folder_lines(&[
+            (
+                "chrome.exe",
+                Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            ),
+            (
+                "Chrome.exe",
+                Some(r"C:\Users\me\AppData\Local\Temp\Chrome.exe"),
+            ),
+            ("chrome.exe", None),
+            ("code.exe", Some(r"C:\Apps\code.exe")),
+        ]);
+        assert_eq!(
+            lines,
+            [
+                Some(String::from(
+                    r"  in C:\Program Files\Google\Chrome\Application"
+                )),
+                Some(String::from(r"  in C:\Users\me\AppData\Local\Temp")),
+                Some(String::from("  in (folder not saved)")),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn folder_lines_hide_invisible_characters() {
+        let lines = folder_lines(&[
+            ("a.exe", Some("C:\\Temp\u{202E}exe.\\a.exe")),
+            ("a.exe", None),
+        ]);
+        assert_eq!(lines[0].as_deref(), Some(r"  in C:\Temp?exe."));
     }
 
     #[test]
