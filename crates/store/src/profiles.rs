@@ -1,12 +1,13 @@
 //! Per-app behaviour profiles: what each program normally talks to, and
 //! when. The tables are created by the layout version 5 migration.
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{Store, StoreError, UNIX_EPOCH, clamp, from_unix_ms, to_u64, unix_ms};
+use super::{Store, StoreError, UNIX_EPOCH, clamp, from_unix_ms, known_app_key, to_u64, unix_ms};
 
 /// Most items of one kind (domains, companies, ...) kept per app.
 pub const MAX_ITEMS_PER_KIND: usize = 5_000;
@@ -22,6 +23,8 @@ pub const PROFILE_HOURS_KEPT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const PROFILE_IDLE_LIMIT: Duration = Duration::from_secs(180 * 24 * 60 * 60);
 
 const SECS_PER_HOUR: u64 = 3_600;
+const SECS_PER_HOUR_I64: i64 = 3_600;
+const SECS_PER_DAY: i64 = 86_400;
 
 /// Whether an app is expected to talk to anywhere (a web browser).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +56,7 @@ impl GoesAnywhere {
 }
 
 /// What kind of destination a profile item is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemKind {
     /// A registrable domain.
     Domain,
@@ -241,6 +244,255 @@ fn delete(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result
     Ok(u64::try_from(conn.execute(sql, params)?).unwrap_or(0))
 }
 
+/// Writes a profile's summary line, replacing any earlier one.
+fn write_row(conn: &Connection, row: &ProfileRow) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO profiles ({ROW_COLUMNS}) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        ),
+        params![
+            row.key,
+            row.path,
+            row.app_name,
+            unix_ms(row.first_data),
+            unix_ms(row.learned_since),
+            unix_ms(row.last_data),
+            i64::from(row.active_days),
+            row.last_active_day,
+            row.last_sha256,
+            row.last_publisher,
+            row.goes_anywhere.as_str(),
+            row.reset_at.map(unix_ms),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upserts items and trims each kind to [`MAX_ITEMS_PER_KIND`]; see
+/// [`Store::save_items`].
+fn write_items(conn: &Connection, key: &str, items: &[ProfileItem]) -> Result<(), StoreError> {
+    let mut upsert = conn.prepare_cached(
+        "INSERT INTO profile_items \
+           (key, kind, value, first_seen, last_seen, seen_on_day, state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT (key, kind, value) DO UPDATE SET \
+           first_seen = MIN(first_seen, excluded.first_seen), \
+           last_seen = MAX(last_seen, excluded.last_seen), \
+           seen_on_day = MAX(seen_on_day, excluded.seen_on_day), \
+           state = CASE WHEN state = 'allowed' THEN 'allowed' ELSE excluded.state END",
+    )?;
+    for item in items {
+        upsert.execute(params![
+            key,
+            item.kind.as_str(),
+            item.value,
+            unix_ms(item.first_seen),
+            unix_ms(item.last_seen),
+            i64::from(item.seen_on_day),
+            item.state.as_str(),
+        ])?;
+    }
+    let mut counted =
+        conn.prepare_cached("SELECT COUNT(*) FROM profile_items WHERE key = ?1 AND kind = ?2")?;
+    let mut evict = conn.prepare_cached(
+        "DELETE FROM profile_items WHERE rowid IN ( \
+           SELECT rowid FROM profile_items \
+           WHERE key = ?1 AND kind = ?2 AND state != 'allowed' \
+           ORDER BY last_seen ASC, rowid ASC LIMIT ?3)",
+    )?;
+    for kind in ItemKind::ALL {
+        let total: i64 = counted.query_row(params![key, kind.as_str()], |r| r.get(0))?;
+        let excess = total - clamp(MAX_ITEMS_PER_KIND as u64);
+        if excess > 0 {
+            evict.execute(params![key, kind.as_str(), excess])?;
+        }
+    }
+    Ok(())
+}
+
+/// Adds traffic to the per-hour totals; see [`Store::add_hours`].
+fn write_hours(conn: &Connection, key: &str, hours: &[HourRow]) -> Result<(), StoreError> {
+    let mut add = conn.prepare_cached(
+        "INSERT INTO profile_hours (key, hour, bytes_sent, bytes_received, connections) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (key, hour) DO UPDATE SET \
+           bytes_sent = MIN(bytes_sent + excluded.bytes_sent, 9223372036854775807), \
+           bytes_received = MIN(bytes_received + excluded.bytes_received, 9223372036854775807), \
+           connections = MIN(connections + excluded.connections, 9223372036854775807)",
+    )?;
+    for hour in hours {
+        add.execute(params![
+            key,
+            hour.hour,
+            clamp(hour.bytes_sent),
+            clamp(hour.bytes_received),
+            clamp(hour.connections),
+        ])?;
+    }
+    Ok(())
+}
+
+/// Setting that remembers how far the saved history has been turned into
+/// profiles: the ID of the last flow processed, or `"done"`.
+pub const BACKFILL_SETTING: &str = "profiles_backfilled";
+
+const BACKFILL_DONE: &str = "done";
+
+/// A flow that spans more hours than this is spread over its last hours
+/// only, so a corrupt row cannot make a huge number of hour rows.
+const MAX_SPREAD_HOURS: i64 = 24 * 366;
+
+/// How far [`Store::backfill_profiles`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackfillProgress {
+    /// Flows read in this call (including ones without a program path).
+    pub flows_read: u64,
+    /// Whether every saved flow has now been processed.
+    pub done: bool,
+}
+
+/// The columns of a saved flow that profiles are built from.
+struct SavedFlow {
+    id: i64,
+    path: Option<String>,
+    app_name: String,
+    sha256: Option<String>,
+    publisher: Option<String>,
+    domain: Option<String>,
+    owner: Option<String>,
+    country: Option<String>,
+    port: i64,
+    first_ms: i64,
+    last_ms: i64,
+    sent: u64,
+    received: u64,
+    connections: u64,
+}
+
+/// What a backfill batch has learned about one app so far.
+struct Learning {
+    row: ProfileRow,
+    items: HashMap<(ItemKind, String), ProfileItem>,
+    hours: BTreeMap<i64, HourRow>,
+    /// When the SHA-256 and publisher in `row` were seen.
+    sha_at: Option<SystemTime>,
+    publisher_at: Option<SystemTime>,
+}
+
+impl Learning {
+    fn new(row: ProfileRow) -> Self {
+        let known = Some(row.last_data);
+        Self {
+            sha_at: row.last_sha256.as_ref().and(known),
+            publisher_at: row.last_publisher.as_ref().and(known),
+            row,
+            items: HashMap::new(),
+            hours: BTreeMap::new(),
+        }
+    }
+
+    fn add_flow(&mut self, flow: &SavedFlow, local_offset_secs: i32) {
+        let first = from_unix_ms(flow.first_ms);
+        let last = from_unix_ms(flow.last_ms);
+        let row = &mut self.row;
+        row.first_data = row.first_data.min(first);
+        row.learned_since = row.learned_since.min(first);
+        row.last_data = row.last_data.max(last);
+        if let Some(sha) = &flow.sha256
+            && self.sha_at.is_none_or(|at| last >= at)
+        {
+            row.last_sha256 = Some(sha.clone());
+            self.sha_at = Some(last);
+        }
+        if let Some(publisher) = &flow.publisher
+            && self.publisher_at.is_none_or(|at| last >= at)
+        {
+            row.last_publisher = Some(publisher.clone());
+            self.publisher_at = Some(last);
+        }
+
+        // A day only counts when it is later than the last one counted.
+        let day = (flow.first_ms.div_euclid(1_000) + i64::from(local_offset_secs))
+            .div_euclid(SECS_PER_DAY);
+        if row.last_active_day.is_none_or(|seen| day > seen) {
+            row.active_days = row.active_days.saturating_add(1);
+            row.last_active_day = Some(day);
+        }
+        let seen_on_day = row.active_days;
+
+        let port = flow.port.to_string();
+        let values = [
+            (ItemKind::Domain, flow.domain.as_deref()),
+            (ItemKind::Company, flow.owner.as_deref()),
+            (ItemKind::Country, flow.country.as_deref()),
+            (ItemKind::Port, Some(port.as_str())),
+        ];
+        for (kind, value) in values {
+            let Some(value) = value.filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            let item = self
+                .items
+                .entry((kind, value.to_owned()))
+                .or_insert_with(|| ProfileItem {
+                    kind,
+                    value: value.to_owned(),
+                    first_seen: first,
+                    last_seen: last,
+                    seen_on_day,
+                    state: ItemState::Learned,
+                });
+            item.first_seen = item.first_seen.min(first);
+            item.last_seen = item.last_seen.max(last);
+            item.seen_on_day = item.seen_on_day.max(seen_on_day);
+        }
+
+        self.spread_over_hours(flow);
+    }
+
+    /// Splits the flow's traffic evenly over the UTC hours it covers; the
+    /// last hour gets the remainder so the totals stay exact.
+    fn spread_over_hours(&mut self, flow: &SavedFlow) {
+        let hour_of = |ms: i64| ms.div_euclid(1_000).div_euclid(SECS_PER_HOUR_I64);
+        let last_hour = hour_of(flow.last_ms.max(flow.first_ms));
+        let first_hour = hour_of(flow.first_ms).max(last_hour - MAX_SPREAD_HOURS + 1);
+        let count = u64::try_from(last_hour - first_hour + 1).unwrap_or(1);
+        for (index, hour) in (first_hour..=last_hour).enumerate() {
+            let is_last = index as u64 + 1 == count;
+            let share = |total: u64| total / count + if is_last { total % count } else { 0 };
+            let row = self.hours.entry(hour).or_insert(HourRow {
+                hour,
+                bytes_sent: 0,
+                bytes_received: 0,
+                connections: 0,
+            });
+            row.bytes_sent = row.bytes_sent.saturating_add(share(flow.sent));
+            row.bytes_received = row.bytes_received.saturating_add(share(flow.received));
+            row.connections = row.connections.saturating_add(share(flow.connections));
+        }
+    }
+}
+
+fn read_flow(row: &Row<'_>) -> rusqlite::Result<SavedFlow> {
+    Ok(SavedFlow {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        app_name: row.get(2)?,
+        sha256: row.get(3)?,
+        publisher: row.get(4)?,
+        domain: row.get(5)?,
+        owner: row.get(6)?,
+        country: row.get(7)?,
+        port: row.get(8)?,
+        first_ms: row.get(9)?,
+        last_ms: row.get(10)?,
+        sent: to_u64(row.get(11)?),
+        received: to_u64(row.get(12)?),
+        connections: to_u64(row.get(13)?),
+    })
+}
+
 impl Store {
     /// Reads one app's whole profile, or `None` if it has none.
     pub fn profile(&self, key: &str) -> Result<Option<StoredProfile>, StoreError> {
@@ -295,26 +547,7 @@ impl Store {
     /// column is written as given.
     pub fn save_profile_row(&mut self, row: &ProfileRow) -> Result<(), StoreError> {
         let transaction = self.conn.transaction()?;
-        transaction.execute(
-            &format!(
-                "INSERT OR REPLACE INTO profiles ({ROW_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-            ),
-            params![
-                row.key,
-                row.path,
-                row.app_name,
-                unix_ms(row.first_data),
-                unix_ms(row.learned_since),
-                unix_ms(row.last_data),
-                i64::from(row.active_days),
-                row.last_active_day,
-                row.last_sha256,
-                row.last_publisher,
-                row.goes_anywhere.as_str(),
-                row.reset_at.map(unix_ms),
-            ],
-        )?;
+        write_row(&transaction, row)?;
         transaction.commit()?;
         Ok(())
     }
@@ -328,44 +561,7 @@ impl Store {
     /// seen longest ago. Allowed items are never dropped.
     pub fn save_items(&mut self, key: &str, items: &[ProfileItem]) -> Result<(), StoreError> {
         let transaction = self.conn.transaction()?;
-        {
-            let mut upsert = transaction.prepare(
-                "INSERT INTO profile_items \
-                   (key, kind, value, first_seen, last_seen, seen_on_day, state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT (key, kind, value) DO UPDATE SET \
-                   first_seen = MIN(first_seen, excluded.first_seen), \
-                   last_seen = MAX(last_seen, excluded.last_seen), \
-                   seen_on_day = MAX(seen_on_day, excluded.seen_on_day), \
-                   state = CASE WHEN state = 'allowed' THEN 'allowed' ELSE excluded.state END",
-            )?;
-            for item in items {
-                upsert.execute(params![
-                    key,
-                    item.kind.as_str(),
-                    item.value,
-                    unix_ms(item.first_seen),
-                    unix_ms(item.last_seen),
-                    i64::from(item.seen_on_day),
-                    item.state.as_str(),
-                ])?;
-            }
-            let mut counted = transaction
-                .prepare("SELECT COUNT(*) FROM profile_items WHERE key = ?1 AND kind = ?2")?;
-            let mut evict = transaction.prepare(
-                "DELETE FROM profile_items WHERE rowid IN ( \
-                   SELECT rowid FROM profile_items \
-                   WHERE key = ?1 AND kind = ?2 AND state != 'allowed' \
-                   ORDER BY last_seen ASC, rowid ASC LIMIT ?3)",
-            )?;
-            for kind in ItemKind::ALL {
-                let total: i64 = counted.query_row(params![key, kind.as_str()], |r| r.get(0))?;
-                let excess = total - clamp(MAX_ITEMS_PER_KIND as u64);
-                if excess > 0 {
-                    evict.execute(params![key, kind.as_str(), excess])?;
-                }
-            }
-        }
+        write_items(&transaction, key, items)?;
         transaction.commit()?;
         Ok(())
     }
@@ -374,25 +570,7 @@ impl Store {
     /// replaced).
     pub fn add_hours(&mut self, key: &str, hours: &[HourRow]) -> Result<(), StoreError> {
         let transaction = self.conn.transaction()?;
-        {
-            let mut add = transaction.prepare(
-                "INSERT INTO profile_hours (key, hour, bytes_sent, bytes_received, connections) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (key, hour) DO UPDATE SET \
-                   bytes_sent = MIN(bytes_sent + excluded.bytes_sent, 9223372036854775807), \
-                   bytes_received = MIN(bytes_received + excluded.bytes_received, 9223372036854775807), \
-                   connections = MIN(connections + excluded.connections, 9223372036854775807)",
-            )?;
-            for hour in hours {
-                add.execute(params![
-                    key,
-                    hour.hour,
-                    clamp(hour.bytes_sent),
-                    clamp(hour.bytes_received),
-                    clamp(hour.connections),
-                ])?;
-            }
-        }
+        write_hours(&transaction, key, hours)?;
         transaction.commit()?;
         Ok(())
     }
@@ -500,6 +678,101 @@ impl Store {
 
         transaction.commit()?;
         Ok(expiry)
+    }
+
+    /// Builds profiles from the saved flows, a batch at a time, so the first
+    /// start after an upgrade can learn from the history without a long
+    /// stall. Call it until it reports `done`. Each call reads up to `batch`
+    /// flows after the last one processed and saves the profile changes and
+    /// its place in one transaction, so an interrupted call is not counted
+    /// twice. Flows without a program path are skipped. `local_offset_secs`
+    /// is the local time zone's offset from UTC, used to count active days.
+    pub fn backfill_profiles(
+        &mut self,
+        batch: usize,
+        local_offset_secs: i32,
+    ) -> Result<BackfillProgress, StoreError> {
+        let after = match self.setting(BACKFILL_SETTING)?.as_deref() {
+            Some(BACKFILL_DONE) => {
+                return Ok(BackfillProgress {
+                    flows_read: 0,
+                    done: true,
+                });
+            }
+            Some(text) => text.parse::<i64>().map_err(|_| bad_value(0, text))?,
+            None => 0,
+        };
+        let batch = batch.max(1);
+
+        let transaction = self.conn.transaction()?;
+        let flows = transaction
+            .prepare(
+                "SELECT id, app_path, app_name, app_sha256, publisher, domain, owner, country, \
+                        remote_port, first_seen, last_seen, bytes_sent, bytes_received, \
+                        connections \
+                 FROM flows WHERE id > ?1 ORDER BY id LIMIT ?2",
+            )?
+            .query_map(params![after, clamp(batch as u64)], read_flow)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut apps: BTreeMap<String, Learning> = BTreeMap::new();
+        for flow in &flows {
+            let Some(path) = flow.path.as_deref().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let key = known_app_key(path);
+            if !apps.contains_key(&key) {
+                let row = transaction
+                    .query_row(
+                        &format!("SELECT {ROW_COLUMNS} FROM profiles WHERE key = ?1"),
+                        [&key],
+                        read_row,
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| ProfileRow {
+                        key: key.clone(),
+                        path: path.to_owned(),
+                        app_name: flow.app_name.clone(),
+                        first_data: from_unix_ms(flow.first_ms),
+                        learned_since: from_unix_ms(flow.first_ms),
+                        last_data: from_unix_ms(flow.last_ms),
+                        active_days: 0,
+                        last_active_day: None,
+                        last_sha256: None,
+                        last_publisher: None,
+                        goes_anywhere: GoesAnywhere::Auto,
+                        reset_at: None,
+                    });
+                apps.insert(key.clone(), Learning::new(row));
+            }
+            if let Some(app) = apps.get_mut(&key) {
+                app.add_flow(flow, local_offset_secs);
+            }
+        }
+
+        for (key, app) in &apps {
+            write_row(&transaction, &app.row)?;
+            let items: Vec<_> = app.items.values().cloned().collect();
+            write_items(&transaction, key, &items)?;
+            let hours: Vec<_> = app.hours.values().cloned().collect();
+            write_hours(&transaction, key, &hours)?;
+        }
+
+        let done = flows.len() < batch;
+        let progress = match flows.last() {
+            Some(last) if !done => last.id.to_string(),
+            _ => BACKFILL_DONE.to_owned(),
+        };
+        transaction.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![BACKFILL_SETTING, progress],
+        )?;
+        transaction.commit()?;
+        Ok(BackfillProgress {
+            flows_read: flows.len() as u64,
+            done,
+        })
     }
 }
 
@@ -848,5 +1121,183 @@ mod tests {
                 .set_item_state("app", ItemKind::Domain, "nope.example", ItemState::Allowed)
                 .unwrap()
         );
+    }
+
+    const APP: &str = r"C:\A\app.exe";
+    const BASE: u64 = 20_000 * DAY;
+
+    fn flow(
+        path: Option<&str>,
+        domain: &str,
+        first: u64,
+        last: u64,
+        sent: u64,
+    ) -> crate::FlowRecord {
+        crate::FlowRecord {
+            app_name: String::from("app.exe"),
+            app_path: path.map(str::to_owned),
+            app_sha256: None,
+            signature: None,
+            signature_confirmed: false,
+            protocol: whereabouts_core::model::Protocol::Tcp,
+            remote_ip: "203.0.113.5".parse().unwrap(),
+            remote_port: 443,
+            domain: Some(domain.to_owned()),
+            domain_source: None,
+            owner: Some(String::from("X")),
+            country: Some(String::from("US")),
+            first_seen: at(first),
+            last_seen: at(last),
+            bytes_sent: sent,
+            bytes_received: sent * 2,
+            connections: 3,
+        }
+    }
+
+    #[test]
+    fn backfill_builds_profile_from_flows() {
+        let mut store = store("backfill-builds");
+        let mut second = flow(Some(APP), "b.com", BASE + 5 * DAY, BASE + 5 * DAY, 10);
+        second.country = Some(String::from("DE"));
+        store
+            .insert_flows(&[
+                flow(Some(APP), "a.com", BASE + 100, BASE + 200, 10),
+                second,
+                flow(Some(APP), "a.com", BASE + 10 * DAY, BASE + 10 * DAY, 10),
+                flow(None, "z.com", BASE + 300, BASE + 400, 10),
+            ])
+            .unwrap();
+
+        let progress = store.backfill_profiles(1_000, 0).unwrap();
+        assert!(progress.done);
+        assert_eq!(progress.flows_read, 4);
+
+        let rows = store.profile_rows().unwrap();
+        assert_eq!(rows.len(), 1, "no profile for the flow without a path");
+        let profile = store.profile(&crate::known_app_key(APP)).unwrap().unwrap();
+        assert_eq!(profile.row.learned_since, at(BASE + 100));
+        assert_eq!(profile.row.first_data, at(BASE + 100));
+        assert_eq!(profile.row.last_data, at(BASE + 10 * DAY));
+        assert_eq!(profile.row.active_days, 3);
+        let of = |kind| {
+            profile
+                .items
+                .iter()
+                .filter(|i| i.kind == kind)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(of(ItemKind::Domain).len(), 2);
+        assert_eq!(of(ItemKind::Company).len(), 1);
+        assert_eq!(of(ItemKind::Country).len(), 2);
+        assert_eq!(of(ItemKind::Port)[0].value, "443");
+        assert!(profile.items.iter().all(|i| i.state == ItemState::Learned));
+        let a = of(ItemKind::Domain)[0];
+        assert_eq!((a.value.as_str(), a.seen_on_day), ("a.com", 3));
+        assert_eq!(a.first_seen, at(BASE + 100));
+    }
+
+    #[test]
+    fn backfill_spreads_bytes_over_hours() {
+        let mut store = store("backfill-hours");
+        let first = BASE + 10 * 3_600;
+        let last = BASE + 12 * 3_600 + 3_599;
+        store
+            .insert_flows(&[flow(Some(APP), "a.com", first, last, 3_000)])
+            .unwrap();
+        store.backfill_profiles(1_000, 0).unwrap();
+        let hours = store
+            .profile(&crate::known_app_key(APP))
+            .unwrap()
+            .unwrap()
+            .hours;
+        let first_hour = i64::try_from(first / 3_600).unwrap();
+        assert_eq!(
+            hours.iter().map(|h| h.hour).collect::<Vec<_>>(),
+            vec![first_hour, first_hour + 1, first_hour + 2]
+        );
+        assert!(hours.iter().all(|h| h.bytes_sent == 1_000));
+        assert!(hours.iter().all(|h| h.bytes_received == 2_000));
+        assert!(hours.iter().all(|h| h.connections == 1));
+    }
+
+    #[test]
+    fn backfill_remainder_goes_to_last_hour() {
+        let mut store = store("backfill-remainder");
+        let first = BASE + 10 * 3_600;
+        let last = BASE + 11 * 3_600;
+        store
+            .insert_flows(&[flow(Some(APP), "a.com", first, last, 11)])
+            .unwrap();
+        store.backfill_profiles(1_000, 0).unwrap();
+        let hours = store
+            .profile(&crate::known_app_key(APP))
+            .unwrap()
+            .unwrap()
+            .hours;
+        assert_eq!(
+            hours.iter().map(|h| h.bytes_sent).collect::<Vec<_>>(),
+            [5, 6]
+        );
+        assert_eq!(hours.iter().map(|h| h.connections).sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn backfill_runs_in_batches() {
+        let flows: Vec<_> = (0..25)
+            .map(|i| {
+                let t = BASE + i * 3 * 3_600;
+                flow(Some(APP), &format!("d{}.com", i % 7), t, t + 100, 100 + i)
+            })
+            .collect();
+        let mut batched = store("backfill-batched");
+        batched.insert_flows(&flows).unwrap();
+        let mut whole = store("backfill-whole");
+        whole.insert_flows(&flows).unwrap();
+
+        let done: Vec<bool> = (0..3)
+            .map(|_| batched.backfill_profiles(10, 0).unwrap().done)
+            .collect();
+        assert_eq!(done, [false, false, true]);
+        assert!(whole.backfill_profiles(1_000, 0).unwrap().done);
+
+        let key = crate::known_app_key(APP);
+        assert_eq!(batched.profile(&key).unwrap(), whole.profile(&key).unwrap());
+    }
+
+    #[test]
+    fn backfill_is_not_repeated() {
+        let mut store = store("backfill-once");
+        store
+            .insert_flows(&[flow(Some(APP), "a.com", BASE, BASE + 1, 10)])
+            .unwrap();
+        assert!(store.backfill_profiles(1_000, 0).unwrap().done);
+        let again = store.backfill_profiles(1_000, 0).unwrap();
+        assert_eq!(again.flows_read, 0);
+        assert!(again.done);
+        let key = crate::known_app_key(APP);
+        assert_eq!(
+            store.profile(&key).unwrap().unwrap().hours[0].bytes_sent,
+            10
+        );
+    }
+
+    #[test]
+    fn backfill_counts_days_by_local_time_and_ignores_older_days() {
+        let mut store = store("backfill-days");
+        // At UTC+2, 22:00 and 23:00 UTC are both local day 20_001.
+        let at_hour = |h: u64| BASE + h * 3_600;
+        store
+            .insert_flows(&[
+                flow(Some(APP), "a.com", at_hour(1), at_hour(1), 1),
+                flow(Some(APP), "a.com", at_hour(22), at_hour(22), 1),
+                flow(Some(APP), "a.com", at_hour(23), at_hour(23), 1),
+                // An older day arriving late does not count again.
+                flow(Some(APP), "b.com", at_hour(2), at_hour(2), 1),
+            ])
+            .unwrap();
+        store.backfill_profiles(1_000, 2 * 3_600).unwrap();
+        let profile = store.profile(&crate::known_app_key(APP)).unwrap().unwrap();
+        assert_eq!(profile.row.active_days, 2);
+        assert_eq!(profile.row.last_active_day, Some(20_001));
     }
 }
