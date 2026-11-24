@@ -5,11 +5,10 @@ real NSIS installer over 0.2.0 on Windows 11. Every "Confirmed" finding below wa
 reproduced on that machine, as a **normal (non-admin) user** unless it says otherwise.
 Test rules and test programs were removed afterwards; no saved data was deleted.
 
-> Contains attack steps. Every attack below is fixed in `main` (most re-tested live: see the
-> Status column), but the fixes are not released yet: the steps still work against
-> **Whereabouts 0.2.0 and earlier**. They are listed under Unreleased → Security in
-> `CHANGELOG.md` and ship in the next release. M6 (code signing) is not an attack; it needs a
-> certificate.
+> Contains attack steps. Every attack below is fixed in **Whereabouts 0.2.1** (most re-tested
+> live: see the Status column); the steps still work against **0.2.0 and earlier**, so please
+> update. The fixes are listed under 0.2.1 → Security in `CHANGELOG.md`. M6 (code signing) is
+> not an attack; it needs a certificate.
 
 ## Summary
 
