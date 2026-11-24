@@ -319,8 +319,11 @@ impl Store {
         Ok(())
     }
 
-    /// Saves items: new ones are added, known ones get the new `last_seen`,
-    /// `seen_on_day` and state while keeping the earliest `first_seen`. Then
+    /// Saves items: new ones are added. Known ones merge: the earliest
+    /// `first_seen`, the latest `last_seen` and the highest `seen_on_day`
+    /// win, so a stale copy cannot move an item back in time. The state is
+    /// replaced, except that an `allowed` item stays allowed (only
+    /// [`Store::set_item_state`] changes it). Then
     /// each kind is trimmed to [`MAX_ITEMS_PER_KIND`] by dropping the items
     /// seen longest ago. Allowed items are never dropped.
     pub fn save_items(&mut self, key: &str, items: &[ProfileItem]) -> Result<(), StoreError> {
@@ -332,9 +335,9 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT (key, kind, value) DO UPDATE SET \
                    first_seen = MIN(first_seen, excluded.first_seen), \
-                   last_seen = excluded.last_seen, \
-                   seen_on_day = excluded.seen_on_day, \
-                   state = excluded.state",
+                   last_seen = MAX(last_seen, excluded.last_seen), \
+                   seen_on_day = MAX(seen_on_day, excluded.seen_on_day), \
+                   state = CASE WHEN state = 'allowed' THEN 'allowed' ELSE excluded.state END",
             )?;
             for item in items {
                 upsert.execute(params![
@@ -619,6 +622,32 @@ mod tests {
         assert_eq!(items[0].first_seen, at(1_000));
         assert_eq!(items[0].last_seen, at(5_000));
         assert_eq!(items[0].seen_on_day, 4);
+    }
+
+    #[test]
+    fn allowed_survives_later_saves_and_stale_times_do_not_win() {
+        let mut store = store("sticky");
+        store.save_profile_row(&row("app")).unwrap();
+        let mut allowed = item(ItemKind::Domain, "a.example", 5_000, ItemState::Allowed);
+        allowed.seen_on_day = 4;
+        store.save_items("app", &[allowed]).unwrap();
+        let mut stale = item(ItemKind::Domain, "a.example", 2_000, ItemState::Learned);
+        stale.seen_on_day = 2;
+        store.save_items("app", &[stale]).unwrap();
+
+        let items = store.profile("app").unwrap().unwrap().items;
+        assert_eq!(items[0].state, ItemState::Allowed);
+        assert_eq!(items[0].last_seen, at(5_000));
+        assert_eq!(items[0].seen_on_day, 4);
+
+        // set_item_state is still the way to change it.
+        store
+            .set_item_state("app", ItemKind::Domain, "a.example", ItemState::Learned)
+            .unwrap();
+        assert_eq!(
+            store.profile("app").unwrap().unwrap().items[0].state,
+            ItemState::Learned
+        );
     }
 
     #[test]
