@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use whereabouts_detect::learner::{AppFacts, Finished, Learner};
+use whereabouts_detect::learner::{AppFacts, BINARY_CHANGE_WINDOW, Finished, Learner};
 use whereabouts_detect::meter::Delta;
 use whereabouts_detect::signals::Toggles;
 use whereabouts_enrich::{CompanyList, Enricher, GeoDatabases, TrackerList};
@@ -468,8 +468,7 @@ fn reset_profile_learns_again() {
     // The learner caches the finished profile.
     assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
 
-    assert!(db.reset_profile(&key(), at(T0 + 60)).unwrap());
-    learner.forget(&key());
+    assert!(learner.reset(&mut db, &key(), at(T0 + 60)).unwrap());
 
     let ru = flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), T0 + 120);
     assert!(learner.finished(&ru, &e, &mut db, at(T0 + 120)).is_empty());
@@ -486,5 +485,246 @@ fn reset_profile_learns_again() {
     let day8 = T0 + 8 * DAY;
     let cn = flow(Some("chat.example"), Some("Chat Inc"), Some("CN"), day8);
     assert_eq!(learner.finished(&cn, &e, &mut db, at(day8)).len(), 1);
+    assert!(learner.take_errors().is_empty());
+}
+
+/// The app after its file was swapped for an unsigned one.
+fn unsigned() -> AppFacts<'static> {
+    AppFacts {
+        sha256: Some("bbbb"),
+        publisher: None,
+        signature_valid: false,
+        ..app()
+    }
+}
+
+fn russia(secs: u64) -> Finished<'static> {
+    flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), secs)
+}
+
+fn signals_of(alert: &whereabouts_store::NewAlert) -> Vec<Signal> {
+    alert.reasons.iter().map(|r| r.signal).collect()
+}
+
+#[test]
+fn swapped_program_is_caught_on_its_first_new_destination() {
+    let mut db = TestStore::open("swap");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    // A flow to a known place: nothing, but the file stays suspect.
+    let known = Finished {
+        app: unsigned(),
+        ..usual(T0)
+    };
+    assert!(learner.finished(&known, &e, &mut db, at(T0)).is_empty());
+    let row = db.profile(&key()).unwrap().unwrap().row;
+    assert_eq!(row.last_sha256.as_deref(), Some("bbbb"));
+
+    let ru = Finished {
+        app: unsigned(),
+        ..russia(T0 + HOUR)
+    };
+    let raised = learner.finished(&ru, &e, &mut db, at(T0 + HOUR));
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0].alert.severity, Severity::High);
+    assert_eq!(
+        signals_of(&raised[0].alert),
+        [Signal::NewCountry, Signal::BinaryChanged]
+    );
+
+    // It fired once: the next new destination is only that.
+    let day2 = T0 + DAY;
+    let company = Finished {
+        app: unsigned(),
+        ..flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), day2)
+    };
+    let raised = learner.finished(&company, &e, &mut db, at(day2));
+    assert_eq!(signals_of(&raised[0].alert), [Signal::NewCompany]);
+
+    // A swap older than the window is no longer suspect.
+    let other = AppFacts {
+        sha256: Some("cccc"),
+        publisher: Some("Evil Ltd"),
+        signature_valid: true,
+        ..app()
+    };
+    let day3 = T0 + 3 * DAY;
+    let known = Finished {
+        app: other,
+        ..usual(day3)
+    };
+    assert!(learner.finished(&known, &e, &mut db, at(day3)).is_empty());
+    let later = day3 + BINARY_CHANGE_WINDOW;
+    let cn = Finished {
+        app: other,
+        ..flow(Some("chat.example"), Some("Chat Inc"), Some("CN"), later)
+    };
+    let raised = learner.finished(&cn, &e, &mut db, at(later));
+    assert_eq!(signals_of(&raised[0].alert), [Signal::NewCountry]);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn dismissed_pending_value_raises_a_new_alert() {
+    let mut db = TestStore::open("dismiss");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let id = learner.finished(&russia(T0), &e, &mut db, at(T0))[0].id;
+    assert!(db.dismiss_alert(id, false, at(T0 + 60)).unwrap());
+    learner
+        .alert_closed(&mut db, id, false, at(T0 + 60))
+        .unwrap();
+
+    // Remind me: the next sighting, even the same day, is a new alert.
+    let again = learner.finished(&russia(T0 + 120), &e, &mut db, at(T0 + 120));
+    assert_eq!(again.len(), 1);
+    assert_ne!(again[0].id, id);
+    assert_eq!(signals_of(&again[0].alert), [Signal::NewCountry]);
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Pending)
+    );
+
+    // Later sightings count on the new alert.
+    let secs = T0 + 2 * HOUR;
+    assert!(
+        learner
+            .finished(&russia(secs), &e, &mut db, at(secs))
+            .is_empty()
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 2);
+    let newest = saved.iter().find(|a| a.id == again[0].id).unwrap();
+    assert_eq!(newest.seen_again, 1);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn allowed_pending_value_is_known_in_store_and_cache() {
+    let mut db = TestStore::open("allow");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let id = learner.finished(&russia(T0), &e, &mut db, at(T0))[0].id;
+    assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
+    learner
+        .alert_closed(&mut db, id, true, at(T0 + 60))
+        .unwrap();
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Allowed)
+    );
+
+    let secs = T0 + HOUR;
+    assert!(
+        learner
+            .finished(&russia(secs), &e, &mut db, at(secs))
+            .is_empty()
+    );
+    // The cache knows RU is allowed: a swapped program reaching it is not
+    // new behaviour (a stale "pending" would count as new and fire).
+    let secs = T0 + 2 * HOUR;
+    let swapped = Finished {
+        app: unsigned(),
+        ..russia(secs)
+    };
+    assert!(learner.finished(&swapped, &e, &mut db, at(secs)).is_empty());
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].seen_again, 0);
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Allowed)
+    );
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn reset_drops_traffic_not_yet_written() {
+    let mut db = TestStore::open("reset-hour");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let before = [delta(T0 + 60, "chat.example", 5 * MB, 1)];
+    learner.traffic(&app(), &before, &e, &mut db, at(T0 + 60));
+    assert!(learner.reset(&mut db, &key(), at(T0 + 120)).unwrap());
+    let after = [delta(T0 + 180, "chat.example", 3 * MB, 1)];
+    learner.traffic(&app(), &after, &e, &mut db, at(T0 + 180));
+    learner.flush(&mut db, at(T0 + HOUR)).unwrap();
+    assert!(learner.take_errors().is_empty());
+    let profile = db.profile(&key()).unwrap().unwrap();
+    assert_eq!(profile.row.first_data, at(T0 + 120));
+    assert_eq!(profile.hours.len(), 1);
+    assert_eq!(profile.hours[0].bytes_sent, 3 * MB);
+    assert!(!learner.reset(&mut db, r"c:\nothing.exe", at(T0)).unwrap());
+}
+
+#[test]
+fn goes_anywhere_choice_is_kept_by_the_cache() {
+    let mut db = TestStore::open("goes-anywhere");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
+    assert!(
+        learner
+            .set_goes_anywhere(&mut db, &key(), GoesAnywhere::UserOn)
+            .unwrap()
+    );
+    let new = flow(Some("other.example"), Some("Other Co"), Some("RU"), T0 + 60);
+    assert!(learner.finished(&new, &e, &mut db, at(T0 + 60)).is_empty());
+    assert!(behaviour(&db).is_empty());
+    // The flow saved the cached row; the user's choice is still there.
+    let row = db.profile(&key()).unwrap().unwrap().row;
+    assert_eq!(row.goes_anywhere, GoesAnywhere::UserOn);
+    assert!(
+        !learner
+            .set_goes_anywhere(&mut db, r"c:\nothing.exe", GoesAnywhere::UserOn)
+            .unwrap()
+    );
+    assert!(learner.take_errors().is_empty());
+}
+
+fn set_read_only(path: &std::path::Path, read_only: bool) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_readonly(read_only);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[test]
+fn failed_alert_save_learns_nothing() {
+    let mut db = TestStore::open("read-only");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let path = db.dir.join("t.db");
+    let store_key = Key::from_bytes([9; 32]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    // The learner caches the profile while the store can be written.
+    assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
+
+    drop(db.store.take());
+    set_read_only(&path, true);
+    let failed = Store::open(&path, &store_key)
+        .map(|mut read_only| learner.finished(&russia(T0 + 60), &e, &mut read_only, at(T0 + 60)));
+    set_read_only(&path, false);
+    assert!(failed.unwrap().is_empty());
+    let errors = learner.take_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("could not save an alert")),
+        "{errors:?}"
+    );
+
+    // RU was neither learned nor counted as raised today: the next flow
+    // raises it.
+    db.store = Some(Store::open(&path, &store_key).unwrap());
+    assert_eq!(state(&db, ItemKind::Country, "RU"), None);
+    let raised = learner.finished(&russia(T0 + 120), &e, &mut db, at(T0 + 120));
+    assert_eq!(raised.len(), 1);
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Pending)
+    );
     assert!(learner.take_errors().is_empty());
 }
