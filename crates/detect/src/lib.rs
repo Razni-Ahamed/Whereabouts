@@ -17,6 +17,11 @@
 //! "This is fine" (stored by the store as an allow key) stops alerts for the
 //! same app and tracker, or the same app and listed range.
 
+pub mod browsers;
+pub mod profile;
+
+pub use profile::{LEARNING, Profile};
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
