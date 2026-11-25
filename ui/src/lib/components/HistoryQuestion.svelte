@@ -31,7 +31,7 @@
         <Toggle
           checked={save}
           label="Save connection history"
-          detail="Each connection for 30 days, then hourly totals for 180 days. Needed for the History view, Export and, from version 0.3, learning what is normal for each app."
+          detail="Each connection for 30 days, then hourly totals for 180 days. Needed for the History view and Export. Learning what is normal for each app works either way."
           onchange={(v) => (save = v)}
         />
       </div>

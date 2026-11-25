@@ -160,3 +160,38 @@ export interface Live {
   /** Process IDs that are Whereabouts: the app, its WebView2 helpers, the service. */
   own_pids: number[];
 }
+
+export type GoesAnywhereChoice = 'auto' | 'on' | 'off';
+
+/** One destination in a behaviour profile. */
+export interface ProfileItemView {
+  /** The domain, company or country code. */
+  value: string;
+  /** Seconds since 1970. */
+  last_seen_secs: number;
+  /** learned, allowed (the user said it is fine) or pending (raised an alert). */
+  state: string;
+}
+
+/** What Whereabouts learned is usual for one program. */
+export interface ProfileView {
+  path: string;
+  app: string;
+  /** Still in its first week: no behaviour alerts meanwhile. */
+  learning: boolean;
+  /** Seconds since 1970. */
+  learning_ends_secs: number;
+  /** Seconds since 1970. */
+  learned_since_secs: number;
+  /** Whether new sites, companies and countries are expected of it. */
+  goes_anywhere: boolean;
+  goes_anywhere_choice: GoesAnywhereChoice;
+  recognised_browser: boolean;
+  sites: ProfileItemView[];
+  companies: ProfileItemView[];
+  countries: ProfileItemView[];
+  usual_sent_per_hour: number | null;
+  busiest_sent_per_hour: number | null;
+  /** The share of its active hours in each local hour (24 numbers). */
+  active_hours: number[];
+}

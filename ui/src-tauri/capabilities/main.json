@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "The main window may read live and saved data, export or delete it after the user confirms in a native dialog, block after the user confirms in a native dialog, lift blocks, read and change the app's own settings (start at sign-in, notifications), read alerts, and mark them as fine (stopping warnings about a risky network is confirmed in a native dialog), switch list updates on or off, and switch saving history on or off (turning it off asks in a native dialog whether to keep or delete what is saved). No dialog, file system, shell or network permissions of its own.",
+  "description": "The main window may read live and saved data, export or delete it after the user confirms in a native dialog, block after the user confirms in a native dialog, lift blocks, read and change the app's own settings (start at sign-in, notifications), read alerts, and mark them as fine (stopping warnings about a risky network is confirmed in a native dialog), switch list updates on or off, and switch saving history on or off (turning it off asks in a native dialog whether to keep or delete what is saved), read what was learned about an app, reset it after the user confirms in a native dialog, and say whether an app goes anywhere. No dialog, file system, shell or network permissions of its own.",
   "windows": ["main"],
   "permissions": [
     "allow-live",
@@ -18,6 +18,9 @@
     "allow-dismiss-alert",
     "allow-set-list-updates",
     "allow-check-lists-now",
-    "allow-set-save-history"
+    "allow-set-save-history",
+    "allow-profile",
+    "allow-reset-profile",
+    "allow-set-goes-anywhere"
   ]
 }

@@ -8,7 +8,10 @@
 //! user through native Windows dialogs (where to save; whether to delete);
 //! `add_rule` shows what will be blocked in a native Windows dialog and
 //! blocks only if the user agrees; `remove_rule` and `set_blocking_paused`
-//! lift blocks (the safe direction).
+//! lift blocks (the safe direction). `profile` reads what was learned about
+//! a program; `reset_profile` asks in a native Windows dialog before the
+//! service forgets it; `set_goes_anywhere` only changes what counts as
+//! unusual for one program.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -33,8 +36,8 @@ use tauri_plugin_dialog::{
 use whereabouts_client::{Client, Problem, ProblemKind, unexpected};
 use whereabouts_core::text::display_safe;
 use whereabouts_ipc::{
-    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, MAX_HOURS, MAX_ROWS, PIPE_NAME,
-    Request, Response, RuleSpec, RuleView, Status,
+    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, GoesAnywhereChoice, MAX_HOURS,
+    MAX_ROWS, PIPE_NAME, ProfileView, Request, Response, RuleSpec, RuleView, Status,
 };
 
 /// The service's status and current flows.
@@ -224,7 +227,8 @@ async fn delete_history(
             main_window(&app),
             "Delete everything Whereabouts saved?",
             "All saved connection history and hourly totals will be deleted and overwritten. \
-             This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards.",
+             This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards. \
+             Behaviour profiles are kept. Reset them on the Apps screen, or use Delete everything.",
             "Delete everything",
         );
         if !confirmed {
@@ -407,6 +411,85 @@ async fn set_blocking_paused(
     let connection = Arc::clone(&connection);
     blocking(move || {
         connection.with(|client| ask_rules(client, &Request::SetBlockingPaused { paused }))
+    })
+    .await
+}
+
+/// One program's behaviour profile (`None` if it has none yet).
+#[tauri::command]
+async fn profile(
+    path: String,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Option<ProfileView>, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        connection.with(
+            |client| match client.ask(&Request::Profile { path: path.clone() })? {
+                Response::Profile { profile } => Ok(profile),
+                other => Err(unexpected(&other)),
+            },
+        )
+    })
+    .await
+}
+
+/// Asks the user, in a native Windows dialog, whether to forget what was
+/// learned about a program, and if they agree asks the service to. `false`
+/// if the user said no.
+#[tauri::command]
+async fn reset_profile(
+    path: String,
+    app: tauri::AppHandle,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<bool, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        // The name comes from the path, not from the web view's own words.
+        let name = program_name(&path);
+        // Cancel is the default: Enter must not throw away what was learned.
+        let confirmed = whereabouts_win_dialog::confirm(
+            main_window(&app),
+            "Reset what Whereabouts learned?",
+            &format!(
+                "{name} will start a new 7-day learning period. Until then you'll get no behaviour \
+                 warnings for it."
+            ),
+            "Reset",
+        );
+        if !confirmed {
+            return Ok(false);
+        }
+        connection.with(|client| {
+            match client.ask(&Request::ResetProfile { path: path.clone() })? {
+                Response::ProfileReset {} => Ok(true),
+                other => Err(unexpected(&other)),
+            }
+        })
+    })
+    .await
+}
+
+/// Says whether a program is expected to connect anywhere (a web browser).
+/// Only widens or narrows what counts as unusual for that one program, so
+/// it needs no dialog; the service insists on a trusted client.
+#[tauri::command]
+async fn set_goes_anywhere(
+    path: String,
+    value: GoesAnywhereChoice,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Option<ProfileView>, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        connection.with(|client| {
+            let request = Request::SetGoesAnywhere {
+                path: path.clone(),
+                value,
+            };
+            match client.ask(&request)? {
+                Response::Profile { profile } => Ok(profile),
+                other => Err(unexpected(&other)),
+            }
+        })
     })
     .await
 }
@@ -761,7 +844,10 @@ fn main() {
             dismiss_alert,
             set_list_updates,
             check_lists_now,
-            set_save_history
+            set_save_history,
+            profile,
+            reset_profile,
+            set_goes_anywhere
         ])
         .build(tauri::generate_context!())
         .expect("failed to start the Whereabouts app")

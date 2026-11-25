@@ -186,12 +186,15 @@
         {/key}
         <p class="muted">
           {#if on}
-            Needed for the History view, Export and, from version 0.3, learning what is normal for each app. Turning it
-            off asks whether to keep or delete what is saved.
+            Needed for the History view and Export. Turning it off asks whether to keep or delete what is saved.
           {:else}
-            Live connections, alerts and blocking still work. The History view and Export get nothing new, and from
-            version 0.3 Whereabouts can't learn what is normal for each app without it.
+            Live connections, alerts and blocking still work. The History view and Export get nothing new.
           {/if}
+        </p>
+        <p class="muted">
+          Behaviour profiles are kept even when history is off: which sites, companies and countries each app uses,
+          including your browsers, and hourly totals. Reset one on the Apps screen, or remove them all with Delete
+          everything.
         </p>
       </section>
     {/if}

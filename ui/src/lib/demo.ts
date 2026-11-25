@@ -1,7 +1,20 @@
 // Made-up data, shown only when the UI runs in an ordinary browser (for
 // design work). The desktop app always shows real data from the service.
 
-import type { Added, AlertView, AppTotals, FlowView, ListsView, Live, Problem, Rules, RuleSpec } from './types';
+import type {
+  Added,
+  AlertView,
+  AppTotals,
+  FlowView,
+  GoesAnywhereChoice,
+  ListsView,
+  Live,
+  Problem,
+  ProfileItemView,
+  ProfileView,
+  Rules,
+  RuleSpec,
+} from './types';
 import { appKey } from './apps';
 
 // Demo list updates, kept while the page is open.
@@ -236,4 +249,107 @@ export function demoHistory(): AppTotals[] {
   return [...byApp.values()].sort(
     (a, b) => b.bytes_sent + b.bytes_received - (a.bytes_sent + a.bytes_received),
   );
+}
+
+// Demo behaviour profiles, kept while the page is open.
+const DAY = 86_400;
+const items = (values: string[], state = 'learned'): ProfileItemView[] =>
+  values.map((value, i) => ({ value, last_seen_secs: now() - (i + 1) * 3600, state }));
+const hours = (active: Record<number, number>): number[] =>
+  Array.from({ length: 24 }, (_, h) => active[h] ?? 0);
+
+let demoProfiles: ProfileView[] = [
+  {
+    path: PATHS['chrome.exe'] ?? '',
+    app: 'chrome.exe',
+    learning: false,
+    learning_ends_secs: now() - 20 * DAY,
+    learned_since_secs: now() - 27 * DAY,
+    goes_anywhere: true,
+    goes_anywhere_choice: 'auto',
+    recognised_browser: true,
+    sites: items([
+      'youtube.com', 'google.com', 'github.com', 'wikipedia.org', 'microsoft.com', 'reddit.com',
+      'cloudflare.com', 'stackoverflow.com', 'nytimes.com', 'bbc.co.uk', 'amazon.com',
+    ]),
+    companies: items(['Google LLC', 'Cloudflare', 'Microsoft Corporation', 'Akamai International B.V.']),
+    countries: items(['US', 'IE', 'NL', 'DE', 'GB']),
+    usual_sent_per_hour: 6_400_000,
+    busiest_sent_per_hour: 182_000_000,
+    active_hours: hours({ 8: 0.06, 9: 0.1, 10: 0.11, 11: 0.1, 12: 0.07, 13: 0.09, 14: 0.11, 15: 0.1, 16: 0.08, 20: 0.1, 21: 0.08 }),
+  },
+  {
+    path: PATHS['Spotify.exe'] ?? '',
+    app: 'Spotify.exe',
+    learning: true,
+    learning_ends_secs: now() + 4 * DAY + 3600,
+    learned_since_secs: now() - 3 * DAY + 3600,
+    goes_anywhere: false,
+    goes_anywhere_choice: 'auto',
+    recognised_browser: false,
+    sites: items(['spotifycdn.com', 'spotify.com', 'scdn.co']),
+    companies: items(['Spotify AB', 'Akamai International B.V.']),
+    countries: items(['SE', 'NL']),
+    usual_sent_per_hour: 410_000,
+    busiest_sent_per_hour: 1_900_000,
+    active_hours: hours({ 9: 0.2, 10: 0.2, 17: 0.3, 18: 0.3 }),
+  },
+  {
+    path: PATHS['Discord.exe'] ?? '',
+    app: 'Discord.exe',
+    learning: false,
+    learning_ends_secs: now() - 2 * DAY,
+    learned_since_secs: now() - 9 * DAY,
+    goes_anywhere: false,
+    goes_anywhere_choice: 'off',
+    recognised_browser: false,
+    sites: items(['discord.com', 'discordapp.com', 'sentry.io']),
+    companies: items(['Discord Inc.', 'Cloudflare']),
+    countries: items(['US', 'DE']),
+    usual_sent_per_hour: 2_100_000,
+    busiest_sent_per_hour: 9_800_000,
+    active_hours: hours({ 19: 0.3, 20: 0.4, 21: 0.3 }),
+  },
+];
+
+export function demoProfile(path: string): ProfileView | null {
+  const found = demoProfiles.find((p) => p.path.toLowerCase() === path.toLowerCase());
+  return found ? structuredClone(found) : null;
+}
+
+/** Asks like the native dialog does; if agreed, the profile starts learning again. */
+export function demoResetProfile(path: string, app: string): boolean {
+  if (!window.confirm(`Demo: reset what Whereabouts learned about ${app}? It will start a new 7-day learning period.`)) {
+    return false;
+  }
+  demoProfiles = demoProfiles.map((p) =>
+    p.path.toLowerCase() === path.toLowerCase()
+      ? {
+          ...p,
+          learning: true,
+          learning_ends_secs: now() + 7 * DAY,
+          learned_since_secs: now(),
+          sites: [],
+          companies: [],
+          countries: [],
+          usual_sent_per_hour: null,
+          busiest_sent_per_hour: null,
+          active_hours: hours({}),
+        }
+      : p,
+  );
+  return true;
+}
+
+export function demoGoesAnywhere(path: string, choice: GoesAnywhereChoice): ProfileView | null {
+  demoProfiles = demoProfiles.map((p) =>
+    p.path.toLowerCase() === path.toLowerCase()
+      ? {
+          ...p,
+          goes_anywhere_choice: choice,
+          goes_anywhere: choice === 'auto' ? p.recognised_browser : choice === 'on',
+        }
+      : p,
+  );
+  return demoProfile(path);
 }

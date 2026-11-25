@@ -7,6 +7,9 @@ import {
   demoAddRule,
   demoAlerts,
   demoDismissAlert,
+  demoGoesAnywhere,
+  demoProfile,
+  demoResetProfile,
   demoHistory,
   demoLive,
   demoRemoveRule,
@@ -15,7 +18,19 @@ import {
   demoHistorySetting,
   demoSetPaused,
 } from './demo';
-import type { Added, AlertView, AppSettings, AppTotals, ListsView, Live, Problem, Rules, RuleSpec } from './types';
+import type {
+  Added,
+  AlertView,
+  AppSettings,
+  AppTotals,
+  GoesAnywhereChoice,
+  ListsView,
+  Live,
+  Problem,
+  ProfileView,
+  Rules,
+  RuleSpec,
+} from './types';
 
 export const isDemo = !('__TAURI_INTERNALS__' in window);
 
@@ -153,6 +168,28 @@ export async function alerts(hours = 30 * 24, limit = 500): Promise<Result<Alert
 export async function dismissAlert(id: number, allow: boolean): Promise<Result<boolean>> {
   if (isDemo) return { ok: true, value: demoDismissAlert(id, allow) };
   return call<boolean>('dismiss_alert', { id, allow });
+}
+
+/** What Whereabouts learned about one program (`null` if nothing yet). */
+export async function profile(path: string): Promise<Result<ProfileView | null>> {
+  if (isDemo) return { ok: true, value: demoProfile(path) };
+  return call<ProfileView | null>('profile', { path });
+}
+
+/**
+ * Asks for confirmation (a native Windows dialog) and forgets what was
+ * learned about a program; it starts a new learning period. `false` if the
+ * user said no.
+ */
+export async function resetProfile(path: string, app: string): Promise<Result<boolean>> {
+  if (isDemo) return { ok: true, value: demoResetProfile(path, app) };
+  return call<boolean>('reset_profile', { path });
+}
+
+/** Sets whether a program is expected to connect anywhere (a browser). The updated profile. */
+export async function setGoesAnywhere(path: string, value: GoesAnywhereChoice): Promise<Result<ProfileView | null>> {
+  if (isDemo) return { ok: true, value: demoGoesAnywhere(path, value) };
+  return call<ProfileView | null>('set_goes_anywhere', { path, value });
 }
 
 // Demo settings, kept while the page is open.
