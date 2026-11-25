@@ -652,6 +652,7 @@ mod tests {
             can_allow: true,
             reasons: Vec::new(),
             seen_again: 0,
+            dropped_reasons: 0,
         }
     }
 

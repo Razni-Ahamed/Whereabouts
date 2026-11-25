@@ -1,6 +1,6 @@
 // Plain-language text for why a behaviour alert was raised.
 
-import { appLabel, bytes, countryName } from './format.ts';
+import { appLabel, bytes, count, countryName } from './format.ts';
 import type { AlertView, ReasonView } from './types.ts';
 
 const finite = (n: number | null): n is number => n !== null && Number.isFinite(n);
@@ -38,6 +38,11 @@ export function reasonText(r: ReasonView): string {
     default:
       return 'Unusual behaviour';
   }
+}
+
+/** The line under an alert's reasons when it left some out, or null. */
+export function moreReasonsText(dropped: number | undefined): string | null {
+  return dropped && dropped > 0 ? `and ${count(dropped)} more` : null;
 }
 
 /** The headline of a behaviour alert. */

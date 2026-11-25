@@ -22,6 +22,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - A first connection to a new site, company or country is **listed on the Alerts screen as info and never notified**, because global content networks made it too common. These are learned at once.
 - **Beaconing detection (regular check-ins) is built but not switched on**: the lab measured too many false alarms.
 - Profiles are **kept when "Save connection history" is off**, and when saved history is deleted; they are cleared by Reset (one app) and "Delete everything". The Privacy screen and the delete dialog say so. Profiles include the registrable sites each browser uses.
+- A behaviour alert keeps its 24 most serious reasons and says "and N more" for the rest, so an app reaching thousands of new places at once cannot blank the Alerts screen; if the list of alerts is ever too long for one reply, info alerts are left out first.
 - Storage: the database moves to layout version 5 (alert reasons and profiles). Existing alerts are kept.
 - The history-off texts now say learning works either way, and "Block site" is only offered for host names.
 

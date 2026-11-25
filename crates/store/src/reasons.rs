@@ -1,11 +1,20 @@
 //! Why a behaviour alert was raised: the signals that fired, and the
 //! numbers behind them.
 
+use std::cmp::Reverse;
+
 use serde::{Deserialize, Serialize};
+
+use crate::Severity;
 
 /// Longest `value` kept in a [`Reason`], in characters (a domain name is at
 /// most 253).
 pub const REASON_VALUE_MAX_CHARS: usize = 253;
+
+/// Most reasons kept in one alert. More are only counted (see
+/// [`cap_reasons`]), so an app reaching thousands of new places in a few
+/// minutes cannot grow one alert without limit.
+pub const MAX_REASONS: usize = 24;
 
 /// The kinds of unusual behaviour that are noticed.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -46,6 +55,19 @@ impl Signal {
             Self::BinaryChanged => "binary_changed",
         }
     }
+
+    /// The severity a reason of this signal starts with (design spec v0.3,
+    /// §5; new sites, companies and countries were lowered to info by the
+    /// lab).
+    pub fn severity(self) -> Severity {
+        match self {
+            Self::NewSite | Self::NewCompany | Self::NewCountry | Self::UnusualTime => {
+                Severity::Info
+            }
+            Self::RatioFlip | Self::Beaconing | Self::RandomName => Severity::Medium,
+            Self::UploadSpike | Self::BinaryChanged => Severity::High,
+        }
+    }
 }
 
 /// One reason behind a behaviour alert.
@@ -74,4 +96,26 @@ impl Reason {
         }
         self
     }
+}
+
+/// Cuts `reasons` to [`MAX_REASONS`], keeping the most severe and, among
+/// equally severe ones, the earliest; the kept ones stay in their order.
+/// Returns how many were dropped.
+pub fn cap_reasons(reasons: &mut Vec<Reason>) -> u32 {
+    if reasons.len() <= MAX_REASONS {
+        return 0;
+    }
+    let mut ranked: Vec<usize> = (0..reasons.len()).collect();
+    ranked.sort_by_key(|&at| (Reverse(reasons[at].signal.severity()), at));
+    let mut keep = vec![false; reasons.len()];
+    for &at in &ranked[..MAX_REASONS] {
+        keep[at] = true;
+    }
+    let dropped = reasons.len() - MAX_REASONS;
+    let mut at = 0;
+    reasons.retain(|_| {
+        at += 1;
+        keep[at - 1]
+    });
+    u32::try_from(dropped).unwrap_or(u32::MAX)
 }

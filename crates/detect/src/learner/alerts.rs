@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use whereabouts_store::{
-    AlertKind, ItemKind, NewAlert, Reason, Severity, Signal, Store, StoreError,
+    AlertKind, ItemKind, NewAlert, Reason, Severity, Signal, Store, StoreError, cap_reasons,
 };
 
 use super::AppFacts;
@@ -138,6 +138,8 @@ impl Alerts {
                 }
             }
             let severity = combined(&merged).max(window.alert.severity);
+            // Bounded like the saved alert (the store keeps the count).
+            cap_reasons(&mut merged);
             let seen_again = self.seen_again.get(&window.id).copied().unwrap_or(0);
             // `false`: the alert is gone (all data deleted), so a new one opens.
             if store.update_alert(window.id, &reasons, severity, seen_again, now)? {
@@ -164,7 +166,7 @@ impl Alerts {
             }
         }
 
-        let alert = NewAlert {
+        let mut alert = NewAlert {
             key: format!("behaviour|{key}|{secs}"),
             allow_key: reasons.iter().find_map(|r| allow_key(key, r)),
             kind: AlertKind::Behaviour,
@@ -179,6 +181,8 @@ impl Alerts {
             return Ok(Saved::default());
         };
         self.mark_today(key, &alert.reasons);
+        // The store kept the same reasons and counted the rest.
+        cap_reasons(&mut alert.reasons);
         self.windows.insert(
             key.to_owned(),
             Window {

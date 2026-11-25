@@ -5,7 +5,7 @@
   import { appKey } from '../lib/apps';
   import { appLabel } from '../lib/format';
   import { isIpLiteral } from '../lib/host';
-  import { alertTitle, reasonText } from '../lib/reasons';
+  import { alertTitle, moreReasonsText, reasonText } from '../lib/reasons';
   import { store } from '../lib/state.svelte';
   import type { AlertView, FlowView } from '../lib/types';
 
@@ -166,6 +166,9 @@
                 {#each alert.reasons ?? [] as reason, i (i)}
                   <li>{reasonText(reason)}</li>
                 {/each}
+                {#if moreReasonsText(alert.dropped_reasons)}
+                  <li class="muted">{moreReasonsText(alert.dropped_reasons)}</li>
+                {/if}
               </ul>
               <p class="why">
                 {text.why}

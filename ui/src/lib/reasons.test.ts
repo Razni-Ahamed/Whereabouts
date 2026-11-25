@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { alertTitle, reasonText } from './reasons.ts';
+import { alertTitle, moreReasonsText, reasonText } from './reasons.ts';
 import type { AlertView, ReasonView } from './types.ts';
 
 const reason = (r: Partial<ReasonView> & { signal: string }): ReasonView => ({
@@ -48,6 +48,13 @@ test('describes the other signals', () => {
     reasonText(reason({ signal: 'binary_changed' })),
     'Its program file changed and lost its signature, and it reached somewhere new.',
   );
+});
+
+test('counts the reasons an alert left out', () => {
+  assert.equal(moreReasonsText(undefined), null);
+  assert.equal(moreReasonsText(0), null);
+  assert.equal(moreReasonsText(1), 'and 1 more');
+  assert.equal(moreReasonsText(4_976), 'and 4,976 more');
 });
 
 test('falls back for an unknown signal', () => {

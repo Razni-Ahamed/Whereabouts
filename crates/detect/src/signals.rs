@@ -86,16 +86,12 @@ impl Toggles {
     }
 }
 
-/// The starting severity of a signal. New sites, companies and countries are
-/// only listed (Info): global CDNs made them far too common to notify on
-/// (lab-tuned).
+/// The starting severity of a signal ([`Signal::severity`], kept by the
+/// store so it can keep an alert's most severe reasons). New sites,
+/// companies and countries are only listed (Info): global CDNs made them far
+/// too common to notify on (lab-tuned).
 pub fn severity_of(signal: Signal) -> Severity {
-    match signal {
-        Signal::NewSite | Signal::NewCompany | Signal::NewCountry => Severity::Info,
-        Signal::UnusualTime => Severity::Info,
-        Signal::RatioFlip | Signal::Beaconing | Signal::RandomName => Severity::Medium,
-        Signal::UploadSpike | Signal::BinaryChanged => Severity::High,
-    }
+    signal.severity()
 }
 
 fn reason(signal: Signal) -> Reason {

@@ -9,8 +9,8 @@ use whereabouts_detect::meter::Delta;
 use whereabouts_detect::signals::Toggles;
 use whereabouts_enrich::{CompanyList, Enricher, GeoDatabases, TrackerList};
 use whereabouts_store::{
-    AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, Key, ProfileItem, ProfileRow, Severity,
-    Signal, Store, StoredAlert, known_app_key,
+    AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, Key, MAX_REASONS, ProfileItem,
+    ProfileRow, Severity, Signal, Store, StoredAlert, known_app_key,
 };
 
 /// 2027-01-15 08:00 UTC, on the hour.
@@ -428,6 +428,43 @@ fn signals_in_ten_minutes_combine() {
     );
     assert_eq!(learner.finished(&later, &e, &mut db, at(T0 + 700)).len(), 1);
     assert_eq!(behaviour(&db).len(), 2);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn thousands_of_new_companies_in_one_window_keep_the_alert_small() {
+    let mut db = TestStore::open("many-companies");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    const COMPANIES: u64 = 1_500;
+    for i in 0..COMPANIES {
+        // All within one combine window.
+        let secs = T0 + i * 300 / COMPANIES;
+        let company = format!("Company {i}");
+        let new = flow(Some("chat.example"), Some(&company), Some("DE"), secs);
+        learner.finished(&new, &e, &mut db, at(secs));
+    }
+    assert!(learner.take_errors().is_empty());
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1, "one window, one alert");
+    assert_eq!(saved[0].reasons.len(), MAX_REASONS);
+    assert_eq!(
+        u64::from(saved[0].dropped_reasons),
+        COMPANIES - MAX_REASONS as u64
+    );
+    // The earliest are kept.
+    assert_eq!(saved[0].reasons[0].value.as_deref(), Some("Company 0"));
+
+    // A medium signal still joins (and the alert in memory is as small).
+    let raised = learner.finished(&random_flow(T0 + 400), &e, &mut db, at(T0 + 400));
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0].alert.severity, Severity::Medium);
+    assert_eq!(raised[0].alert.reasons.len(), MAX_REASONS);
+    assert!(signals_of(&raised[0].alert).contains(&Signal::RandomName));
+    let saved = newest(&db);
+    assert!(signals_of_stored(&saved).contains(&Signal::RandomName));
+    assert_eq!(saved.reasons.len(), MAX_REASONS);
     assert!(learner.take_errors().is_empty());
 }
 

@@ -278,6 +278,10 @@ pub struct AlertView {
     /// while it waited for the user.
     #[serde(default)]
     pub seen_again: u32,
+    /// How many more reasons a behaviour alert had than it keeps (it keeps
+    /// the most severe few).
+    #[serde(default)]
+    pub dropped_reasons: u32,
 }
 
 /// One program's behaviour profile: what Whereabouts learned is usual for
@@ -919,6 +923,7 @@ mod tests {
                 can_allow: true,
                 reasons: Vec::new(),
                 seen_again: 0,
+                dropped_reasons: 0,
             }],
         });
         assert_eq!(
@@ -965,6 +970,7 @@ mod tests {
                 },
             ],
             seen_again: 2,
+            dropped_reasons: 7,
         };
         round_trip(Response::Alerts {
             alerts: vec![alert.clone()],
@@ -978,6 +984,7 @@ mod tests {
         let old: AlertView = serde_json::from_str(old).unwrap();
         assert!(old.reasons.is_empty());
         assert_eq!(old.seen_again, 0);
+        assert_eq!(old.dropped_reasons, 0);
     }
 
     #[test]

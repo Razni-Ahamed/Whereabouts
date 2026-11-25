@@ -139,6 +139,8 @@ export interface AlertView {
   reasons?: ReasonView[];
   /** How many more times it happened after the alert was raised. Missing from older services. */
   seen_again?: number;
+  /** Reasons left out because the alert holds only the most severe few. Missing from older services. */
+  dropped_reasons?: number;
 }
 
 /** The app's own settings (per Windows user). */

@@ -77,6 +77,33 @@ pub fn view(alert: whereabouts_store::StoredAlert) -> whereabouts_ipc::AlertView
         can_allow: alert.can_allow,
         reasons: alert.reasons.into_iter().map(reason_view).collect(),
         seen_again: alert.seen_again,
+        dropped_reasons: alert.dropped_reasons,
+    }
+}
+
+/// Room left in a message for the JSON around the alerts.
+const MESSAGE_MARGIN: usize = 4 * 1024;
+
+/// Leaves out alerts until the list fits in one message: info alerts first,
+/// the oldest first (the list comes above-info first, each part newest
+/// first), so an alert that needs a look is never left out while an info
+/// one remains. Real lists are far smaller; this guards against many alerts
+/// that each hold many long reasons.
+pub fn fit(alerts: &mut Vec<whereabouts_ipc::AlertView>) {
+    let size = |alert: &whereabouts_ipc::AlertView| {
+        // An alert that cannot be measured is left out first.
+        serde_json::to_vec(alert).map_or(usize::MAX, |json| json.len().saturating_add(1))
+    };
+    let mut sizes: Vec<usize> = alerts.iter().map(size).collect();
+    let limit = whereabouts_ipc::MAX_MESSAGE - MESSAGE_MARGIN;
+    let mut total = sizes.iter().fold(0usize, |sum, &s| sum.saturating_add(s));
+    while total > limit && !alerts.is_empty() {
+        let at = alerts
+            .iter()
+            .rposition(|alert| alert.severity == whereabouts_ipc::Severity::Info)
+            .unwrap_or(alerts.len() - 1);
+        alerts.remove(at);
+        total = total.saturating_sub(sizes.remove(at));
     }
 }
 

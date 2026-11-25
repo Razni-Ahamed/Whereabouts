@@ -29,7 +29,7 @@ mod profiles;
 mod reasons;
 
 pub use profiles::*;
-pub use reasons::{REASON_VALUE_MAX_CHARS, Reason, Signal};
+pub use reasons::{MAX_REASONS, REASON_VALUE_MAX_CHARS, Reason, Signal, cap_reasons};
 
 /// Version of the database layout this code writes.
 pub const SCHEMA_VERSION: i64 = 5;
@@ -320,6 +320,8 @@ impl Store {
 
     /// Saves an alert. Returns its ID, or `None` if an alert with the same
     /// key exists already, or the user said this is fine (its allow key).
+    /// At most [`MAX_REASONS`] reasons are kept (see [`cap_reasons`]); the
+    /// rest are counted in the alert's `dropped_reasons`.
     pub fn add_alert(
         &mut self,
         alert: &NewAlert,
@@ -330,9 +332,12 @@ impl Store {
         {
             return Ok(None);
         }
+        let mut reasons = alert.reasons.clone();
+        let dropped = cap_reasons(&mut reasons);
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO alerts (key, allow_key, created, kind, severity, app_name, \
-             app_path, target, detail, reasons) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             app_path, target, detail, reasons, dropped_reasons) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 alert.key,
                 alert.allow_key,
@@ -343,7 +348,8 @@ impl Store {
                 alert.app_path,
                 alert.target,
                 alert.detail,
-                reasons_to_json(&alert.reasons)
+                reasons_to_json(&reasons),
+                dropped
             ],
         )?;
         Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
@@ -375,6 +381,11 @@ impl Store {
     /// severity, sets how many times the behaviour was seen again, and
     /// records the time as the alert's last update. `false` if there was no
     /// such alert.
+    ///
+    /// The alert keeps at most [`MAX_REASONS`] reasons (see
+    /// [`cap_reasons`]); the others are only counted. Once it is full, a
+    /// reason no more severe than those it holds only adds to the count: the
+    /// saved reasons are not written again.
     pub fn update_alert(
         &mut self,
         id: i64,
@@ -384,21 +395,22 @@ impl Store {
         now: SystemTime,
     ) -> Result<bool, StoreError> {
         let transaction = self.conn.transaction()?;
-        let current: Option<(String, String)> = transaction
+        let current: Option<(String, String, u32)> = transaction
             .query_row(
-                "SELECT severity, reasons FROM alerts WHERE id = ?1",
+                "SELECT severity, reasons, dropped_reasons FROM alerts WHERE id = ?1",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map(Some)
             .or_else(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let Some((old_severity, old_reasons)) = current else {
+        let Some((old_severity, old_reasons, old_dropped)) = current else {
             return Ok(false);
         };
-        let mut merged = reasons_from_json(&old_reasons);
+        let old = reasons_from_json(&old_reasons);
+        let mut merged = old.clone();
         for reason in reasons {
             let reason = reason.clone().capped();
             if !merged
@@ -408,18 +420,28 @@ impl Store {
                 merged.push(reason);
             }
         }
+        let dropped = old_dropped.saturating_add(cap_reasons(&mut merged));
         let severity = Severity::parse(&old_severity).map_or(severity, |old| old.max(severity));
-        transaction.execute(
-            "UPDATE alerts SET reasons = ?1, severity = ?2, seen_again = ?3, updated = ?4 \
-             WHERE id = ?5",
-            params![
-                reasons_to_json(&merged),
-                severity.as_str(),
-                seen_again,
-                unix_ms(now),
-                id
-            ],
-        )?;
+        if merged == old {
+            transaction.execute(
+                "UPDATE alerts SET severity = ?1, seen_again = ?2, updated = ?3, \
+                 dropped_reasons = ?4 WHERE id = ?5",
+                params![severity.as_str(), seen_again, unix_ms(now), dropped, id],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE alerts SET reasons = ?1, severity = ?2, seen_again = ?3, updated = ?4, \
+                 dropped_reasons = ?5 WHERE id = ?6",
+                params![
+                    reasons_to_json(&merged),
+                    severity.as_str(),
+                    seen_again,
+                    unix_ms(now),
+                    dropped,
+                    id
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(true)
     }
@@ -1022,6 +1044,8 @@ pub struct StoredAlert {
     pub reasons: Vec<Reason>,
     /// How many more times the same behaviour was seen after the alert.
     pub seen_again: u32,
+    /// Reasons left out because the alert already held [`MAX_REASONS`].
+    pub dropped_reasons: u32,
 }
 
 /// Reasons as stored: JSON text.
@@ -1037,7 +1061,8 @@ fn reasons_from_json(text: &str) -> Vec<Reason> {
 
 /// The columns [`read_alert`] reads, in order.
 const ALERT_COLUMNS: &str = "id, created, kind, severity, app_name, app_path, target, detail, \
-                             dismissed, allow_key IS NOT NULL, reasons, seen_again";
+                             dismissed, allow_key IS NOT NULL, reasons, seen_again, \
+                             dropped_reasons";
 
 /// One alert from a row of [`ALERT_COLUMNS`]; `None` if its kind or severity
 /// is not known to this version.
@@ -1061,6 +1086,7 @@ fn read_alert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<StoredAlert>> 
         can_allow: row.get(9)?,
         reasons: reasons_from_json(&reasons),
         seen_again: row.get(11)?,
+        dropped_reasons: row.get(12)?,
     }))
 }
 
@@ -1082,7 +1108,8 @@ CREATE TABLE alerts_v5 (
     dismissed INTEGER NOT NULL DEFAULT 0,
     reasons TEXT NOT NULL DEFAULT '[]',
     seen_again INTEGER NOT NULL DEFAULT 0,
-    updated INTEGER
+    updated INTEGER,
+    dropped_reasons INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 INSERT INTO alerts_v5 (id, key, allow_key, created, kind, severity, app_name, app_path, target, detail, dismissed)
     SELECT id, key, allow_key, created, kind, severity, app_name, app_path, target, detail, dismissed FROM alerts;
@@ -2278,6 +2305,72 @@ mod tests {
                 .update_alert(999, &[], Severity::Info, 0, at(40))
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reasons_are_capped_keeping_the_most_severe_then_the_earliest() {
+        let path = temp_db("reason-cap");
+        let mut store = Store::open(&path, &key(8)).unwrap();
+        let spike = Reason {
+            signal: Signal::UploadSpike,
+            value: None,
+            observed: Some(3.4e8),
+            usual: Some(5e6),
+            count: None,
+        };
+        let mut reasons: Vec<Reason> = (0..30).map(|i| country(&format!("C{i}"))).collect();
+        reasons.push(spike.clone());
+        let id = store
+            .add_alert(&behaviour_alert(reasons), at(10))
+            .unwrap()
+            .unwrap();
+        let alert = store.alert(id).unwrap().unwrap();
+        assert_eq!(alert.reasons.len(), MAX_REASONS);
+        assert_eq!(alert.dropped_reasons, 31 - MAX_REASONS as u32);
+        // The high reason is kept, then the earliest info ones, in order.
+        assert_eq!(
+            alert.reasons[..MAX_REASONS - 1],
+            {
+                let first: Vec<Reason> = (0..MAX_REASONS - 1)
+                    .map(|i| country(&format!("C{i}")))
+                    .collect();
+                first
+            }[..]
+        );
+        assert_eq!(alert.reasons[MAX_REASONS - 1], spike);
+
+        // At the cap, another info reason is only counted.
+        assert!(
+            store
+                .update_alert(id, &[country("XX")], Severity::Info, 0, at(20))
+                .unwrap()
+        );
+        let after = store.alert(id).unwrap().unwrap();
+        assert_eq!(after.reasons, alert.reasons);
+        assert_eq!(after.dropped_reasons, alert.dropped_reasons + 1);
+        // A more severe reason takes the place of the latest info one.
+        let name = Reason {
+            signal: Signal::RandomName,
+            value: Some(String::from("q7x9k2m4zt8w.example")),
+            observed: Some(3.6),
+            usual: None,
+            count: None,
+        };
+        assert!(
+            store
+                .update_alert(id, std::slice::from_ref(&name), Severity::High, 0, at(30))
+                .unwrap()
+        );
+        let after = store.alert(id).unwrap().unwrap();
+        assert_eq!(after.reasons.len(), MAX_REASONS);
+        assert!(after.reasons.contains(&name));
+        assert!(
+            !after
+                .reasons
+                .contains(&country(&format!("C{}", MAX_REASONS - 2)))
+        );
+        assert_eq!(after.dropped_reasons, alert.dropped_reasons + 2);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

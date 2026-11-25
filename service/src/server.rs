@@ -697,9 +697,11 @@ fn alerts(store: &Store, hours: u32, limit: u32) -> Response {
         .checked_sub(Duration::from_secs(u64::from(hours) * 60 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
     match store.alerts(since, usize::try_from(limit).unwrap_or(usize::MAX)) {
-        Ok(alerts) => Response::Alerts {
-            alerts: alerts.into_iter().map(crate::alerts::view).collect(),
-        },
+        Ok(alerts) => {
+            let mut alerts: Vec<_> = alerts.into_iter().map(crate::alerts::view).collect();
+            crate::alerts::fit(&mut alerts);
+            Response::Alerts { alerts }
+        }
         Err(error) => Response::Error {
             message: format!("could not read the alerts: {error}"),
         },
@@ -1143,6 +1145,61 @@ mod tests {
         )
         .unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn the_alerts_reply_fits_a_message_and_keeps_serious_alerts() {
+        use whereabouts_store::{AlertKind, MAX_REASONS, NewAlert, Reason, Severity, Signal};
+        let (mut store, dir) = temp_store("alerts-fit");
+        let alert = |n: usize, severity: Severity, reasons: Vec<Reason>| NewAlert {
+            key: format!("behaviour|k|{n}"),
+            allow_key: None,
+            kind: AlertKind::Behaviour,
+            severity,
+            app_name: Some(String::from("chat.exe")),
+            app_path: Some(path()),
+            target: Some("t".repeat(250)),
+            detail: None,
+            reasons,
+        };
+        let now = SystemTime::now();
+        // The serious one is the oldest.
+        let high = store
+            .add_alert(
+                &alert(0, Severity::High, Vec::new()),
+                now - Duration::from_secs(60),
+            )
+            .unwrap()
+            .unwrap();
+        for n in 1..=whereabouts_ipc::MAX_ROWS as usize {
+            let reasons = (0..MAX_REASONS)
+                .map(|i| Reason {
+                    signal: Signal::NewSite,
+                    value: Some(format!("{i}{}", "x".repeat(250))),
+                    observed: None,
+                    usual: None,
+                    count: None,
+                })
+                .collect();
+            store
+                .add_alert(&alert(n, Severity::Info, reasons), now)
+                .unwrap()
+                .unwrap();
+        }
+        let reply = alerts(
+            &store,
+            whereabouts_ipc::MAX_HOURS,
+            whereabouts_ipc::MAX_ROWS,
+        );
+        let size = serde_json::to_vec(&reply).unwrap().len();
+        assert!(size <= whereabouts_ipc::MAX_MESSAGE, "{size} bytes");
+        let Response::Alerts { alerts } = reply else {
+            panic!("{reply:?}");
+        };
+        assert!(alerts.iter().any(|a| a.id == high));
+        assert!(alerts.len() > 1, "info alerts are kept while they fit");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn ago(days: u64) -> SystemTime {
