@@ -25,7 +25,7 @@ def is_runner_app(name: str | None) -> bool:
 
 INT_FIELDS = ("remote_port", "bytes_sent", "bytes_received", "connections")
 TEXT_FIELDS = (
-    "app_name", "app_path", "app_sha256", "protocol", "remote_ip",
+    "app_name", "app_path", "app_sha256", "signature", "publisher", "protocol", "remote_ip",
     "domain", "domain_source", "owner", "country",
 )
 

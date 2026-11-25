@@ -1,25 +1,29 @@
 //! `whereabouts-lab-replay`: runs a lab timeline through the shipped
-//! detection code and writes the alerts as JSON Lines (see `lab/README.md`).
+//! detection code (Layer 1, or Layers 1 and 2) and writes the alerts as JSON
+//! Lines (see `lab/README.md`).
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use whereabouts_enrich::{DropList, Enricher};
+use whereabouts_lab_replay::replay::Layers;
 use whereabouts_lab_replay::{replay, timeline};
 
 const USAGE: &str = "usage: whereabouts-lab-replay --timeline <timeline.jsonl> --data <dir> \
-[--lists <dir>] [--layers 1] --out <alerts.jsonl>";
+[--lists <dir>] [--layers 1|1,2] --out <alerts.jsonl>";
 
 struct Options {
     timeline: PathBuf,
     data: PathBuf,
     lists: Option<PathBuf>,
+    layers: Layers,
     out: PathBuf,
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let (mut timeline, mut data, mut lists, mut out) = (None, None, None, None);
+    let mut layers = Layers::One;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || {
@@ -33,10 +37,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--lists" => lists = Some(PathBuf::from(value()?)),
             "--out" => out = Some(PathBuf::from(value()?)),
             "--layers" => {
-                let layers = value()?;
-                if layers != "1" {
-                    return Err(format!("--layers {layers}: only Layer 1 exists so far"));
-                }
+                layers = match value()?.as_str() {
+                    "1" => Layers::One,
+                    "1,2" => Layers::OneAndTwo,
+                    other => return Err(format!("--layers {other}: choose 1 or 1,2")),
+                };
             }
             "--help" | "-h" => return Err(String::from(USAGE)),
             other => return Err(format!("unknown option {other:?}\n{USAGE}")),
@@ -46,6 +51,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         timeline: timeline.ok_or(USAGE)?,
         data: data.ok_or(USAGE)?,
         lists,
+        layers,
         out: out.ok_or(USAGE)?,
     })
 }
@@ -63,7 +69,7 @@ fn run(options: &Options) -> Result<usize, String> {
         eprintln!("note: no Spamhaus DROP list given; risky-network alerts are off");
     }
     let work = std::env::temp_dir().join(format!("whereabouts-lab-replay-{}", std::process::id()));
-    let alerts = replay::run(&lines, &enricher, drop.as_ref(), &work)?;
+    let alerts = replay::run(&lines, &enricher, drop.as_ref(), options.layers, &work)?;
     let mut file = std::io::BufWriter::new(
         std::fs::File::create(&options.out)
             .map_err(|e| format!("{}: {e}", options.out.display()))?,

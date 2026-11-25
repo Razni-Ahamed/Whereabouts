@@ -1,4 +1,5 @@
-"""Writes the lab report: report.md, summary.md, metrics.json and charts."""
+"""Writes the lab report: report.md, summary.md, metrics.json and charts, with each
+Layer 2 signal on its own and the release bar (U8) for the chosen signals."""
 
 from __future__ import annotations
 
@@ -10,7 +11,22 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  (after choosing the backend)
 
-from .score import SERIOUS, Scored  # noqa: E402
+from .score import SERIOUS, Scored, match  # noqa: E402
+
+# Layer 2's signals (the store's spellings) and their starting severities.
+SIGNAL_SEVERITY = {
+    "new_site": "info", "new_company": "medium", "new_country": "medium", "upload_spike": "high",
+    "ratio_flip": "medium", "beaconing": "medium", "unusual_time": "info", "random_name": "medium",
+    "binary_changed": "high",
+}
+SIGNALS = tuple(SIGNAL_SEVERITY)
+# Release bar U8 (design spec v0.3): with the shipped signals on together, at most
+# 1.0 medium+ false alarms per user-week, and at least 50 % detection in at least 3
+# of the 5 Layer 2 scenario types.
+BAR_TYPES = ("upload", "beacon", "random_domain", "swapped_binary", "renamed_binary")
+BAR_FALSE_ALARMS = 1.0
+BAR_RATE = 0.5
+BAR_TYPES_NEEDED = 3
 
 CAVEAT = (
     "These numbers come from short scripted sessions on GitHub's disposable Windows runners "
@@ -33,8 +49,59 @@ def _minutes(seconds: float | None) -> str:
     return "—" if seconds is None else f"{seconds / 60:.1f} min"
 
 
-def _metrics(scored: Scored) -> dict:
-    return {
+def parse_signals(text: str) -> set[str]:
+    """'upload_spike,beaconing' -> {'upload_spike', 'beaconing'}."""
+    chosen = {part.strip() for part in text.split(",") if part.strip()}
+    unknown = sorted(chosen - set(SIGNALS))
+    if unknown:
+        raise ValueError(f"unknown signal {', '.join(unknown)} (known: {', '.join(SIGNALS)})")
+    return chosen
+
+
+def only_signals(alerts: list[dict], signals: set[str]) -> list[dict]:
+    """The alerts as if only `signals` were on: Layer 1 alerts always count; a
+    behaviour (Layer 2) alert counts if one of its reasons is on. One whose reasons
+    that are on are all info signals would have been info (and not notified).
+
+    An estimate: with signals off, the app might also have combined or held back
+    other alerts differently. Medium+ (what scoring counts) is exact per alert."""
+    kept = []
+    for alert in alerts:
+        if alert.get("layer", 1) != 2:
+            kept.append(alert)
+            continue
+        on = [reason for reason in alert.get("reasons", []) if reason in signals]
+        if not on:
+            continue
+        if all(SIGNAL_SEVERITY.get(reason) == "info" for reason in on):
+            alert = {**alert, "severity": "info", "notified": False}
+        kept.append(alert)
+    return kept
+
+
+def per_signal(alerts: list[dict], labels: list[dict], info: dict, signals: list[str]) -> dict[str, Scored]:
+    """Each signal on its own: the behaviour alerts it was behind, at the signal's own
+    severity, scored against the labels."""
+    table = {}
+    for signal in signals:
+        mine = [{**a, "severity": SIGNAL_SEVERITY[signal]} for a in alerts
+                if a.get("layer", 1) == 2 and signal in a.get("reasons", [])]
+        table[signal] = match(mine, labels, info)
+    return table
+
+
+def release_bar(scored: Scored) -> tuple[bool, str]:
+    """Release bar U8 for one scored run: whether it passes, and the report's line."""
+    fa = scored.fa_medium_plus
+    types = sum(1 for kind in BAR_TYPES if scored.per_type.get(kind, {}).get("rate", 0.0) >= BAR_RATE)
+    passed = fa <= BAR_FALSE_ALARMS and types >= BAR_TYPES_NEEDED
+    line = (f"Release bar: {'PASS' if passed else 'FAIL'} (false alarms {fa:.2f} ≤ {BAR_FALSE_ALARMS}; "
+            f"types at ≥ {BAR_RATE * 100:.0f} %: {types} of {len(BAR_TYPES)})")
+    return passed, line
+
+
+def _metrics(scored: Scored, signal_table: dict[str, Scored] | None = None) -> dict:
+    metrics = {
         "user_weeks": scored.user_weeks,
         "alerts_in_test_week": scored.alerts_in_test_week,
         "false_alarms_per_user_week": {"medium_plus": scored.fa_medium_plus, "notified": scored.fa_notified},
@@ -42,13 +109,32 @@ def _metrics(scored: Scored) -> dict:
         "kinds": dict(scored.kinds),
         "per_type": scored.per_type,
     }
+    if signal_table is not None:
+        metrics["per_signal"] = {
+            signal: {"alerts_in_test_week": s.alerts_in_test_week,
+                     "false_alarms_per_user_week": s.fa_medium_plus,
+                     "detected": {kind: e["detected"] for kind, e in s.per_type.items()}}
+            for signal, s in signal_table.items()
+        }
+    return metrics
 
 
-def write(results: list[tuple[str, Scored]], info: dict, out: Path) -> None:
+def write(results: list[tuple[str, Scored]], info: dict, out: Path,
+          signal_tables: list[tuple[str, dict[str, Scored]]] | None = None,
+          bar: tuple[str, list[str]] | None = None) -> None:
+    """Writes the report. `signal_tables`: per result name, each Layer 2 signal on its
+    own (see `per_signal`). `bar`: the result the release bar is checked on, and the
+    signals that were on."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "metrics.json").write_text(json.dumps({name: _metrics(s) for name, s in results}, indent=2),
-                                      encoding="utf-8")
+    tables = dict(signal_tables or [])
+    by_name = dict(results)
+    bar_result = release_bar(by_name[bar[0]]) if bar else None
+    metrics = {name: _metrics(s, tables.get(name)) for name, s in results}
+    if bar and bar_result:
+        metrics["release_bar"] = {"result": bar[0], "signals": bar[1], "passed": bar_result[0],
+                                  "line": bar_result[1]}
+    (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     names = [name for name, _ in results]
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
@@ -118,6 +204,21 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path) -> None:
     for name, s in results:
         kinds = ", ".join(f"{k} {v}" for k, v in sorted(s.kinds.items())) or "none"
         lines.append(f"- {name}: {kinds}")
+    for name, table in tables.items():
+        lines += ["", f"## Behaviour signals one by one ({name})", "",
+                  "Each signal's behaviour alerts in the test week at the signal's own severity: how many, "
+                  "medium+ false alarms per user-week, and scenario instances detected.", "",
+                  "| Signal | Alerts | False alarms / user-week | " + " | ".join(BAR_TYPES) + " |",
+                  "|---|---|---|" + "---|" * len(BAR_TYPES)]
+        for signal, s in table.items():
+            found = " | ".join(f"{s.per_type[kind]['detected']}/{s.per_type[kind]['instances']}"
+                               if kind in s.per_type else "—" for kind in BAR_TYPES)
+            lines.append(f"| {signal} | {s.alerts_in_test_week} | {_fmt(s.fa_medium_plus)} | {found} |")
+    if bar and bar_result:
+        lines += ["", f"## Release bar (U8), {bar[0]}", "", bar_result[1], "",
+                  f"Signals on: {', '.join(bar[1])}. Needs at most {BAR_FALSE_ALARMS:g} medium+ false alarm "
+                  f"per user-week and at least {BAR_RATE * 100:.0f} % detection in {BAR_TYPES_NEEDED} of: "
+                  f"{', '.join(BAR_TYPES)}."]
     lines += ["", "## Notes", "", GAPS, ""]
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -128,5 +229,7 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path) -> None:
         total = sum(e["instances"] for e in s.per_type.values())
         found = sum(e["detected"] for e in s.per_type.values())
         summary.append(f"| {name} | {_fmt(s.fa_medium_plus)} | {_fmt(s.fa_notified)} | {found}/{total} |")
+    if bar and bar_result:
+        summary += ["", f"**{bar_result[1]}** ({bar[0]}; signals: {', '.join(bar[1])})"]
     summary += ["", "Full report and charts: the `lab-report` artifact."]
     (out / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")

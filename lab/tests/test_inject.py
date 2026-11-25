@@ -50,11 +50,33 @@ def test_upload_shape(tmp_path):
 def test_beacon_period_and_span(tmp_path):
     rows, labels = injected(tmp_path)
     for label in [label for label in labels if label["type"] == "beacon"]:
-        times = sorted(r["first_seen"] for r in rows if r.get("scenario") == label["scenario"])
+        mine = [r for r in rows if r.get("scenario") == label["scenario"]]
+        times = sorted(r["time"] for r in mine if r["type"] == "connection")
         gaps = [b - a for a, b in zip(times, times[1:])]
         assert all(55 <= g <= 65 for g in gaps)
         assert 3 * 3600 - 120 <= times[-1] - times[0] <= 3 * 3600
-        assert len({r["remote_ip"] for r in rows if r.get("scenario") == label["scenario"]}) == 1
+        assert len({r["remote_ip"] for r in mine if r["type"] == "flow"}) == 1
+        assert len({r["destination"] for r in mine if r["type"] == "connection"}) == 1
+
+
+def test_beacon_injected_as_connection_lines(tmp_path):
+    rows, labels = injected(tmp_path)
+    for label in [label for label in labels if label["type"] == "beacon"]:
+        mine = [r for r in rows if r.get("scenario") == label["scenario"]]
+        connections = [r for r in mine if r["type"] == "connection"]
+        [flow_row] = [r for r in mine if r["type"] == "flow"]  # one flow carries the bytes
+        assert len(connections) >= 150  # every ~60 s for 3 hours
+        for line in connections:
+            assert line["user"] == label["user"]
+            assert line["app_name"] == label["app_name"]
+            assert line["app_path"] == label["app_path"]
+            assert line["destination"] == flow_row["domain"]
+            assert label["start"] <= line["time"] <= label["end"]
+            assert set(line) >= {"type", "user", "app_path", "app_name", "destination", "time"}
+        times = [line["time"] for line in connections]
+        assert flow_row["first_seen"] == min(times) and flow_row["last_seen"] == max(times)
+        assert flow_row["connections"] == len(connections)
+        assert flow_row["bytes_sent"] == 1000 * len(connections)
 
 
 def test_random_domain_entropy(tmp_path):

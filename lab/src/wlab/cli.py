@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
 from pathlib import Path
 
 from . import sessions, timeline
 
-TIMELINE_SCHEMA = 1
+TIMELINE_SCHEMA = 2
 
 
 def write_jsonl(path: Path, rows: list[dict], header: dict | None = None) -> None:
@@ -54,11 +55,18 @@ def cmd_report(args: argparse.Namespace) -> None:
 
     labels = read_jsonl(args.timeline_dir / "labels.jsonl")
     info = json.loads((args.timeline_dir / "info.json").read_text(encoding="utf-8"))
+    chosen = report.parse_signals(args.signals) if args.signals else set(report.SIGNALS)
+    signals = [signal for signal in report.SIGNALS if signal in chosen]
     results = []
+    last_alerts: list[dict] = []
     for spec in args.alerts:
         name, _, path = spec.partition("=")
-        results.append((name, score.match(read_jsonl(Path(path)), labels, info)))
-    report.write(results, info, args.out)
+        last_alerts = report.only_signals(read_jsonl(Path(path)), chosen)
+        results.append((name, score.match(last_alerts, labels, info)))
+    # The release bar and the per-signal table are for the last --alerts (Layers 1+2).
+    last = results[-1][0]
+    table = report.per_signal(last_alerts, labels, info, signals)
+    report.write(results, info, args.out, signal_tables=[(last, table)], bar=(last, signals))
     print((args.out / "summary.md").read_text(encoding="utf-8"))
 
 
@@ -70,6 +78,9 @@ def cmd_droplist(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # The report's text has "≤" and "—"; a Windows console may default to a code page without them.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(prog="lab", description="Whereabouts lab (never shipped)")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -83,7 +94,10 @@ def main(argv: list[str] | None = None) -> None:
 
     r = sub.add_parser("report", help="alerts + labels -> report")
     r.add_argument("--timeline-dir", type=Path, required=True)
-    r.add_argument("--alerts", action="append", required=True, help='"Layer 1=alerts.jsonl" (repeatable)')
+    r.add_argument("--alerts", action="append", required=True,
+                   help='"Layer 1=alerts.jsonl" (repeatable; the release bar is checked on the last)')
+    r.add_argument("--signals", default="",
+                   help="score only these Layer 2 signals, e.g. upload_spike,beaconing (default: all)")
     r.add_argument("--out", type=Path, required=True)
     r.set_defaults(func=cmd_report)
 

@@ -6,7 +6,8 @@ app the user ran in its learning week, starts at a moment the user was
 active in the test week, and gets a label with its time window.
 
 - upload: 200 MB or more sent in one hour to a new destination
-- beacon: small connections every 60 s +/- 5 s for 3 hours to one new host
+- beacon: small connections every 60 s +/- 5 s for 3 hours to one new host:
+  `connection` lines (when each was opened) plus one flow row with their bytes
 - random_domain: 5 connections to random-looking names not on any list
 - swapped_binary: the app's program changes (new SHA-256) and it reaches
   3 new destinations
@@ -61,6 +62,13 @@ def _row(template: dict, at: int, **changes) -> dict:
     return row
 
 
+def _connection(template: dict, at: int, destination: str) -> dict:
+    """A connection line (timeline schema 2): when one connection was opened."""
+    return {"type": "connection", "user": template["user"], "day": (at - T0) // DAY + 1,
+            "session": "synthetic", "app_path": template["app_path"], "app_name": template["app_name"],
+            "destination": destination, "time": at, "scenario": template["scenario"]}
+
+
 def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int]) -> tuple[list[dict], list[dict]]:
     """Returns new lists with the scenarios added (rows sorted by time)."""
     rng = random.Random(seed)
@@ -94,11 +102,18 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
                     end = start + HOUR
                 elif kind == "beacon":
                     ip, host = _new_ip(rng), f"cdn-{rng.randrange(16**6):06x}.example.org"
+                    times = []
                     t = start
                     while t + 65 <= start + BEACON_SPAN:
-                        out.append(_row(base, t, remote_ip=ip, domain=host, domain_source="verified",
-                                        bytes_sent=1000, bytes_received=1000))
+                        times.append(t)
                         t += 60 + rng.randint(-5, 5)
+                    # As the engine sees it: one flow (same program and server) whose
+                    # connection count rises, and when each connection was opened.
+                    out.append(_row(base, start, remote_ip=ip, domain=host, domain_source="verified",
+                                    last_seen=times[-1], connections=len(times),
+                                    bytes_sent=1000 * len(times), bytes_received=1000 * len(times)))
+                    if base.get("app_path"):  # programs without a path are never profiled
+                        out.extend(_connection(base, at, host) for at in times)
                     end = start + BEACON_SPAN
                 elif kind == "random_domain":
                     for i in range(5):
