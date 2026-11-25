@@ -44,6 +44,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       minutes: ${{ steps.plan.outputs.minutes }}
+      timeout: ${{ steps.plan.outputs.timeout }}
       users: ${{ steps.plan.outputs.users }}
       seed: ${{ steps.plan.outputs.seed }}
       inject: ${{ steps.plan.outputs.inject }}
@@ -66,6 +67,10 @@ jobs:
           [[ "$INJECT" =~ ^[a-z_=0-9,]*$ ]] || { echo "bad inject list"; exit 1; }
           [[ "$REANALYSE" =~ ^[0-9]*$ ]] || { echo "bad run id"; exit 1; }
           (( SESSIONS >= 2 )) || { echo "need at least 2 sessions per persona"; exit 1; }
+          # Session length plus setup, build and upload time, capped below the
+          # 360-minute job limit. GitHub expressions have no arithmetic.
+          timeout=$(( 10#$MINUTES + 40 ))
+          (( timeout <= 340 )) || timeout=340
           matrix=$(python3 -c "
           import json, sys
           n = int(sys.argv[1])
@@ -74,6 +79,7 @@ jobs:
           {
             echo "matrix=$matrix"
             echo "minutes=$MINUTES"
+            echo "timeout=$timeout"
             echo "users=$USERS"
             echo "seed=$SEED"
             echo "inject=$INJECT"
@@ -85,8 +91,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.reanalyse == ''
     runs-on: windows-latest
-    # Session length plus setup, build and upload time; a fixed 45 killed 30-minute sessions.
-    timeout-minutes: ${{ fromJSON(needs.plan.outputs.minutes) + 40 }}
+    # Planned in the plan job (session minutes + 40); a fixed 45 killed 30-minute sessions.
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}

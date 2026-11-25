@@ -142,6 +142,14 @@ impl Alerts {
             // `false`: the alert is gone (all data deleted), so a new one opens.
             if store.update_alert(window.id, &reasons, severity, seen_again, now)? {
                 let raised = severity > window.alert.severity;
+                // A signal that can be allowed may join an alert that began
+                // without one: the alert gains its "this is fine".
+                if window.alert.allow_key.is_none()
+                    && let Some(allow) = reasons.iter().find_map(|r| allow_key(key, r))
+                    && store.set_allow_key(window.id, &allow)?
+                {
+                    window.alert.allow_key = Some(allow);
+                }
                 window.alert.reasons = merged;
                 window.alert.severity = severity;
                 let saved = Saved {
@@ -158,7 +166,7 @@ impl Alerts {
 
         let alert = NewAlert {
             key: format!("behaviour|{key}|{secs}"),
-            allow_key: allow_key(key, first),
+            allow_key: reasons.iter().find_map(|r| allow_key(key, r)),
             kind: AlertKind::Behaviour,
             severity: combined(&reasons),
             app_name: Some(app.app_name.to_owned()),

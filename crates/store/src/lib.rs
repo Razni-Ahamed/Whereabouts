@@ -359,6 +359,17 @@ impl Store {
         )?)
     }
 
+    /// Gives alert `id` its allow key if it has none yet (a signal that can
+    /// be allowed joined an alert that began without one). `false` if the
+    /// alert is gone or already has a key.
+    pub fn set_allow_key(&mut self, id: i64, allow_key: &str) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE alerts SET allow_key = ?1 WHERE id = ?2 AND allow_key IS NULL",
+            params![allow_key, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Adds `reasons` to an open alert (a reason with the same signal and
     /// value is not added twice), keeps the higher of the old and new
     /// severity, sets how many times the behaviour was seen again, and
@@ -2195,6 +2206,37 @@ mod tests {
                 .is_allowed("behaviour|c:\\a.exe|beaconing|other")
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_allow_key_only_fills_a_missing_key() {
+        let path = temp_db("set-allow-key");
+        let mut store = Store::open(&path, &key(8)).unwrap();
+        let id = store
+            .add_alert(&behaviour_alert(vec![country("RU")]), at(10))
+            .unwrap()
+            .unwrap();
+        assert!(!store.alert(id).unwrap().unwrap().can_allow);
+        assert!(
+            store
+                .set_allow_key(id, "behaviour|k|random_name|x")
+                .unwrap()
+        );
+        assert!(store.alert(id).unwrap().unwrap().can_allow);
+        // A key already there is kept, and a missing alert is reported.
+        assert!(
+            !store
+                .set_allow_key(id, "behaviour|k|random_name|y")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_allow_key(id + 1, "behaviour|k|random_name|z")
+                .unwrap()
+        );
+        assert!(store.dismiss_alert(id, true, at(11)).unwrap());
+        assert!(store.is_allowed("behaviour|k|random_name|x").unwrap());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

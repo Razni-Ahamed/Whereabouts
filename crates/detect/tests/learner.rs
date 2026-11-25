@@ -295,7 +295,8 @@ fn random_name_after_learning_is_pending() {
     assert_eq!(alert.kind, AlertKind::Behaviour);
     assert_eq!(alert.severity, Severity::Medium);
     assert_eq!(alert.key, format!("behaviour|{}|{T0}", key()));
-    assert_eq!(alert.allow_key, None);
+    let allow = format!("behaviour|{}|random_name|{RANDOM_DOMAIN}", key());
+    assert_eq!(alert.allow_key.as_deref(), Some(allow.as_str()));
     assert_eq!(alert.target.as_deref(), Some(RANDOM_DOMAIN));
     assert_eq!(alert.detail, None);
     assert_eq!(alert.app_path.as_deref(), Some(PATH));
@@ -303,6 +304,7 @@ fn random_name_after_learning_is_pending() {
     let saved = behaviour(&db);
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].id, raised[0].id);
+    assert!(saved[0].can_allow, "\"This is fine\" is offered");
     assert_eq!(saved[0].severity, Severity::Medium);
     assert_eq!(
         signals_of_stored(&saved[0]),
@@ -317,6 +319,36 @@ fn random_name_after_learning_is_pending() {
         state(&db, ItemKind::Country, "DE"),
         Some(ItemState::Learned)
     );
+}
+
+#[test]
+fn info_alert_raised_to_medium_notifies_and_gains_its_allow_key() {
+    let mut db = TestStore::open("info-to-medium");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    // A plain new site: listed only, and nothing in it can be allowed.
+    let plain = flow(Some("chat2.example"), Some("Chat Inc"), Some("DE"), T0);
+    assert!(learner.finished(&plain, &e, &mut db, at(T0)).is_empty());
+    let first = newest(&db);
+    assert_eq!(first.severity, Severity::Info);
+    assert!(!first.can_allow);
+
+    // Two minutes later a random-looking name joins it: now medium, notified.
+    let raised = learner.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
+    assert_eq!(raised.len(), 1, "a severity raise is notified");
+    assert_eq!(raised[0].id, first.id);
+    assert_eq!(raised[0].alert.severity, Severity::Medium);
+    let allow = format!("behaviour|{}|random_name|{RANDOM_DOMAIN}", key());
+    assert_eq!(raised[0].alert.allow_key.as_deref(), Some(allow.as_str()));
+    let saved = newest(&db);
+    assert_eq!(saved.id, first.id);
+    assert!(saved.can_allow);
+
+    // "This is fine" now sticks.
+    assert!(db.dismiss_alert(saved.id, true, at(T0 + 180)).unwrap());
+    assert!(db.is_allowed(&allow).unwrap());
+    assert!(learner.take_errors().is_empty());
 }
 
 #[test]
