@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use whereabouts_detect::browsers::auto_goes_anywhere;
+use whereabouts_detect::browsers::{auto_goes_anywhere, program_file_name};
 use whereabouts_detect::{LEARNING, Profile};
 use whereabouts_ipc::{
     GoesAnywhereChoice, MAX_MESSAGE, MAX_ROWS, MAX_RULE_PATH, ProfileItemView, ProfileView,
@@ -57,8 +57,12 @@ pub fn view(
     let publisher = row.last_publisher.as_deref();
     let installed =
         whereabouts_win_secrets::installed_by_administrators(Path::new(&row.path)).unwrap_or(false);
-    let recognised_browser =
-        auto_goes_anywhere(&row.app_name, publisher, publisher.is_some(), installed);
+    let recognised_browser = auto_goes_anywhere(
+        program_file_name(&row.path),
+        publisher,
+        publisher.is_some(),
+        installed,
+    );
 
     let mut sent: Vec<f64> = profile.hourly_sent();
     sent.sort_by(f64::total_cmp);

@@ -180,7 +180,8 @@ impl Profile {
 
     /// Whether this app may contact any site without it being unusual: the
     /// user's choice if they made one, otherwise automatic recognition of a
-    /// genuine, administrator-installed browser from its signature.
+    /// genuine, administrator-installed browser from its program file's name
+    /// and signature.
     pub fn goes_anywhere(
         &self,
         signature_publisher: Option<&str>,
@@ -191,7 +192,7 @@ impl Profile {
             GoesAnywhere::UserOn => true,
             GoesAnywhere::UserOff => false,
             GoesAnywhere::Auto => browsers::auto_goes_anywhere(
-                &self.stored.row.app_name,
+                browsers::program_file_name(&self.stored.row.path),
                 signature_publisher,
                 signature_valid,
                 installed_by_admins,
@@ -311,6 +312,16 @@ mod tests {
         for item in p.stored().items.clone() {
             assert_eq!(p.item_mut(item.kind, &item.value), Some(&mut item.clone()));
         }
+    }
+
+    #[test]
+    fn a_browser_is_recognised_by_its_file_not_its_shown_name() {
+        let mut p = profile("chrome.exe", GoesAnywhere::Auto);
+        p.row_mut().path = String::from(r"C:\Program Files\Evil\evil.exe");
+        assert!(!p.goes_anywhere(Some("Google LLC"), true, true));
+        let mut p = profile("evil.exe", GoesAnywhere::Auto);
+        p.row_mut().path = String::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        assert!(p.goes_anywhere(Some("Google LLC"), true, true));
     }
 
     #[test]

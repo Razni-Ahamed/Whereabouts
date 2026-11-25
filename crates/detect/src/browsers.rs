@@ -20,7 +20,14 @@ const BROWSER_PUBLISHERS: [(&str, &str); 7] = [
     ("vivaldi.exe", "Vivaldi Technologies AS"),
 ];
 
-/// Returns `true` if `app_name` is a listed browser, its signature is valid
+/// The file name at the end of a program path (the whole text if it has no
+/// folder). Browsers are recognised by it, never by a shown name.
+pub fn program_file_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// Returns `true` if `app_name` (the program file's name, see
+/// [`program_file_name`]) is a listed browser, its signature is valid
 /// the publisher is the one expected for that browser, and the file is
 /// installed by administrators (`installed_by_admins`, worked out by the
 /// caller). A program that only has a browser's file name, or that another
@@ -99,6 +106,14 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn file_name_is_the_last_part_of_the_path() {
+        assert_eq!(program_file_name(r"C:\x\chrome.exe"), "chrome.exe");
+        assert_eq!(program_file_name("C:/x/chrome.exe"), "chrome.exe");
+        assert_eq!(program_file_name("chrome.exe"), "chrome.exe");
+        assert_eq!(program_file_name(r"C:\x\"), "");
     }
 
     #[test]
