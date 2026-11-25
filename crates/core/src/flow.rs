@@ -48,8 +48,10 @@ pub const DEFAULT_MAX_OVERFLOW_FLOWS: usize = 10_000;
 const GLOBAL_OVERFLOW_PID: u32 = u32::MAX;
 
 /// The remote address used by overflow flows. Real connections never use
-/// address `0.0.0.0` with port 0.
-const OVERFLOW_REMOTE: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+/// address `0.0.0.0` with port 0 (saved flows keep it, so overflow rows can
+/// be told apart there too).
+pub const OVERFLOW_REMOTE: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 /// Identifies a flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

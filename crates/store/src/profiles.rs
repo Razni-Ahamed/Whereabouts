@@ -2,10 +2,13 @@
 //! when. The tables are created by the layout version 5 migration.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, SystemTime};
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use whereabouts_core::dns::LabelSource;
+use whereabouts_core::flow::OVERFLOW_REMOTE;
 
 use super::{Store, StoreError, UNIX_EPOCH, clamp, from_unix_ms, known_app_key, to_u64, unix_ms};
 
@@ -358,6 +361,33 @@ pub struct BackfillProgress {
     pub done: bool,
 }
 
+/// Where a saved flow went, as [`Store::backfill_profiles`] hands it to the
+/// caller's rule for what a profile learns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackfillFlow<'a> {
+    /// The remote address (unspecified if the saved text is not one).
+    pub remote_ip: IpAddr,
+    /// The remote port.
+    pub remote_port: u16,
+    /// The saved domain name (for web browsers, already the registrable
+    /// domain).
+    pub domain: Option<&'a str>,
+    /// How the domain name was learned.
+    pub domain_source: Option<LabelSource>,
+}
+
+/// What a behaviour profile learns about where a flow went. Each value
+/// becomes a profile item of its kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DestinationFacts {
+    /// The registrable domain.
+    pub domain: Option<String>,
+    /// The company that owns the remote network.
+    pub company: Option<String>,
+    /// The remote country code.
+    pub country: Option<String>,
+}
+
 /// The columns of a saved flow that profiles are built from.
 struct SavedFlow {
     id: i64,
@@ -366,8 +396,8 @@ struct SavedFlow {
     sha256: Option<String>,
     publisher: Option<String>,
     domain: Option<String>,
-    owner: Option<String>,
-    country: Option<String>,
+    domain_source: Option<LabelSource>,
+    remote_ip: IpAddr,
     port: i64,
     first_ms: i64,
     last_ms: i64,
@@ -398,13 +428,24 @@ impl Learning {
         }
     }
 
-    fn add_flow(&mut self, flow: &SavedFlow, local_offset_secs: i32) {
+    /// Adds one saved flow; `facts` is what the caller's rule learned about
+    /// where it went.
+    fn add_flow(&mut self, flow: &SavedFlow, facts: &DestinationFacts, local_offset_secs: i32) {
         let first = from_unix_ms(flow.first_ms);
         let last = from_unix_ms(flow.last_ms);
         let row = &mut self.row;
         row.first_data = row.first_data.min(first);
         row.learned_since = row.learned_since.min(first);
         row.last_data = row.last_data.max(last);
+        self.spread_over_hours(flow);
+        // A process's flow-limit overflow went to many places: its bytes
+        // count (so many flows cannot hide an upload), but no destination
+        // is learned from it, as with live traffic.
+        if flow.is_overflow() {
+            return;
+        }
+
+        let row = &mut self.row;
         if let Some(sha) = &flow.sha256
             && self.sha_at.is_none_or(|at| last >= at)
         {
@@ -429,9 +470,9 @@ impl Learning {
 
         let port = flow.port.to_string();
         let values = [
-            (ItemKind::Domain, flow.domain.as_deref()),
-            (ItemKind::Company, flow.owner.as_deref()),
-            (ItemKind::Country, flow.country.as_deref()),
+            (ItemKind::Domain, facts.domain.as_deref()),
+            (ItemKind::Company, facts.company.as_deref()),
+            (ItemKind::Country, facts.country.as_deref()),
             (ItemKind::Port, Some(port.as_str())),
         ];
         for (kind, value) in values {
@@ -453,8 +494,6 @@ impl Learning {
             item.last_seen = item.last_seen.max(last);
             item.seen_on_day = item.seen_on_day.max(seen_on_day);
         }
-
-        self.spread_over_hours(flow);
     }
 
     /// Splits the flow's traffic evenly over the UTC hours it covers; the
@@ -480,6 +519,34 @@ impl Learning {
     }
 }
 
+impl SavedFlow {
+    /// Whether this is a process's flow-limit overflow row ("many
+    /// destinations"), saved with the overflow's remote address.
+    fn is_overflow(&self) -> bool {
+        self.remote_ip == OVERFLOW_REMOTE.ip() && self.port == i64::from(OVERFLOW_REMOTE.port())
+    }
+
+    /// The flow as the caller's rule sees it.
+    fn destination(&self) -> BackfillFlow<'_> {
+        BackfillFlow {
+            remote_ip: self.remote_ip,
+            remote_port: u16::try_from(self.port).unwrap_or(0),
+            domain: self.domain.as_deref(),
+            domain_source: self.domain_source,
+        }
+    }
+}
+
+/// How a saved domain name was learned, from its stored spelling.
+fn label_source(text: &str) -> Option<LabelSource> {
+    match text {
+        "verified" => Some(LabelSource::Verified),
+        "unverified" => Some(LabelSource::Unverified),
+        "inferred" => Some(LabelSource::Inferred),
+        _ => None,
+    }
+}
+
 fn read_flow(row: &Row<'_>) -> rusqlite::Result<SavedFlow> {
     Ok(SavedFlow {
         id: row.get(0)?,
@@ -488,8 +555,14 @@ fn read_flow(row: &Row<'_>) -> rusqlite::Result<SavedFlow> {
         sha256: row.get(3)?,
         publisher: row.get(4)?,
         domain: row.get(5)?,
-        owner: row.get(6)?,
-        country: row.get(7)?,
+        domain_source: row
+            .get::<_, Option<String>>(6)?
+            .as_deref()
+            .and_then(label_source),
+        remote_ip: row
+            .get::<_, String>(7)?
+            .parse()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
         port: row.get(8)?,
         first_ms: row.get(9)?,
         last_ms: row.get(10)?,
@@ -694,6 +767,11 @@ impl Store {
     /// twice. Flows without a program path are skipped. `local_offset_secs`
     /// is the local time zone's offset from UTC, used to count active days.
     ///
+    /// `facts` is the caller's rule for what a profile learns about where a
+    /// flow went: the same rule live learning uses, so a profile built from
+    /// history matches one built live. A process's flow-limit overflow row
+    /// adds its bytes to the app's hours, but no destination.
+    ///
     /// Items that already exist keep their state (a pending warning stays
     /// pending); flows from before a profile's reset are ignored.
     ///
@@ -705,6 +783,7 @@ impl Store {
         &mut self,
         batch: usize,
         local_offset_secs: i32,
+        facts: impl Fn(&BackfillFlow<'_>) -> DestinationFacts,
     ) -> Result<BackfillProgress, StoreError> {
         let after = match self.setting(BACKFILL_SETTING)?.as_deref() {
             Some(BACKFILL_DONE) => {
@@ -721,8 +800,8 @@ impl Store {
         let transaction = self.conn.transaction()?;
         let mut flows = transaction
             .prepare(
-                "SELECT id, app_path, app_name, app_sha256, publisher, domain, owner, country, \
-                        remote_port, first_seen, last_seen, bytes_sent, bytes_received, \
+                "SELECT id, app_path, app_name, app_sha256, publisher, domain, domain_source, \
+                        remote_ip, remote_port, first_seen, last_seen, bytes_sent, bytes_received, \
                         connections \
                  FROM flows WHERE id > ?1 ORDER BY id LIMIT ?2",
             )?
@@ -767,7 +846,12 @@ impl Store {
                     }
                     flow.first_ms = flow.first_ms.max(reset);
                 }
-                app.add_flow(flow, local_offset_secs);
+                let learned = if flow.is_overflow() {
+                    DestinationFacts::default()
+                } else {
+                    facts(&flow.destination())
+                };
+                app.add_flow(flow, &learned, local_offset_secs);
             }
         }
 
@@ -1175,11 +1259,29 @@ mod tests {
         }
     }
 
+    /// An address the test rule places in Germany.
+    const IN_GERMANY: &str = "198.51.100.7";
+
+    /// A simple rule for what a profile learns: the saved domain as it is,
+    /// company "X", and the country by address.
+    fn facts(flow: &BackfillFlow<'_>) -> DestinationFacts {
+        let germany: IpAddr = IN_GERMANY.parse().unwrap();
+        DestinationFacts {
+            domain: flow.domain.map(str::to_owned),
+            company: Some(String::from("X")),
+            country: Some(String::from(if flow.remote_ip == germany {
+                "DE"
+            } else {
+                "US"
+            })),
+        }
+    }
+
     #[test]
     fn backfill_builds_profile_from_flows() {
         let mut store = store("backfill-builds");
         let mut second = flow(Some(APP), "b.com", BASE + 5 * DAY, BASE + 5 * DAY, 10);
-        second.country = Some(String::from("DE"));
+        second.remote_ip = IN_GERMANY.parse().unwrap();
         store
             .insert_flows(&[
                 flow(Some(APP), "a.com", BASE + 100, BASE + 200, 10),
@@ -1189,7 +1291,7 @@ mod tests {
             ])
             .unwrap();
 
-        let progress = store.backfill_profiles(1_000, 0).unwrap();
+        let progress = store.backfill_profiles(1_000, 0, facts).unwrap();
         assert!(progress.done);
         assert_eq!(progress.flows_read, 4);
 
@@ -1225,7 +1327,7 @@ mod tests {
         store
             .insert_flows(&[flow(Some(APP), "a.com", first, last, 3_000)])
             .unwrap();
-        store.backfill_profiles(1_000, 0).unwrap();
+        store.backfill_profiles(1_000, 0, facts).unwrap();
         let hours = store
             .profile(&crate::known_app_key(APP))
             .unwrap()
@@ -1249,7 +1351,7 @@ mod tests {
         store
             .insert_flows(&[flow(Some(APP), "a.com", first, last, 11)])
             .unwrap();
-        store.backfill_profiles(1_000, 0).unwrap();
+        store.backfill_profiles(1_000, 0, facts).unwrap();
         let hours = store
             .profile(&crate::known_app_key(APP))
             .unwrap()
@@ -1276,13 +1378,77 @@ mod tests {
         whole.insert_flows(&flows).unwrap();
 
         let done: Vec<bool> = (0..3)
-            .map(|_| batched.backfill_profiles(10, 0).unwrap().done)
+            .map(|_| batched.backfill_profiles(10, 0, facts).unwrap().done)
             .collect();
         assert_eq!(done, [false, false, true]);
-        assert!(whole.backfill_profiles(1_000, 0).unwrap().done);
+        assert!(whole.backfill_profiles(1_000, 0, facts).unwrap().done);
 
         let key = crate::known_app_key(APP);
         assert_eq!(batched.profile(&key).unwrap(), whole.profile(&key).unwrap());
+    }
+
+    #[test]
+    fn backfill_learns_what_the_rule_says_not_the_saved_display_text() {
+        let mut store = store("backfill-rule");
+        let mut saved = flow(Some(APP), "api.chat.example", BASE, BASE + 10, 10);
+        saved.domain_source = Some(LabelSource::Unverified);
+        saved.owner = Some(String::from("Google · analytics"));
+        store.insert_flows(&[saved]).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        store
+            .backfill_profiles(1_000, 0, |flow| {
+                seen.borrow_mut().push((
+                    flow.remote_ip,
+                    flow.remote_port,
+                    flow.domain.map(str::to_owned),
+                    flow.domain_source,
+                ));
+                DestinationFacts::default()
+            })
+            .unwrap();
+        assert_eq!(
+            seen.into_inner(),
+            [(
+                "203.0.113.5".parse::<IpAddr>().unwrap(),
+                443,
+                Some(String::from("api.chat.example")),
+                Some(LabelSource::Unverified),
+            )]
+        );
+        let items = store
+            .profile(&crate::known_app_key(APP))
+            .unwrap()
+            .unwrap()
+            .items;
+        // Only the port: the rule learned nothing else, and the saved
+        // owner text is never used.
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(
+            (items[0].kind, items[0].value.as_str()),
+            (ItemKind::Port, "443")
+        );
+    }
+
+    #[test]
+    fn backfill_counts_overflow_bytes_but_learns_no_destination() {
+        let mut store = store("backfill-overflow");
+        let mut overflow = flow(Some(APP), "-", BASE, BASE, 700);
+        overflow.domain = None;
+        overflow.remote_ip = OVERFLOW_REMOTE.ip();
+        overflow.remote_port = OVERFLOW_REMOTE.port();
+        overflow.owner = Some(String::from("(many destinations)"));
+        store.insert_flows(&[overflow]).unwrap();
+        let asked = std::cell::Cell::new(0);
+        store
+            .backfill_profiles(1_000, 0, |flow| {
+                asked.set(asked.get() + 1);
+                facts(flow)
+            })
+            .unwrap();
+        assert_eq!(asked.get(), 0, "no destination to ask about");
+        let profile = store.profile(&crate::known_app_key(APP)).unwrap().unwrap();
+        assert!(profile.items.is_empty(), "{:?}", profile.items);
+        assert_eq!(profile.hours.iter().map(|h| h.bytes_sent).sum::<u64>(), 700);
     }
 
     #[test]
@@ -1291,8 +1457,8 @@ mod tests {
         store
             .insert_flows(&[flow(Some(APP), "a.com", BASE, BASE + 1, 10)])
             .unwrap();
-        assert!(store.backfill_profiles(1_000, 0).unwrap().done);
-        let again = store.backfill_profiles(1_000, 0).unwrap();
+        assert!(store.backfill_profiles(1_000, 0, facts).unwrap().done);
+        let again = store.backfill_profiles(1_000, 0, facts).unwrap();
         assert_eq!(again.flows_read, 0);
         assert!(again.done);
         let key = crate::known_app_key(APP);
@@ -1316,7 +1482,7 @@ mod tests {
                 flow(Some(APP), "b.com", at_hour(2), at_hour(2), 1),
             ])
             .unwrap();
-        store.backfill_profiles(1_000, 2 * 3_600).unwrap();
+        store.backfill_profiles(1_000, 2 * 3_600, facts).unwrap();
         let profile = store.profile(&crate::known_app_key(APP)).unwrap().unwrap();
         assert_eq!(profile.row.active_days, 2);
         assert_eq!(profile.row.last_active_day, Some(20_001));
@@ -1329,12 +1495,12 @@ mod tests {
             .map(|i| flow(Some(APP), "a.com", BASE + i * 100, BASE + i * 100, 10))
             .collect();
         store.insert_flows(&flows[..2]).unwrap();
-        assert!(!store.backfill_profiles(2, 0).unwrap().done);
+        assert!(!store.backfill_profiles(2, 0, facts).unwrap().done);
         store.insert_flows(&flows[2..]).unwrap();
-        let progress = store.backfill_profiles(2, 0).unwrap();
+        let progress = store.backfill_profiles(2, 0, facts).unwrap();
         assert_eq!(progress.flows_read, 2);
         assert!(!progress.done);
-        assert!(store.backfill_profiles(2, 0).unwrap().done);
+        assert!(store.backfill_profiles(2, 0, facts).unwrap().done);
         let hours = store
             .profile(&crate::known_app_key(APP))
             .unwrap()
@@ -1362,7 +1528,7 @@ mod tests {
         store
             .insert_flows(&[flow(Some(APP), "a.com", BASE, BASE + 10, 1)])
             .unwrap();
-        store.backfill_profiles(1_000, 0).unwrap();
+        store.backfill_profiles(1_000, 0, facts).unwrap();
         let items = store.profile(&key).unwrap().unwrap().items;
         let state = |kind, value: &str| {
             items
@@ -1395,7 +1561,7 @@ mod tests {
                 flow(Some(APP), "new.com", BASE + 4_000, BASE + 6_000, 10),
             ])
             .unwrap();
-        store.backfill_profiles(1_000, 0).unwrap();
+        store.backfill_profiles(1_000, 0, facts).unwrap();
         let profile = store.profile(&key).unwrap().unwrap();
         assert_eq!(profile.row.first_data, reset);
         assert_eq!(profile.row.learned_since, reset);

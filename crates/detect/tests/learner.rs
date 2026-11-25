@@ -390,6 +390,39 @@ fn flush_then_restart_adds_to_same_hour() {
 }
 
 #[test]
+fn dropped_profiles_are_read_again_and_held_traffic_is_kept() {
+    let mut db = TestStore::open("drop");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
+    let deltas = [delta(T0 + 60, "chat.example", 5 * MB, 1)];
+    learner.traffic(&app(), &deltas, &e, &mut db, at(T0 + 60));
+
+    // The stored profile changes behind the Learner's back (as when the
+    // store ages items out); without dropping its copy, it would still
+    // raise "new site" here.
+    assert!(db.set_goes_anywhere(&key(), GoesAnywhere::UserOn).unwrap());
+    learner.drop_profiles();
+    let new = flow(
+        Some("other.example"),
+        Some("Other Co"),
+        Some("RU"),
+        T0 + 120,
+    );
+    assert!(
+        learner.finished(&new, &e, &mut db, at(T0 + 120)).is_empty(),
+        "read again from the store"
+    );
+
+    // The traffic held before is still written.
+    learner.flush(&mut db, at(T0 + HOUR + 60)).unwrap();
+    assert!(learner.take_errors().is_empty());
+    let hours = db.profile(&key()).unwrap().unwrap().hours;
+    assert_eq!(hours.iter().map(|h| h.bytes_sent).sum::<u64>(), 5 * MB);
+}
+
+#[test]
 fn goes_anywhere_app_gets_no_destination_alerts() {
     let mut db = TestStore::open("anywhere");
     seed(&mut db, GoesAnywhere::UserOn, &[]);

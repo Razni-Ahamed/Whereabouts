@@ -581,6 +581,15 @@ impl Learner {
         self.time_checked.remove(key);
     }
 
+    /// Forgets the cached profiles only, so each is read from the store again
+    /// when next needed (after the store aged some out: call
+    /// [`Learner::flush`] first, so no written hour is lost). Traffic not yet
+    /// written, open alerts, pending links and suspect program files are
+    /// kept.
+    pub fn drop_profiles(&mut self) {
+        self.profiles.clear();
+    }
+
     /// Problems with the store since the last call, for the caller to report.
     pub fn take_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.errors)

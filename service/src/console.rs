@@ -98,7 +98,7 @@ impl Closed {
 }
 
 /// How often retention runs while the console is open.
-const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
+pub(crate) const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// How the engine runs.
 #[derive(Debug, Default)]
@@ -179,7 +179,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
     let mut store = match crate::storage::open() {
         Ok(mut store) => {
             crate::storage::apply_retention(&mut store);
-            crate::storage::expire_profiles(&mut store);
+            crate::storage::expire_profiles(&mut store, SystemTime::now());
             Some(store)
         }
         Err(error) => {
@@ -391,7 +391,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
             );
             let mut raised = Vec::new();
             if let Some(store) = store.as_mut() {
-                learning.tick(store, SystemTime::now());
+                learning.tick(store, &enricher, SystemTime::now());
                 raised.extend(store_finished(
                     store,
                     &mut closed,
@@ -403,7 +403,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 ));
                 if last_retention.elapsed() >= RETENTION_EVERY {
                     crate::storage::apply_retention(store);
-                    crate::storage::expire_profiles(store);
+                    learning.expire(store, SystemTime::now());
                     last_retention = Instant::now();
                 }
             }
@@ -996,28 +996,37 @@ fn prefill_from_cache(dns: &mut DnsMap, now: SystemTime) -> usize {
     answers.len()
 }
 
-/// Saves finished flows to the store. Normally only flows closed at least
-/// [`LATE_TRAFFIC_WINDOW`] ago are saved, because late traffic may still be
-/// added to them; with `everything`, all unsaved flows are saved.
+/// Whether a finished flow is ready to be saved and learned at `now`: it
+/// closed at least [`LATE_TRAFFIC_WINDOW`] ago (late traffic may still be
+/// added to it, and its program's identity may still arrive), or
+/// `everything` is wanted.
+fn is_due(row: &Row, everything: bool, now: Instant) -> bool {
+    everything
+        || row
+            .closed_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= LATE_TRAFFIC_WINDOW)
+}
+
+/// Saves finished flows to the store: those due at `now` (see [`is_due`]),
+/// and those pushed off the live list.
 fn save_closed(
     store: &mut Store,
     closed: &mut Closed,
     names: &ProcessNames,
     enricher: &Enricher,
     everything: bool,
+    now: Instant,
 ) {
     let mut records: Vec<FlowRecord> = closed
         .unsaved_evicted
         .drain(..)
         .map(|row| to_record(&row, names, enricher))
         .collect();
-    for row in closed.rows.iter_mut().filter(|row| {
-        !row.saved
-            && (everything
-                || row
-                    .closed_at
-                    .is_some_and(|at| at.elapsed() >= LATE_TRAFFIC_WINDOW))
-    }) {
+    for row in closed
+        .rows
+        .iter_mut()
+        .filter(|row| !row.saved && is_due(row, everything, now))
+    {
         records.push(to_record(row, names, enricher));
         row.saved = true;
     }
@@ -1048,19 +1057,19 @@ fn store_finished(
     learning: &mut crate::learning::Learning,
     everything: bool,
 ) -> Vec<crate::alerts::Raised> {
-    let raised = learn_finished(store, closed, names, enricher, learning, everything);
+    let now = Instant::now();
+    let raised = learn_finished(store, closed, names, enricher, learning, everything, now);
     if history.on() {
-        save_closed(store, closed, names, enricher, everything);
+        save_closed(store, closed, names, enricher, everything, now);
     } else {
         forget_unsaved(closed);
     }
     raised
 }
 
-/// Gives each finished flow to the behaviour Learner once. Like saving, it
-/// waits [`LATE_TRAFFIC_WINDOW`] after a flow closed (late traffic and the
-/// program's identity may still arrive), except with `everything` and for
-/// rows pushed off the live list, which are saved now too. Flows that
+/// Gives each finished flow to the behaviour Learner once, when it is due
+/// for saving too (see [`is_due`]; rows pushed off the live list are saved
+/// at once, so they are learned at once). Flows that
 /// finish while saved history is still being turned into profiles are
 /// passed over: the saved ones are learned from the history instead.
 fn learn_finished(
@@ -1070,23 +1079,18 @@ fn learn_finished(
     enricher: &Enricher,
     learning: &mut crate::learning::Learning,
     everything: bool,
+    now: Instant,
 ) -> Vec<crate::alerts::Raised> {
-    let now = SystemTime::now();
-    let due = |row: &Row| {
-        everything
-            || row
-                .closed_at
-                .is_some_and(|at| at.elapsed() >= LATE_TRAFFIC_WINDOW)
-    };
+    let time = SystemTime::now();
     let evicted = closed.unsaved_evicted.iter_mut().map(|row| (row, true));
     let shown = closed.rows.iter_mut().map(|row| (row, false));
     let mut raised = Vec::new();
     for (row, evicted) in evicted.chain(shown) {
-        if row.learned || !(evicted || due(row)) {
+        if row.learned || !(evicted || is_due(row, everything, now)) {
             continue;
         }
         row.learned = true;
-        raised.extend(learning.finished(&flow_input(row, names), enricher, store, now));
+        raised.extend(learning.finished(&flow_input(row, names), enricher, store, time));
     }
     raised
 }
@@ -1881,7 +1885,7 @@ mod tests {
     /// profiles, so it learns from live flows.
     fn learning(store: &mut Store) -> crate::learning::Learning {
         let mut learning = crate::learning::Learning::new(SystemTime::now());
-        learning.tick(store, SystemTime::now());
+        learning.tick(store, &enricher(), SystemTime::now());
         learning
     }
 
@@ -1957,17 +1961,14 @@ mod tests {
         );
         assert!(closed.rows[0].learned, "passed over once, not kept waiting");
 
-        // Live traffic: no program path, the flow-limit overflow, and (to
-        // show learning works at all) a flow with a path.
-        let mut overflow = row_to("0.0.0.0:0", None);
-        overflow.token = Some(2);
-        overflow.stats.bytes_sent = 7_000;
+        // Live traffic: no program path, and (to show learning works at
+        // all) a flow with a path.
         let mut known = row_to("203.0.113.2:443", None);
         known.token = Some(1);
         known.stats.bytes_sent = 9_000;
         learn_traffic(
             &mut learning,
-            &[unknown, overflow, known],
+            &[unknown, known],
             &names,
             &enricher,
             &mut store,
@@ -1987,6 +1988,128 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The downloaded offline data if present (so network owners and
+    /// countries are looked up too), otherwise the built-in lists only.
+    fn real_or_built_in_enricher() -> (Enricher, bool) {
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../data"));
+        let (real, report) = Enricher::load(&dir);
+        if report.missing.is_empty() {
+            (real, true)
+        } else {
+            eprintln!("note: data files missing, so owners and countries are not compared");
+            (enricher(), false)
+        }
+    }
+
+    #[test]
+    fn backfill_and_live_learn_the_same_destinations() {
+        use std::collections::BTreeSet;
+        use whereabouts_store::ItemKind;
+
+        let (enricher, real_data) = real_or_built_in_enricher();
+        let path = r"C:\Apps\chat.exe";
+        let mut names = ProcessNames::new();
+        names.identities.insert(1, identity(path));
+        let verified = LabelSource::Verified;
+        let flows = || {
+            [
+                // A known company's domain: the saved owner text was
+                // "Google (Firebase) · analytics", never a company name.
+                ("8.8.8.8:443", Some(("app-measurement.com", verified))),
+                // A full name of a non-browser app is saved as it is.
+                ("203.0.113.7:443", Some(("api.chat.example", verified))),
+                // Only the app said so: no domain.
+                (
+                    "198.51.100.3:443",
+                    Some(("fake.example", LabelSource::Unverified)),
+                ),
+                // Local: no owner or country.
+                ("192.168.1.20:8443", None),
+            ]
+            .map(|(remote, domain)| {
+                let mut row = finished(remote);
+                row.token = Some(1);
+                row.stats.domain = domain.map(|(name, source)| DomainLabel::new(name, source));
+                row
+            })
+        };
+        // By kind's stored spelling, so the sets compare in order.
+        let items = |store: &Store| -> BTreeSet<(&'static str, String)> {
+            store
+                .profile(&whereabouts_store::known_app_key(path))
+                .unwrap()
+                .expect("a profile")
+                .items
+                .into_iter()
+                .map(|item| (item.kind.as_str(), item.value))
+                .collect()
+        };
+        let history_on = crate::history::HistorySwitch::default();
+
+        // From history: saved before learning caught up, then read back.
+        let (mut saved, saved_dir) = temp_store("same-history");
+        let mut later = crate::learning::Learning::new(SystemTime::now());
+        let mut closed = Closed::default();
+        for row in flows() {
+            closed.push(row);
+        }
+        store_finished(
+            &mut saved,
+            &mut closed,
+            &names,
+            &enricher,
+            history_on,
+            &mut later,
+            false,
+        );
+        assert_eq!(saved.flow_count().unwrap(), 4);
+        assert!(saved.profile_rows().unwrap().is_empty(), "not learned live");
+        later.tick(&mut saved, &enricher, SystemTime::now());
+
+        // Live.
+        let (mut live, live_dir) = temp_store("same-live");
+        let mut learning = learning(&mut live);
+        let mut closed = Closed::default();
+        for row in flows() {
+            closed.push(row);
+        }
+        store_finished(
+            &mut live,
+            &mut closed,
+            &names,
+            &enricher,
+            history_on,
+            &mut learning,
+            false,
+        );
+
+        let learned = items(&live);
+        assert_eq!(items(&saved), learned);
+        let of = |kind: ItemKind| {
+            learned
+                .iter()
+                .filter(|(k, _)| *k == kind.as_str())
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            of(ItemKind::Domain),
+            ["app-measurement.com", "chat.example"]
+        );
+        assert_eq!(of(ItemKind::Port), ["443", "8443"]);
+        assert!(of(ItemKind::Company).iter().all(|c| !c.contains(" · ")));
+        if real_data {
+            assert!(
+                of(ItemKind::Company).iter().any(|c| c.contains("Google")),
+                "{learned:?}"
+            );
+            assert!(of(ItemKind::Country).contains(&"US"), "{learned:?}");
+        }
+        drop((saved, live));
+        let _ = std::fs::remove_dir_all(saved_dir);
+        let _ = std::fs::remove_dir_all(live_dir);
     }
 
     #[test]

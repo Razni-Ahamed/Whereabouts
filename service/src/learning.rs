@@ -1,6 +1,6 @@
 //! Feeds the behaviour Learner (Layer 2, design spec v0.3) from the live
-//! engine: each tick's traffic, finished flows, the hourly write and the
-//! first turning of saved history into profiles.
+//! engine: each tick's traffic, finished flows, the hourly write, ageing out
+//! and the first turning of saved history into profiles.
 //!
 //! Only flows whose program file is known are learned: the profile is the
 //! program's, found by its path. The engine calls [`Learning::tick`] once per
@@ -9,8 +9,12 @@
 //! [`Learning::shutdown`] when it stops. Nothing is learned until the saved
 //! history has been turned into profiles (it reads every saved flow, so a
 //! flow learned live before then could be counted twice).
+//!
+//! What a profile learns about where a flow went has one rule,
+//! [`destination_facts`], used for live flows and for saved history alike.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -19,19 +23,63 @@ use whereabouts_core::flow::{FlowKey, FlowStats};
 use whereabouts_core::model::{AppIdentity, Signature};
 use whereabouts_detect::learner::{AppFacts, Finished, Learner};
 use whereabouts_detect::meter::{Delta, FlowSample, Meter};
-use whereabouts_enrich::{Enricher, Scope};
-use whereabouts_store::{Store, known_app_key};
+use whereabouts_enrich::{Enricher, Scope, registrable_domain};
+use whereabouts_store::{DestinationFacts, Store, known_app_key};
 
 use crate::alerts::Raised;
 
 /// Saved flows turned into profiles per tick while catching up.
 const BACKFILL_BATCH: usize = 5_000;
+/// After catching up failed, how long until it is tried again.
+const BACKFILL_RETRY: Duration = crate::console::RETENTION_EVERY;
 /// How often the local time zone's offset is checked again (it changes with
 /// daylight saving time, or when the user travels).
 const OFFSET_EVERY: Duration = Duration::from_secs(15 * 60);
 /// On shutdown, hours are written as if this much later, so the hour still
 /// running is written too.
 const HOUR: Duration = Duration::from_secs(3_600);
+
+/// What a behaviour profile learns about where a flow went, the same for
+/// live flows and saved ones: the registrable domain of a name that was
+/// confirmed (one only the app itself reported could be false), and the
+/// network's owner and country from the IP address. Local and multicast
+/// addresses (and the flow-limit overflow's) have no owner or country.
+pub fn destination_facts(
+    remote_ip: IpAddr,
+    domain: Option<&str>,
+    domain_source: Option<LabelSource>,
+    enricher: &Enricher,
+) -> DestinationFacts {
+    let ip = enricher.ip(remote_ip);
+    let (company, country) = match ip.scope {
+        Scope::Internet => (ip.network, ip.country),
+        Scope::Local | Scope::Multicast => (None, None),
+    };
+    DestinationFacts {
+        domain: confirmed_domain(domain, domain_source),
+        company: company.filter(|name| !name.is_empty()),
+        country: country.filter(|code| !code.is_empty()),
+    }
+}
+
+/// The registrable domain of `name`, only if it was confirmed.
+fn confirmed_domain(name: Option<&str>, source: Option<LabelSource>) -> Option<String> {
+    match source? {
+        LabelSource::Verified | LabelSource::Inferred => registrable_domain(name?),
+        LabelSource::Unverified => None,
+    }
+}
+
+/// How far turning the saved history into profiles has got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackfillState {
+    /// Still reading saved flows, a batch per tick; nothing is learned live.
+    Running,
+    /// Done: learning from live traffic.
+    Done,
+    /// The last attempt failed with this error; it is tried again later.
+    Failed(String),
+}
 
 /// One flow as the engine shows it.
 #[derive(Debug, Clone, Copy)]
@@ -51,11 +99,10 @@ pub struct FlowInput<'a> {
 pub struct Learning {
     learner: Learner,
     meter: Meter,
-    /// Whether the saved history has been turned into profiles: until then
-    /// the Learner is given nothing.
-    ready: bool,
-    /// Whether the last attempt to catch up failed (reported once).
-    backfill_failing: bool,
+    /// Until this is `Done`, the Learner is given nothing.
+    backfill: BackfillState,
+    /// After a failure, when to try catching up again.
+    retry_at: Option<Instant>,
     /// Saved flows read while catching up.
     backfilled: u64,
     /// The local time zone's offset from UTC, and when it was checked.
@@ -76,8 +123,8 @@ impl Learning {
         Self {
             learner: crate::alerts::new_learner(offset_secs),
             meter: Meter::default(),
-            ready: false,
-            backfill_failing: false,
+            backfill: BackfillState::Running,
+            retry_at: None,
             backfilled: 0,
             offset_secs,
             offset_checked: Instant::now(),
@@ -86,52 +133,70 @@ impl Learning {
         }
     }
 
+    /// How far turning the saved history into profiles has got.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "shown in the status from the next task on")
+    )]
+    pub fn backfill_state(&self) -> &BackfillState {
+        &self.backfill
+    }
+
+    fn ready(&self) -> bool {
+        self.backfill == BackfillState::Done
+    }
+
     /// Housekeeping, once per refresh: catches up with the saved history
     /// (a batch at a time), checks the time zone every 15 minutes, and
     /// writes the hours that ended.
-    pub fn tick(&mut self, store: &mut Store, now: SystemTime) {
+    pub fn tick(&mut self, store: &mut Store, enricher: &Enricher, now: SystemTime) {
         if self.offset_checked.elapsed() >= OFFSET_EVERY {
             self.offset_secs = crate::clock::local_offset_secs(now);
             self.learner.set_local_offset(self.offset_secs);
             self.offset_checked = Instant::now();
         }
-        if !self.ready {
-            self.catch_up(store);
+        if !self.ready() {
+            self.catch_up(store, enricher);
         }
         let hour = unix_hour(now);
-        if self.hour.is_some_and(|last| last != hour)
-            && let Err(error) = self.learner.flush(store, now)
-        {
-            report!("warning: could not save behaviour profiles: {error}");
+        if self.hour.is_some_and(|last| last != hour) {
+            self.flush(store, now);
         }
         self.hour = Some(hour);
     }
 
-    /// Turns the next batch of saved flows into profiles. An error is
-    /// reported once and tried again next tick; detection keeps running.
-    fn catch_up(&mut self, store: &mut Store) {
-        match store.backfill_profiles(BACKFILL_BATCH, self.offset_secs) {
+    /// Turns the next batch of saved flows into profiles. After an error,
+    /// it is tried again an hour later; detection keeps running meanwhile.
+    fn catch_up(&mut self, store: &mut Store, enricher: &Enricher) {
+        if self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        let facts = |flow: &whereabouts_store::BackfillFlow<'_>| {
+            destination_facts(flow.remote_ip, flow.domain, flow.domain_source, enricher)
+        };
+        match store.backfill_profiles(BACKFILL_BATCH, self.offset_secs, facts) {
             Ok(progress) => {
-                self.backfill_failing = false;
+                self.retry_at = None;
                 self.backfilled = self.backfilled.saturating_add(progress.flows_read);
                 if progress.done {
-                    self.ready = true;
+                    self.backfill = BackfillState::Done;
                     if self.backfilled > 0 {
                         println!(
                             "Behaviour profiles: learned from {} saved flows",
                             self.backfilled
                         );
                     }
+                } else {
+                    self.backfill = BackfillState::Running;
                 }
             }
             Err(error) => {
-                if !self.backfill_failing {
-                    report!(
-                        "warning: could not learn from the saved history yet (will keep \
-                         trying): {error}"
-                    );
-                }
-                self.backfill_failing = true;
+                report!(
+                    "warning: could not learn from the saved history yet (trying again in an \
+                     hour): {error}"
+                );
+                self.backfill = BackfillState::Failed(error.to_string());
+                self.retry_at = Some(Instant::now() + BACKFILL_RETRY);
             }
         }
     }
@@ -139,7 +204,8 @@ impl Learning {
     /// Adds what the shown flows did since the last tick to their apps'
     /// hours, and returns the alerts that raised. Each flow is counted once
     /// per tick: rows with the same key (a flow that finished and started
-    /// again) are added together.
+    /// again) are added together. A process's flow-limit overflow counts
+    /// too (so many flows cannot hide an upload), with no destination.
     pub fn traffic(
         &mut self,
         flows: &[FlowInput<'_>],
@@ -151,11 +217,16 @@ impl Learning {
         let mut at: HashMap<FlowKey, usize> = HashMap::new();
         // The first flow seen for each app supplies its facts.
         let mut apps: HashMap<String, (&FlowInput<'_>, &AppIdentity)> = HashMap::new();
-        for flow in flows.iter().filter(|flow| !flow.key.is_overflow()) {
+        for flow in flows {
             let Some(identity) = program(flow) else {
                 continue;
             };
             let app_key = known_app_key(&identity.path);
+            let destination = if flow.key.is_overflow() {
+                None
+            } else {
+                flow_domain(flow.stats)
+            };
             match at.get(&flow.key).map(|&index| &mut samples[index]) {
                 Some(sample) if sample.app_key == app_key => {
                     sample.bytes_sent = sample.bytes_sent.saturating_add(flow.stats.bytes_sent);
@@ -164,7 +235,7 @@ impl Learning {
                         .saturating_add(flow.stats.bytes_received);
                     sample.connections = sample.connections.saturating_add(flow.stats.connections);
                     if sample.destination.is_none() {
-                        sample.destination = confirmed_domain(flow.stats);
+                        sample.destination = destination;
                     }
                 }
                 // The same key for another program (a reused process ID):
@@ -175,7 +246,7 @@ impl Learning {
                     samples.push(FlowSample {
                         key: flow.key,
                         app_key: app_key.clone(),
-                        destination: confirmed_domain(flow.stats),
+                        destination,
                         bytes_sent: flow.stats.bytes_sent,
                         bytes_received: flow.stats.bytes_received,
                         connections: flow.stats.connections,
@@ -188,7 +259,7 @@ impl Learning {
         // The meter keeps up while catching up, so traffic from before
         // learning started is not counted afterwards.
         let deltas = self.meter.sample(now, &samples);
-        if !self.ready {
+        if !self.ready() {
             return Vec::new();
         }
         let mut by_app: BTreeMap<String, Vec<Delta>> = BTreeMap::new();
@@ -209,7 +280,8 @@ impl Learning {
     }
 
     /// Adds a finished flow's destinations to its app's profile, and
-    /// returns the alerts that raised. Call it once per flow.
+    /// returns the alerts that raised. Call it once per flow. The flow-limit
+    /// overflow went to many places, so nothing is learned from it.
     pub fn finished(
         &mut self,
         flow: &FlowInput<'_>,
@@ -217,26 +289,25 @@ impl Learning {
         store: &mut Store,
         now: SystemTime,
     ) -> Vec<Raised> {
-        if !self.ready || flow.key.is_overflow() {
+        if !self.ready() || flow.key.is_overflow() {
             return Vec::new();
         }
         let Some(identity) = program(flow) else {
             return Vec::new();
         };
         let installed = self.installed_by_admins(identity);
-        let domain = confirmed_domain(flow.stats);
-        // The network's owner and country come from the IP address itself;
-        // local and multicast addresses have neither.
-        let ip = enricher.ip(flow.key.remote.ip());
-        let (company, country) = match ip.scope {
-            Scope::Internet => (ip.network, ip.country),
-            Scope::Local | Scope::Multicast => (None, None),
-        };
+        let label = flow.stats.domain.as_ref();
+        let facts = destination_facts(
+            flow.key.remote.ip(),
+            label.map(|label| label.name.as_ref()),
+            label.map(|label| label.source),
+            enricher,
+        );
         let finished = Finished {
             app: app_facts(flow.app, identity, installed),
-            domain: domain.as_deref(),
-            company: company.as_deref(),
-            country: country.as_deref(),
+            domain: facts.domain.as_deref(),
+            company: facts.company.as_deref(),
+            country: facts.country.as_deref(),
             port: flow.key.remote.port(),
             first_seen: flow.stats.first_seen,
             last_seen: flow.stats.last_seen,
@@ -244,6 +315,17 @@ impl Learning {
         let raised = self.learner.finished(&finished, enricher, store, now);
         self.report_errors();
         raised
+    }
+
+    /// Ages out what is old in the stored profiles. If anything went, the
+    /// hours that ended are written and the cached profiles are read again
+    /// when next needed, so what was deleted is not still counted as known.
+    pub fn expire(&mut self, store: &mut Store, now: SystemTime) {
+        let expiry = crate::storage::expire_profiles(store, now);
+        if expiry.profiles > 0 || expiry.items > 0 || expiry.hours > 0 {
+            self.flush(store, now);
+            self.learner.drop_profiles();
+        }
     }
 
     /// Starts over after "Delete everything": the profiles the Learner held
@@ -256,8 +338,12 @@ impl Learning {
     /// Writes everything held, including the hour still running (call it
     /// when the engine stops).
     pub fn shutdown(&mut self, store: &mut Store, now: SystemTime) {
-        let later = now.checked_add(HOUR).unwrap_or(now);
-        if let Err(error) = self.learner.flush(store, later) {
+        self.flush(store, now.checked_add(HOUR).unwrap_or(now));
+    }
+
+    /// Writes the hours that ended before `now`.
+    fn flush(&mut self, store: &mut Store, now: SystemTime) {
+        if let Err(error) = self.learner.flush(store, now) {
             report!("warning: could not save behaviour profiles: {error}");
         }
     }
@@ -292,14 +378,10 @@ fn program<'a>(flow: &FlowInput<'a>) -> Option<&'a AppIdentity> {
     flow.identity.filter(|identity| !identity.path.is_empty())
 }
 
-/// The registrable domain of the flow's name, only if the name was
-/// confirmed (not one only the app itself reported, which could be false).
-fn confirmed_domain(stats: &FlowStats) -> Option<String> {
-    stats
-        .domain
-        .as_ref()
-        .filter(|label| label.source != LabelSource::Unverified)
-        .and_then(|label| whereabouts_enrich::registrable_domain(&label.name))
+/// The flow's confirmed registrable domain (see [`destination_facts`]).
+fn flow_domain(stats: &FlowStats) -> Option<String> {
+    let label = stats.domain.as_ref()?;
+    confirmed_domain(Some(&label.name), Some(label.source))
 }
 
 fn app_facts<'a>(app: &'a str, identity: &'a AppIdentity, installed: bool) -> AppFacts<'a> {
@@ -323,4 +405,227 @@ fn unix_hour(time: SystemTime) -> i64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     i64::try_from(secs / 3_600).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use whereabouts_core::dns::DomainLabel;
+    use whereabouts_core::model::Protocol;
+    use whereabouts_enrich::{CompanyList, GeoDatabases, TrackerList};
+    use whereabouts_store::{BACKFILL_SETTING, ItemKind, Key};
+
+    const PATH: &str = r"C:\Apps\chat.exe";
+    /// 2027-01-15 08:00 UTC, on the hour.
+    const T0: u64 = 1_800_000_000;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn enricher() -> Enricher {
+        Enricher::from_parts(
+            TrackerList::parse(""),
+            CompanyList::built_in(),
+            GeoDatabases::default(),
+        )
+    }
+
+    fn temp_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "whereabouts-learning-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = Key::from_bytes([6; 32]);
+        (Store::open(&dir.join("t.db"), &key).unwrap(), dir)
+    }
+
+    fn identity() -> AppIdentity {
+        AppIdentity {
+            path: PATH.to_owned(),
+            signature: Signature::Unsigned,
+            sha256: Some("cd".repeat(32)),
+            size: Some(1_000),
+            package_family_name: None,
+            confirmed_running: true,
+        }
+    }
+
+    fn stats(domain: Option<(&str, LabelSource)>, sent: u64) -> FlowStats {
+        let mut stats = FlowStats::new(at(T0));
+        stats.domain = domain.map(|(name, source)| DomainLabel::new(name, source));
+        stats.bytes_sent = sent;
+        stats.connections = 1;
+        stats
+    }
+
+    fn key(remote: &str) -> FlowKey {
+        FlowKey {
+            pid: 40,
+            protocol: Protocol::Tcp,
+            remote: remote.parse().unwrap(),
+        }
+    }
+
+    fn input<'a>(key: FlowKey, identity: &'a AppIdentity, stats: &'a FlowStats) -> FlowInput<'a> {
+        FlowInput {
+            key,
+            app: "chat.exe",
+            identity: Some(identity),
+            stats,
+        }
+    }
+
+    /// Learning that has caught up with the (empty) saved history.
+    fn ready(store: &mut Store, now: SystemTime) -> Learning {
+        let mut learning = Learning::new(now);
+        learning.tick(store, &enricher(), now);
+        assert_eq!(learning.backfill_state(), &BackfillState::Done);
+        learning
+    }
+
+    fn profile(store: &Store) -> Option<whereabouts_store::StoredProfile> {
+        store.profile(&known_app_key(PATH)).unwrap()
+    }
+
+    #[test]
+    fn only_confirmed_names_give_a_domain() {
+        let e = enricher();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let domain = |source| destination_facts(ip, Some("api.chat.example"), source, &e).domain;
+        assert_eq!(
+            domain(Some(LabelSource::Verified)).as_deref(),
+            Some("chat.example")
+        );
+        assert_eq!(
+            domain(Some(LabelSource::Inferred)).as_deref(),
+            Some("chat.example")
+        );
+        assert_eq!(domain(Some(LabelSource::Unverified)), None);
+        assert_eq!(domain(None), None);
+    }
+
+    #[test]
+    fn local_and_overflow_addresses_have_no_owner_or_country() {
+        let e = enricher();
+        for ip in ["192.168.1.1", "224.0.0.251", "0.0.0.0", "fe80::1"] {
+            let facts = destination_facts(ip.parse().unwrap(), None, None, &e);
+            assert_eq!(facts, DestinationFacts::default(), "{ip}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_learned_before_the_history_is_caught_up() {
+        let (mut store, dir) = temp_store("not-ready");
+        let identity = identity();
+        let flow = stats(Some(("chat.example", LabelSource::Verified)), 5_000);
+        let row = input(key("203.0.113.9:443"), &identity, &flow);
+        let e = enricher();
+        let mut learning = Learning::new(at(T0));
+        assert_eq!(learning.backfill_state(), &BackfillState::Running);
+        assert!(learning.traffic(&[row], &e, &mut store, at(T0)).is_empty());
+        assert!(learning.finished(&row, &e, &mut store, at(T0)).is_empty());
+        learning.shutdown(&mut store, at(T0));
+        assert!(store.profile_rows().unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_catch_up_waits_before_trying_again() {
+        let (mut store, dir) = temp_store("retry");
+        store
+            .set_setting(BACKFILL_SETTING, "not a flow id")
+            .unwrap();
+        let e = enricher();
+        let mut learning = Learning::new(at(T0));
+        learning.tick(&mut store, &e, at(T0));
+        assert!(matches!(
+            learning.backfill_state(),
+            BackfillState::Failed(_)
+        ));
+        // Fixed, but not tried again on the next tick.
+        store.set_setting(BACKFILL_SETTING, "done").unwrap();
+        learning.tick(&mut store, &e, at(T0 + 2));
+        assert!(matches!(
+            learning.backfill_state(),
+            BackfillState::Failed(_)
+        ));
+        // Once the wait is over, it is.
+        learning.retry_at = Some(Instant::now());
+        learning.tick(&mut store, &e, at(T0 + 4));
+        assert_eq!(learning.backfill_state(), &BackfillState::Done);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn overflow_bytes_are_counted_but_no_destination_is_learned() {
+        let (mut store, dir) = temp_store("overflow");
+        let identity = identity();
+        let e = enricher();
+        let mut learning = ready(&mut store, at(T0));
+        let flow = stats(None, 7_000);
+        let overflow = input(FlowKey::overflow(40, Protocol::Tcp), &identity, &flow);
+        learning.traffic(&[overflow], &e, &mut store, at(T0 + 60));
+        assert!(
+            learning
+                .finished(&overflow, &e, &mut store, at(T0 + 60))
+                .is_empty()
+        );
+        learning.shutdown(&mut store, at(T0 + 60));
+        let profile = profile(&store).expect("its bytes made a profile");
+        assert!(profile.items.is_empty(), "{:?}", profile.items);
+        assert_eq!(
+            profile.hours.iter().map(|h| h.bytes_sent).sum::<u64>(),
+            7_000
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hours_are_written_when_the_hour_changes() {
+        let (mut store, dir) = temp_store("hour");
+        let identity = identity();
+        let e = enricher();
+        let mut learning = ready(&mut store, at(T0 + 60));
+        let flow = stats(Some(("chat.example", LabelSource::Verified)), 3_000);
+        let row = input(key("203.0.113.9:443"), &identity, &flow);
+        learning.traffic(&[row], &e, &mut store, at(T0 + 60));
+        // Same hour: nothing written yet.
+        learning.tick(&mut store, &e, at(T0 + 120));
+        assert!(profile(&store).unwrap().hours.is_empty());
+        // The next hour: the hour that ended is written.
+        learning.tick(&mut store, &e, at(T0 + 3_600 + 5));
+        let hours = profile(&store).unwrap().hours;
+        assert_eq!(hours.len(), 1);
+        assert_eq!(hours[0].bytes_sent, 3_000);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_finished_flow_teaches_its_confirmed_destination() {
+        let (mut store, dir) = temp_store("finished");
+        let identity = identity();
+        let e = enricher();
+        let mut learning = ready(&mut store, at(T0));
+        let flow = stats(Some(("api.chat.example", LabelSource::Unverified)), 10);
+        let row = input(key("192.168.1.20:8443"), &identity, &flow);
+        learning.finished(&row, &e, &mut store, at(T0));
+        let items: Vec<(ItemKind, String)> = profile(&store)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| (item.kind, item.value))
+            .collect();
+        // An app-reported name and a local address: only the port.
+        assert_eq!(items, [(ItemKind::Port, String::from("8443"))]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
