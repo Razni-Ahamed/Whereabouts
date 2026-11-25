@@ -1201,3 +1201,59 @@ fn failed_alert_save_learns_nothing() {
     );
     assert!(learner.take_errors().is_empty());
 }
+
+/// `count` random-looking domains, all different.
+fn random_domains(count: usize) -> Vec<String> {
+    // 36 different characters: every 12-character window looks random.
+    const CHARS: &[u8] = b"q7x9k2m4zt8wbhn3vr1y6pd5cjlfgs0aeiou";
+    (0..count)
+        .map(|n| {
+            let label: String = (0..12)
+                .map(|i| char::from(CHARS[(n + i) % CHARS.len()]))
+                .collect();
+            format!("{label}.example")
+        })
+        .collect()
+}
+
+#[test]
+fn a_value_the_cap_dropped_still_counts_on_its_alert_after_a_restart() {
+    let mut db = TestStore::open("dropped-relink");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let domains = random_domains(30);
+    {
+        let mut before = Learner::new(Toggles::default(), 0);
+        for (n, domain) in domains.iter().enumerate() {
+            let secs = T0 + n as u64 * 10;
+            let new = flow(Some(domain), Some("Chat Inc"), Some("DE"), secs);
+            before.finished(&new, &e, &mut db, at(secs));
+        }
+        assert!(before.take_errors().is_empty());
+    }
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1, "one window, one alert");
+    assert!(saved[0].dropped_reasons > 0);
+    let last = domains.last().unwrap();
+    assert!(
+        !saved[0]
+            .reasons
+            .iter()
+            .any(|r| r.value.as_deref() == Some(last.as_str())),
+        "the cap dropped the last name"
+    );
+    assert_eq!(state(&db, ItemKind::Domain, last), Some(ItemState::Pending));
+
+    // After a restart, seeing it again counts on the alert still open.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let secs = T0 + HOUR;
+    let again = flow(Some(last), Some("Chat Inc"), Some("DE"), secs);
+    assert!(
+        learner.finished(&again, &e, &mut db, at(secs)).is_empty(),
+        "no new alert while one waits"
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].seen_again, 1);
+    assert!(learner.take_errors().is_empty());
+}

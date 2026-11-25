@@ -571,17 +571,21 @@ impl Learner {
     /// to the alerts waiting on them, as this Learner would hold them had it
     /// been running: to the newest open behaviour alert naming each (keeping
     /// its "seen again" count), or, when the user already closed that alert,
-    /// to a reminder ("remind me"). Links this run already holds are kept.
+    /// to a reminder ("remind me"). A destination no open alert names may
+    /// be one whose reason the alert dropped (it keeps only so many): it
+    /// waits on the newest open alert that dropped reasons and was raised
+    /// by the time the destination was last seen. Links this run already
+    /// holds are kept.
     fn relink(&mut self, key: &str, store: &Store) {
         let Some(profile) = self.profiles.get(key) else {
             return;
         };
-        let pending: Vec<(ItemKind, String)> = profile
+        let pending: Vec<(ItemKind, String, SystemTime)> = profile
             .stored()
             .items
             .iter()
             .filter(|item| item.state == ItemState::Pending)
-            .map(|item| (item.kind, item.value.clone()))
+            .map(|item| (item.kind, item.value.clone(), item.last_seen))
             .collect();
         if pending.is_empty() {
             return;
@@ -595,15 +599,21 @@ impl Learner {
                 return;
             }
         };
-        for (kind, value) in pending {
-            let naming = open
-                .iter()
+        let since_reset = || {
+            open.iter()
                 .rev()
                 .filter(|alert| reset.is_none_or(|reset| alert.created >= reset))
+        };
+        for (kind, value, last_seen) in pending {
+            let naming = since_reset()
                 .find(|alert| {
                     alert.reasons.iter().any(|r| {
                         item_kind(r.signal) == Some(kind) && r.value.as_deref() == Some(&value)
                     })
+                })
+                .or_else(|| {
+                    since_reset()
+                        .find(|alert| alert.dropped_reasons > 0 && alert.created <= last_seen)
                 });
             match naming {
                 Some(alert) => {
