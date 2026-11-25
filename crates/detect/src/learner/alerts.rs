@@ -145,9 +145,17 @@ impl Alerts {
             if store.update_alert(window.id, &reasons, severity, seen_again, now)? {
                 let raised = severity > window.alert.severity;
                 // A signal that can be allowed may join an alert that began
-                // without one: the alert gains its "this is fine".
+                // without one: the alert gains its "this is fine", if the
+                // reason was kept (one the cap dropped is never shown).
                 if window.alert.allow_key.is_none()
-                    && let Some(allow) = reasons.iter().find_map(|r| allow_key(key, r))
+                    && let Some(allow) = reasons
+                        .iter()
+                        .filter(|r| {
+                            merged
+                                .iter()
+                                .any(|m| m.signal == r.signal && m.value == r.value)
+                        })
+                        .find_map(|r| allow_key(key, r))
                     && store.set_allow_key(window.id, &allow)?
                 {
                     window.alert.allow_key = Some(allow);
@@ -166,9 +174,13 @@ impl Alerts {
             }
         }
 
+        // The store keeps the same reasons and counts the rest; only a kept
+        // reason, one the user sees, can give the alert its "this is fine".
+        let mut kept = reasons.clone();
+        cap_reasons(&mut kept);
         let mut alert = NewAlert {
             key: format!("behaviour|{key}|{secs}"),
-            allow_key: reasons.iter().find_map(|r| allow_key(key, r)),
+            allow_key: kept.iter().find_map(|r| allow_key(key, r)),
             kind: AlertKind::Behaviour,
             severity: combined(&reasons),
             app_name: Some(app.app_name.to_owned()),
@@ -181,8 +193,7 @@ impl Alerts {
             return Ok(Saved::default());
         };
         self.mark_today(key, &alert.reasons);
-        // The store kept the same reasons and counted the rest.
-        cap_reasons(&mut alert.reasons);
+        alert.reasons = kept;
         self.windows.insert(
             key.to_owned(),
             Window {
@@ -359,6 +370,7 @@ fn combined(reasons: &[Reason]) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whereabouts_store::MAX_REASONS;
 
     fn reason(signal: Signal, value: Option<&str>) -> Reason {
         Reason {
@@ -437,6 +449,69 @@ mod tests {
         alerts.close(8);
         alerts.unlink("k", ItemKind::Company, "Acme");
         assert_eq!(alerts.link("k", ItemKind::Company, "Acme"), None);
+    }
+
+    /// A temporary store and its folder (removed by the caller).
+    fn store(name: &str) -> (Store, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("whereabouts-alerts-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = whereabouts_store::Key::from_bytes([3; 32]);
+        (Store::open(&dir.join("t.db"), &key).unwrap(), dir)
+    }
+
+    fn app() -> AppFacts<'static> {
+        AppFacts {
+            app_name: "Chat.exe",
+            path: r"C:\Apps\Chat.exe",
+            sha256: None,
+            publisher: None,
+            signature_valid: false,
+            installed_by_admins: false,
+        }
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    /// `count` new companies (info, nothing to allow).
+    fn companies(count: usize) -> Vec<Reason> {
+        (0..count)
+            .map(|n| reason(Signal::NewCompany, Some(&format!("Company {n}"))))
+            .collect()
+    }
+
+    #[test]
+    fn a_reason_the_cap_dropped_gives_no_allow_key() {
+        let (mut store, dir) = store("dropped-allow");
+        let mut alerts = Alerts::default();
+        let hour = reason(Signal::UnusualTime, Some("03"));
+
+        // A new alert whose allowable reason is cut by the cap.
+        let mut first = companies(MAX_REASONS);
+        first.push(hour.clone());
+        let saved = alerts
+            .save("k", &app(), first, &mut store, at(1_000))
+            .unwrap();
+        let id = saved.id.unwrap();
+        assert_eq!(alerts.windows["k"].alert.allow_key, None);
+        assert!(!store.alert(id).unwrap().unwrap().can_allow);
+
+        // An alert already full: an allowable reason joining it is dropped
+        // and gives it no "this is fine".
+        let later = vec![reason(Signal::UnusualTime, Some("04"))];
+        let saved = alerts
+            .save("k", &app(), later, &mut store, at(1_060))
+            .unwrap();
+        assert_eq!(saved.id, Some(id));
+        assert_eq!(alerts.windows["k"].alert.allow_key, None);
+        let stored = store.alert(id).unwrap().unwrap();
+        assert!(!stored.can_allow, "the user never saw the reason");
+        assert_eq!(stored.dropped_reasons, 2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
