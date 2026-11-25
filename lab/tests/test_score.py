@@ -296,5 +296,16 @@ def test_report_prints_the_artifact_count(tmp_path):
     scored = score.match([other], [], INFO)
     report.write([("Layer 1", scored)], INFO, tmp_path)
     text = (tmp_path / "report.md").read_text(encoding="utf-8")
-    assert "Lab artifacts excluded (Layer 1): 1 alerts from the synthetic SBL-LAB entry" in text
+    assert "Lab artifacts excluded (Layer 1): 1 alert (any severity) from the synthetic SBL-LAB entry" in text
     assert "lab artifacts, not false alarms" in text
+
+
+def test_sbl_lab_hit_on_the_scenarios_own_app_is_a_real_false_alarm():
+    known_bad = label(kind="known_bad", app="curl.exe")
+    detail = "93.184.215.0/24 (SBL-LAB)"
+    late = {**alert(app="curl.exe", time=known_bad["end"] + 3601 + 100), "detail": detail}
+    other_user = {**alert(app="curl.exe", user="office-2"), "detail": detail}
+    chrome = {**alert(app="chrome.exe"), "detail": detail}
+    scored = score.match([late, other_user, chrome], [known_bad], INFO)
+    assert scored.false_alarms == [other_user, late] or scored.false_alarms == [late, other_user]
+    assert scored.artifacts == [chrome]

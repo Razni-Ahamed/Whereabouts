@@ -69,6 +69,12 @@ def _fmt(value: float | None, unit: str = "") -> str:
     return "—" if value is None else f"{value:.2f}{unit}" if isinstance(value, float) else f"{value}{unit}"
 
 
+def _artifacts(count: int) -> str:
+    noun = "alert" if count == 1 else "alerts"
+    return (f"{count} {noun} (any severity) from the synthetic SBL-LAB entry on other apps' traffic "
+            "to shared addresses")
+
+
 def _minutes(seconds: float | None) -> str:
     return "—" if seconds is None else f"{seconds / 60:.1f} min"
 
@@ -236,8 +242,7 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path,
         lines.append(f"| {name} | {_fmt(s.fa_medium_plus)} | {_fmt(s.fa_notified)} | ≤ {TARGET:g} |")
     for name, s in results:
         lines.append("")
-        lines.append(f"Lab artifacts excluded ({name}): {len(s.artifacts)} alerts from the synthetic SBL-LAB "
-                     "entry on other apps' traffic to shared addresses")
+        lines.append(f"Lab artifacts excluded ({name}): {_artifacts(len(s.artifacts))}")
     lines += ["", "![False alarms](false_alarms.png)", "", "## Staged problems", "",
               "| Layers | Scenario | Instances | Detected | Rate | Time to detect (median / max) |",
               "|---|---|---|---|---|---|"]
@@ -284,8 +289,7 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path,
         summary.append(f"| {name} | {_fmt(s.fa_medium_plus)} | {_fmt(s.fa_notified)} | {found}/{total} |")
     for name, s in results:
         if s.artifacts:
-            summary += ["", f"Lab artifacts excluded ({name}): {len(s.artifacts)} alerts from the synthetic "
-                        "SBL-LAB entry on other apps' traffic to shared addresses"]
+            summary += ["", f"Lab artifacts excluded ({name}): {_artifacts(len(s.artifacts))}"]
     for bar in bars:
         summary += ["", f"**{bar['label']}**, {bar['result']}: **{bar['line']}**"]
     summary += ["", "Full report and charts: the `lab-report` artifact."]

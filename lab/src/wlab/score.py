@@ -20,7 +20,7 @@
 - A **lab artifact** (R30) is an unmatched `bad_network` alert whose detail
   names the lab's synthetic `SBL-LAB` DROP entry: that entry is example.com's
   address, shared with other apps' traffic (e.g. Cloudflare), so such a hit on
-  another app is no real false alarm. It is counted separately, never as a
+  an app the scenario never ran on is no real false alarm. It is counted separately, never as a
   false alarm. Matching `known_bad` detections are unchanged.
 """
 
@@ -62,9 +62,15 @@ def _matches(alert: dict, label: dict, grace: int) -> bool:
     return label["start"] <= alert["time"] <= label["end"] + grace
 
 
-def is_lab_artifact(alert: dict) -> bool:
-    """A bad-network hit on the lab's synthetic SBL-LAB entry (R30)."""
-    return alert.get("kind") == "bad_network" and LAB_ENTRY in (alert.get("detail") or "")
+def is_lab_artifact(alert: dict, labels: list[dict]) -> bool:
+    """A bad-network hit on the lab's synthetic SBL-LAB entry (R30), on an app the
+    known_bad scenario never ran (same app name, and path where both are known)."""
+    if alert.get("kind") != "bad_network" or LAB_ENTRY not in (alert.get("detail") or ""):
+        return False
+    return not any(
+        label.get("type") == "known_bad" and label.get("app_name") == alert.get("app_name")
+        and not (alert.get("app_path") and label.get("app_path") and alert["app_path"] != label["app_path"])
+        for label in labels)
 
 
 def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE,
@@ -83,7 +89,7 @@ def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE
             for label in hits:
                 if fits is None or fits(alert, label["type"]):
                     first_hit.setdefault(label["scenario"], alert["time"] - label["start"])
-        elif is_lab_artifact(alert):
+        elif is_lab_artifact(alert, test_labels):
             scored.artifacts.append(alert)
         else:
             scored.false_alarms.append(alert)
