@@ -409,6 +409,25 @@ Matches each flow against bundled lists:
 
 The thresholds above are starting values and must be tuned in the lab (§6.6).
 
+Implementation notes (v0.3, Learn, 2026-11-25; numbers are lab numbers, see §6.6):
+
+| Decision | Reason |
+|---|---|
+| **One profile per program path**, saved encrypted, and kept while history saving is off (U1). On upgrade, profiles are built from the history already saved (U2) | Learning must not depend on the history switch; users upgrading should not start blind. |
+| Learning lasts 7 days **from the profile's own first data**; items expire after 30 days **on which the app was active** | A program used once a month must not forget everything in between. |
+| Browsers "go anywhere" (no destination signals) **only when installed by administrators and signed by their publisher** (R10) | A file merely named `chrome.exe` is not a browser. |
+| One **canonical facts rule** for what a destination is (company = network owner, country, registrable domain of a confirmed name), shared by the live service, the backfill and the lab (R21) | Profiles built three ways would disagree, and the lab would measure something else. |
+| Shipped severities (final, lab-tuned): new_site **info**, new_company **info**, new_country **info** (was medium, R29), upload_spike **high**, ratio_flip **medium**, unusual_time **info**, random_name **medium**, binary_changed **high** | Global CDNs make a new company or country common for ordinary apps: 1.44 and 1.62 false alarms per user-week in the first measurement. They are listed on the Alerts screen, never notified, still count as "new destination" for binary_changed, and are learned at once. |
+| random_name: entropy per label ≥ 3.5 bits on labels of ≥ 8 characters (R11) | Whole-name entropy flagged ordinary long host names. |
+| binary_changed: a lost signature needs a stored publisher (R12); the program stays suspect for 24 h (R14) | Never-signed programs are not "swapped"; a swap shows on the first new destination, not only the first flow. |
+| **Beaconing ships off** | Under-measured in the lab (sessions too short) and 1.69 to 3.38 false alarms per user-week on its own. |
+| Thresholds unchanged from the starting values: upload z > 6, ≥ 10 MB in the hour, ≥ 24 active hours of history; ratio flip: ≥ 80 % downloads, ≥ 10 MB sent; unusual hour < 1 % of active hours; beaconing: ≥ 6 connections, CV ≤ 0.1, gaps 10 s to 1 h, ≤ 64 KB each | The measurement did not call for changing them. |
+| Alerts combine for 10 minutes into one, and a "pending" destination (one that raised medium or higher) only counts "seen again" on its open alert | Alert fatigue (§6.4); info signals are learned straight away. |
+| A behaviour alert has a lasting "This is fine" when it holds beaconing, random_name or unusual_time | The user decides what is normal. |
+| Known gaps: a renamed copy of a program is a new path, so it is still learning and Layer 2 cannot catch it (renamed_binary 0 %); beaconing false alarms under-measured; each flow's bytes are spread evenly over its hours; no foreground data | Listed in every lab report. |
+
+Results (lab, simulated users on datacenter runners; **not real-world rates**). Development run 45608752716, re-analysed as 45621133504 (seed 1, 16 users, 30-minute sessions): the shipped set failed at 3.188 false alarms per user-week (new_company 1.44, new_country 1.62, random_name 0.75), which led to R29. Held-out run 45628351177 (seed 2, fresh capture, engine d674bda, nothing tuned on it): raw 2.938, of which 2.375 were Layer 1 alerts on the lab's synthetic SBL-LAB entry hitting Chrome's traffic to shared Cloudflare addresses (38 alerts); the lab scoring now lists those apart (R30). Re-scored: Layer 1 alone 0.00, Layers 1+2 **0.562** per user-week (notified 0.44); detection by fitting reason: random_domain 100 %, swapped_binary 100 %, upload 69 %, beacon 0 % (off), renamed_binary 0 %. **Release bar met** (≤ 1.0 and 3 of 5 types). With beaconing on, it would fail at 3.938.
+
 ### 6.3 Layer 3: anomaly model (Isolation Forest)
 
 **Why this model:** it is **unsupervised** (needs no labelled “bad” data, which we will never have from users), small, fast, and can train on the device.
@@ -492,6 +511,8 @@ Implementation notes (v0.3, L0 lab harness, 2026-11-21; see `lab/README.md`):
 | Detection runs through the **shipped code**: the Layer 1 detector moved into `whereabouts-detect`, and the app's notification rule into `whereabouts_ipc::notify`; `whereabouts-lab-replay` (never bundled) replays each simulated user with a fresh encrypted store | The lab measures what users get, not a re-implementation. |
 | Scoring: a **medium-or-higher** alert for the same user and app within a scenario's window + 1 h detects it; a repeat the same day after a detection counts as covered; every other test-week alert is a false alarm | Tracker contacts (info) are background, not detections; the detector alerts once per app and address a day. |
 | Known gaps: no process IDs or DNS alias chains in the export; new-app notices not measured | Listed in every report. |
+
+Layer 2 measurement (v0.3, Task 13): the lab replays each simulated user through the shipped Learner (`--layers 1,2`), scores each signal alone and the release bar with the signals that ship; a staged problem counts as detected only by a Layer 1 alert or a behaviour alert whose reasons fit its type (R26). Hits on the lab's own SBL-LAB entry from apps the scenario never ran are lab artifacts, excluded from false alarms and counted apart (R30). Results are in §6.2.
 
 First run (2026-11-21, run 44848943887; 3-minute sessions, 2 per persona, 1 simulated user per persona — a smoke run, not a measurement): **Layer 1 baseline** — 0.00 false alarms per user-week at medium and up; known-bad host detected in every instance; upload, beaconing, random domains, renamed and swapped programs: 0 % (expected: Layer 1 only knows lists; these are Layer 2's job).
 
