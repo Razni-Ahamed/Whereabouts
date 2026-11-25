@@ -39,7 +39,7 @@ test('describes the other signals', () => {
     reasonText(reason({ signal: 'beaconing', value: 'c2.example', observed: 60.4, count: 12 })),
     'Connected to c2.example every 60 seconds, 12 times.',
   );
-  assert.equal(reasonText(reason({ signal: 'unusual_time', value: '3' })), 'Active at an hour it rarely is (3:00).');
+  assert.equal(reasonText(reason({ signal: 'unusual_time', value: '03' })), 'Active at an hour it rarely is (03:00).');
   assert.equal(
     reasonText(reason({ signal: 'random_name', value: 'x7qk2.top' })),
     'Used a random-looking name: x7qk2.top',

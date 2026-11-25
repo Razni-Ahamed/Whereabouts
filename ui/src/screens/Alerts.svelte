@@ -73,9 +73,18 @@
   /** The first site (not a company or country) a behaviour alert's reasons name. */
   function siteOf(alert: AlertView): string | null {
     const site = alert.reasons?.find(
-      (r) => ['new_site', 'random_name', 'beaconing'].includes(r.signal) && r.value?.includes('.'),
+      (r) =>
+        ['new_site', 'random_name', 'beaconing'].includes(r.signal) &&
+        r.value?.includes('.') &&
+        !isIpLiteral(r.value),
     );
     return site?.value ?? null;
+  }
+
+  /** Whether `host` is an IPv4 or IPv6 address, not a host name (an address cannot be blocked as a site). */
+  function isIpLiteral(host: string): boolean {
+    const bare = host.replace(/^\[|\]$/g, '');
+    return /^\d{1,3}(\.\d{1,3}){3}$/.test(bare) || (bare.includes(':') && /^[0-9a-f:.]+$/i.test(bare));
   }
 
   /** A stand-in connection, so the Block… picker can offer its choices. `site` makes it about one domain. */
@@ -164,7 +173,7 @@
               </ul>
               <p class="why">
                 {text.why}
-                {#if alert.seen_again}Seen again {alert.seen_again} times.{/if}
+                {#if alert.seen_again}Seen again {alert.seen_again} {alert.seen_again === 1 ? 'time' : 'times'}.{/if}
               </p>
             {:else}
               <p class="why">{text.why}</p>
