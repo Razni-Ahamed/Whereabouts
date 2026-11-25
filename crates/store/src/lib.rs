@@ -290,7 +290,7 @@ impl Store {
             })?;
         match version {
             Some(version) if version > SCHEMA_VERSION => Err(StoreError::NewerSchema(version)),
-            Some(SCHEMA_VERSION) => Ok(()),
+            Some(SCHEMA_VERSION) => self.add_dropped_reasons(),
             Some(version) => {
                 // Older versions are upgraded step by step, keeping history:
                 // version 1 (Whereabouts 0.1) gets blocking rules, then
@@ -316,6 +316,24 @@ impl Store {
                 Ok(())
             }
         }
+    }
+
+    /// Adds `alerts.dropped_reasons` to a version 5 database made by an
+    /// earlier 0.3 build, which had no such column (the same definition as
+    /// in [`SCHEMA_V5`]). Does nothing when it is there.
+    fn add_dropped_reasons(&self) -> Result<(), StoreError> {
+        let present: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('alerts') \
+             WHERE name = 'dropped_reasons')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !present {
+            self.conn.execute_batch(
+                "ALTER TABLE alerts ADD COLUMN dropped_reasons INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(())
     }
 
     /// Saves an alert. Returns its ID, or `None` if an alert with the same
@@ -2228,6 +2246,49 @@ mod tests {
         assert!(alerts[0].can_allow);
         assert!(alerts[0].reasons.is_empty());
         assert_eq!(alerts[0].seen_again, 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v5_from_an_earlier_build_gains_the_dropped_reasons_column() {
+        let path = temp_db("v5-without-dropped");
+        let old_v5 = SCHEMA_V5.replace(",\n    dropped_reasons INTEGER NOT NULL DEFAULT 0", "");
+        assert_ne!(old_v5, SCHEMA_V5);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", key(3).sqlcipher_literal())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;",
+            )
+            .unwrap();
+            for schema in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, old_v5.as_str()] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO alerts (key, created, kind, severity, app_name, app_path, reasons, \
+                 seen_again) VALUES ('old', 5000, 'behaviour', 'medium', 'a.exe', 'c:\\a.exe', \
+                 '[{\"signal\":\"new_country\",\"value\":\"RU\",\"observed\":null,\
+                 \"usual\":null,\"count\":null}]', 2)",
+                [],
+            )
+            .unwrap();
+        }
+        // Opened twice: adding the column again must not fail.
+        drop(Store::open(&path, &key(3)).unwrap());
+        let mut store = Store::open(&path, &key(3)).unwrap();
+        let old = &store.alerts(UNIX_EPOCH, 10).unwrap()[0];
+        assert_eq!(old.reasons, [country("RU")]);
+        assert_eq!(old.seen_again, 2);
+        assert_eq!(old.dropped_reasons, 0);
+        let reasons: Vec<Reason> = (0..30).map(|i| country(&format!("C{i}"))).collect();
+        let id = store
+            .add_alert(&behaviour_alert(reasons), at(10))
+            .unwrap()
+            .unwrap();
+        let new = store.alert(id).unwrap().unwrap();
+        assert_eq!(new.reasons.len(), MAX_REASONS);
+        assert_eq!(new.dropped_reasons, 30 - MAX_REASONS as u32);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
