@@ -192,9 +192,9 @@
           {/if}
         </p>
         <p class="muted">
-          Behaviour profiles are kept even when history is off: which sites, companies and countries each app uses,
-          including your browsers, and hourly totals. Reset one on the Apps screen, or remove them all with Delete
-          everything.
+          Behaviour profiles are kept even when history is off: the sites, companies, countries and ports each app
+          uses (your browsers too), each with when it was first and last used; 30 days of hourly totals; and each
+          program file's hash and signer. Reset one on the Apps screen, or remove them all with Delete everything.
         </p>
       </section>
     {/if}

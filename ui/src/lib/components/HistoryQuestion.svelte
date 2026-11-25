@@ -2,7 +2,7 @@
   // Asked once: should Whereabouts save connection history? On by default;
   // it is saved meanwhile. Turning it off asks (in a native dialog) whether
   // to keep or delete what is saved so far.
-  import { History, Radio } from '@lucide/svelte';
+  import { Brain, History, Radio } from '@lucide/svelte';
   import Toggle from './Toggle.svelte';
   import { store } from '../state.svelte';
 
@@ -31,15 +31,23 @@
         <Toggle
           checked={save}
           label="Save connection history"
-          detail="Each connection for 30 days, then hourly totals for 180 days. Needed for the History view and Export. Learning what is normal for each app works either way."
+          detail="Each connection for 30 days, then hourly totals for 180 days. Needed for the History view and Export."
           onchange={(v) => (save = v)}
         />
       </div>
     </div>
     <div class="choice">
+      <span class="icon"><Brain size={18} /></span>
+      <p class="muted plain">
+        Either way, each app's behaviour profile is saved so Whereabouts can warn when the app changes: the sites,
+        companies, countries and ports it uses, with when each was first and last used, hourly totals, and the
+        program file's hash and signer.
+      </p>
+    </div>
+    <div class="choice">
       <span class="icon"><Radio size={18} /></span>
       <p class="muted plain">
-        Without it you still see live connections, get alerts and can block apps and sites. Saving writes about 8 MB
+        Without history you still see live connections, get alerts and can block apps and sites. Saving writes about 8 MB
         an hour to your disk with ordinary use (more with very busy apps such as torrent clients), far too little to
         wear out an SSD.
       </p>
