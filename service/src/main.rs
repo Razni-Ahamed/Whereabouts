@@ -13,6 +13,7 @@ mod apps;
 mod blocking;
 mod client;
 mod clock;
+mod connection_log;
 mod console;
 mod history;
 mod install;
@@ -38,6 +39,10 @@ Options:
                        save finished flows (must run as administrator;
                        stop with Ctrl+C)
   --seconds <N>        With --console, stop after N seconds
+  --record-connections <FILE>
+                       With --console, for the Whereabouts lab only: append
+                       each connection a program opens (program, server,
+                       time) to FILE, unencrypted, as JSON lines
   --status             Ask the running Whereabouts how it is doing, and show
                        the top flows and apps
   --json               With --status, print only the status as one line of JSON
@@ -88,6 +93,8 @@ only), encrypted. Windows starts the installed service with --service.";
 enum Command {
     Console {
         limit: Option<Duration>,
+        /// Lab only: append each new connection to this file.
+        record_connections: Option<PathBuf>,
     },
     Status {
         /// Print the status as one line of JSON (for scripts, e.g. the lab).
@@ -121,6 +128,7 @@ enum Command {
 fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut console = false;
     let mut seconds = None;
+    let mut record_connections = None;
     let mut status = false;
     let mut json = false;
     let mut history = false;
@@ -155,6 +163,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     .parse()
                     .map_err(|_| format!("--seconds expects a whole number, got {value:?}"))?;
                 seconds = Some(Duration::from_secs(n));
+            }
+            "--record-connections" => {
+                let value = iter
+                    .next()
+                    .ok_or("--record-connections needs a file name")?;
+                record_connections = Some(PathBuf::from(value));
             }
             "--status" => status = true,
             "--json" => json = true,
@@ -253,6 +267,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     if seconds.is_some() && !console {
         return Err(String::from("--seconds only works with --console"));
     }
+    // A lab diagnostic: never written by the installed service.
+    if record_connections.is_some() && !console {
+        return Err(String::from(
+            "--record-connections only works with --console (it is for the Whereabouts lab)",
+        ));
+    }
     if yes && !delete_all {
         return Err(String::from("--yes only works with --delete-all"));
     }
@@ -283,7 +303,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         };
     }
     Ok(if console {
-        Command::Console { limit: seconds }
+        Command::Console {
+            limit: seconds,
+            record_connections,
+        }
     } else if status {
         Command::Status { json }
     } else if history {
@@ -320,7 +343,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
-        Ok(Command::Console { limit }) => console::run(limit),
+        Ok(Command::Console {
+            limit,
+            record_connections,
+        }) => console::run(limit, record_connections),
         Ok(Command::Status { json }) => client::status(json),
         Ok(Command::History) => storage::show_history(),
         Ok(Command::Profile(path)) => client::profile(&path),
@@ -372,13 +398,40 @@ mod tests {
     fn parses_console_with_and_without_limit() {
         assert_eq!(
             parse_args(&args(&["--console"])),
-            Ok(Command::Console { limit: None })
+            Ok(Command::Console {
+                limit: None,
+                record_connections: None
+            })
         );
         assert_eq!(
             parse_args(&args(&["--console", "--seconds", "30"])),
             Ok(Command::Console {
-                limit: Some(Duration::from_secs(30))
+                limit: Some(Duration::from_secs(30)),
+                record_connections: None
             })
+        );
+    }
+
+    #[test]
+    fn records_connections_only_with_the_console() {
+        assert_eq!(
+            parse_args(&args(&["--console", "--record-connections", "c.jsonl"])),
+            Ok(Command::Console {
+                limit: None,
+                record_connections: Some(PathBuf::from("c.jsonl"))
+            })
+        );
+        assert!(parse_args(&args(&["--console", "--record-connections"])).is_err());
+        assert!(parse_args(&args(&["--record-connections", "c.jsonl"])).is_err());
+        assert!(
+            parse_args(&args(&[
+                "--service",
+                "--client-user",
+                "S-1-5-21-1-2-3-1001",
+                "--record-connections",
+                "c.jsonl"
+            ]))
+            .is_err()
         );
     }
 

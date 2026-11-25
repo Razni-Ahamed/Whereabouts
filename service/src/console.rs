@@ -113,11 +113,15 @@ pub struct Options {
     pub client_sid: Option<String>,
     /// Offline data folder; `None` to search for it (see [`data_dir`]).
     pub data_dir: Option<PathBuf>,
+    /// Lab only (`--record-connections`): append each new connection to
+    /// this file (see [`crate::connection_log`]). Never set for the service.
+    pub record_connections: Option<PathBuf>,
 }
 
 /// `--console`: runs the engine with the live table until `limit` passes,
-/// or forever if `None`.
-pub fn run(limit: Option<Duration>) -> ExitCode {
+/// or forever if `None`, recording connections to `record_connections` if
+/// given (lab only).
+pub fn run(limit: Option<Duration>, record_connections: Option<PathBuf>) -> ExitCode {
     // Two captures cannot run at once: starting one ends the other's
     // Windows event session.
     if crate::service_mode::is_running() {
@@ -130,6 +134,7 @@ pub fn run(limit: Option<Duration>) -> ExitCode {
     let options = Options {
         limit,
         show_table: true,
+        record_connections,
         ..Options::default()
     };
     match run_engine(&options) {
@@ -199,6 +204,18 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
         }
     }
     let mut last_retention = Instant::now();
+    let mut connection_log = match &options.record_connections {
+        Some(path) => {
+            let log = crate::connection_log::ConnectionLog::open(path)
+                .map_err(|error| format!("could not open {} ({error})", path.display()))?;
+            println!(
+                "Lab: recording each new connection to {} (NOT encrypted)",
+                path.display()
+            );
+            Some(log)
+        }
+        None => None,
+    };
     let mut new_apps = crate::apps::NewApps::load(store.as_mut(), SystemTime::now());
     let mut detector = crate::alerts::load_detector();
     // Learns each app's usual behaviour (only while a store is open).
@@ -414,6 +431,14 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 }
             }
             let view = View::collect(&table, &closed, &names);
+            if let Some(log) = connection_log.as_mut() {
+                let flows: Vec<crate::learning::FlowInput<'_>> = view
+                    .rows
+                    .iter()
+                    .map(|row| flow_input(row, &names))
+                    .collect();
+                log.record(&flows, SystemTime::now());
+            }
             if let Some(store) = store.as_mut() {
                 let now = SystemTime::now();
                 for row in view.rows.iter().filter(|row| !row.key.is_overflow()) {

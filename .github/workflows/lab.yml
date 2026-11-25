@@ -125,6 +125,7 @@ jobs:
           path: |
             ${{ runner.temp }}\session\session.csv
             ${{ runner.temp }}\session\session.json
+            ${{ runner.temp }}\session\connections.jsonl
             ${{ runner.temp }}\session\engine.log
           retention-days: 90
           if-no-files-found: warn

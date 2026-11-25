@@ -9,6 +9,8 @@
 
     Writes to -Out:
       session.csv   the engine's CSV export (whereabouts-service --export)
+      connections.jsonl  when each connection was opened (the engine's
+                    lab-only --record-connections), for beaconing
       session.json  metadata: persona, times, runner, apps and versions,
                     health counters over time, live-scenario labels
       engine.log    the engine's console output
@@ -142,6 +144,7 @@ $engine = $null
 $sampler = $null
 $countersFile = Join-Path $Out 'counters.jsonl'
 $csv = Join-Path $Out 'session.csv'
+$connectionsFile = Join-Path $Out 'connections.jsonl'
 $engineSeconds = [int]($Minutes * 60) + 120
 
 # Whatever happens, session.json is written (ok = false with the error, so
@@ -151,8 +154,10 @@ try {
     $personaScript = Join-Path $PSScriptRoot "personas\$Persona.ps1"
     $session.apps = @(& $personaScript -Install -LabRoot $LabRoot)
 
-    # 2. The engine records for the whole session.
-    $engine = Start-Process -FilePath $Service -ArgumentList '--console', '--seconds', $engineSeconds `
+    # 2. The engine records for the whole session, and (lab only) when each
+    #    connection was opened, for beaconing.
+    $engine = Start-Process -FilePath $Service `
+        -ArgumentList '--console', '--seconds', $engineSeconds, '--record-connections', "`"$connectionsFile`"" `
         -RedirectStandardOutput (Join-Path $Out 'engine.log') -RedirectStandardError (Join-Path $Out 'engine.err.log') `
         -WindowStyle Hidden -PassThru
     Start-Sleep -Seconds 15

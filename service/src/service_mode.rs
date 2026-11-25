@@ -140,6 +140,8 @@ fn run_service() -> windows_service::Result<()> {
         stop: Some(stop),
         client_sid: CLIENT_USER.get().cloned(),
         data_dir,
+        // The lab's connection file: never written by the installed service.
+        record_connections: None,
     });
     let exit = match result {
         Ok(()) => {

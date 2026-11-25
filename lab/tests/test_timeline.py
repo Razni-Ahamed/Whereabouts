@@ -4,7 +4,7 @@ import csv
 
 import pytest
 
-from helpers import HEADER, flow, write_session
+from helpers import HEADER, connection, flow, write_session
 from wlab import sessions, timeline
 
 DAY = 86_400
@@ -120,3 +120,34 @@ def test_persona_without_usable_sessions_is_an_error(tmp_path):
 def test_no_sessions_is_an_error(tmp_path):
     with pytest.raises(ValueError, match="no usable sessions"):
         timeline.build([], 1, seed=1)
+
+
+def test_recorded_connections_become_connection_lines(tmp_path):
+    lines = [connection(at=1010), connection(at=1070, time_ms=1070_999),
+             connection(app="Runner.Worker.exe", at=1020), connection(app="x.exe", at=1030, app_path=""),
+             '{"app_path": "C:\\Apps\\cut']  # the engine stopped mid-line
+    loaded = make(tmp_path, count=2, connections=lines)
+    assert [c["time"] for c in loaded[0].connections] == [1010, 1070]
+    rows, _, _ = timeline.build(loaded, 1, seed=1)
+    flows = [r for r in rows if r["type"] == "flow"]
+    placed = [r for r in rows if r["type"] == "connection"]
+    assert len(placed) == 14 * 2 * 2  # 14 days, 2 sessions a day, 2 connections each
+    for line in placed:
+        assert set(line) >= {"user", "app_path", "app_name", "destination", "time", "day", "session"}
+        assert line["app_path"] == "C:\\Apps\\chrome.exe" and line["destination"] == "example.org"
+        assert (line["time"] - timeline.T0) // DAY + 1 == line["day"]
+        # Shifted with its session, like its flows. Sessions start at 1000 + i with their
+        # flow 10 s in; the connections are at 1010 and 1070 in both.
+        flow_time = max(f["first_seen"] for f in flows if f["session"] == line["session"]
+                        and f["user"] == line["user"] and f["first_seen"] <= line["time"] + 1)
+        i = int(line["session"].rsplit("-", 1)[1])
+        assert line["time"] - flow_time + i in (0, 60)
+    times = [r["first_seen"] if r["type"] == "flow" else r["time"] for r in rows]
+    assert times == sorted(times)
+
+
+def test_sessions_without_a_connection_file_still_load(tmp_path):
+    loaded = make(tmp_path, count=2)
+    assert all(s.connections == [] for s in loaded)
+    rows, _, _ = timeline.build(loaded, 1, seed=1)
+    assert not [r for r in rows if r["type"] == "connection"]
