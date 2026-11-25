@@ -511,8 +511,8 @@ impl Learner {
     /// unless the profile was reset after the alert, so the alert's
     /// destinations are gone, and except those linked to another open alert
     /// by now. A destination that could not be allowed keeps its link, so
-    /// trying again finds it. The caller still marks the alert seen
-    /// (`Store::dismiss_alert`).
+    /// trying again finds it. The caller then marks the alert seen
+    /// (`Store::dismiss_alert`), only if this succeeded.
     pub fn alert_closed(
         &mut self,
         store: &mut Store,

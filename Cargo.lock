@@ -5098,6 +5098,7 @@ dependencies = [
 name = "whereabouts-service"
 version = "0.3.0"
 dependencies = [
+ "rusqlite",
  "serde_json",
  "ureq",
  "whereabouts-client",

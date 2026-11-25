@@ -180,9 +180,11 @@ impl Learning {
         result.map_err(|error| error.to_string())
     }
 
-    /// Marks a behaviour alert seen and tells the Learner. "This is fine" on
-    /// an alert from before its profile was reset only marks it seen: what
-    /// it named was forgotten with the profile.
+    /// Tells the Learner about a closed behaviour alert, then marks it seen
+    /// (and saves its allow key with `allow`). If the Learner's change
+    /// fails, the alert is not marked seen. "This is fine" on an alert from
+    /// before its profile was reset only marks it seen: what it named was
+    /// forgotten with the profile.
     fn close_alert(
         &mut self,
         store: &mut Store,
@@ -204,11 +206,11 @@ impl Learning {
             None => false,
         };
         let allow = allow && !reset_since;
-        if !store.dismiss_alert(id, allow, now)? {
-            return Ok(false);
-        }
+        // The profile first: if it cannot be changed, the alert stays
+        // unseen, so the user sees it and can answer again (marked seen, a
+        // destination still linked to it would count on a hidden alert).
         self.learner.alert_closed(store, id, allow, now)?;
-        Ok(true)
+        store.dismiss_alert(id, allow, now)
     }
 
     fn ready(&self) -> bool {
@@ -718,6 +720,84 @@ mod tests {
         let kept = profile(&store).unwrap().row;
         assert_eq!(kept.last_sha256, row.last_sha256);
         assert_eq!(kept.last_publisher, row.last_publisher);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_profile_change_leaves_the_alert_to_answer_again() {
+        use whereabouts_store::{
+            GoesAnywhere, ItemState, NewAlert, ProfileItem, ProfileRow, Reason, Severity, Signal,
+        };
+        let (mut store, dir) = temp_store("close-fails");
+        let app_key = known_app_key(PATH);
+        let domain = "q7x9k2m4zt8w.example";
+        store
+            .save_profile_row(&ProfileRow {
+                key: app_key.clone(),
+                path: PATH.to_owned(),
+                app_name: String::from("chat.exe"),
+                first_data: at(T0 - 30 * 86_400),
+                learned_since: at(T0 - 30 * 86_400),
+                last_data: at(T0),
+                active_days: 20,
+                last_active_day: None,
+                last_sha256: None,
+                last_publisher: None,
+                goes_anywhere: GoesAnywhere::Auto,
+                reset_at: None,
+            })
+            .unwrap();
+        store
+            .save_items(
+                &app_key,
+                &[ProfileItem {
+                    kind: ItemKind::Domain,
+                    value: domain.to_owned(),
+                    first_seen: at(T0),
+                    last_seen: at(T0),
+                    seen_on_day: 20,
+                    state: ItemState::Pending,
+                }],
+            )
+            .unwrap();
+        let alert = NewAlert {
+            key: format!("behaviour|{app_key}|{T0}"),
+            allow_key: Some(format!("behaviour|{app_key}|random_name|{domain}")),
+            kind: AlertKind::Behaviour,
+            severity: Severity::Medium,
+            app_name: Some(String::from("chat.exe")),
+            app_path: Some(PATH.to_owned()),
+            target: Some(domain.to_owned()),
+            detail: None,
+            reasons: vec![Reason {
+                signal: Signal::RandomName,
+                value: Some(domain.to_owned()),
+                observed: None,
+                usual: None,
+                count: None,
+            }],
+        };
+        let id = store.add_alert(&alert, at(T0)).unwrap().unwrap();
+        // The store takes everything but the change to the profile's items.
+        let raw = rusqlite::Connection::open(dir.join("t.db")).unwrap();
+        raw.pragma_update(None, "key", format!("x'{}'", "06".repeat(32)))
+            .unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON profile_items \
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let mut learning = ready(&mut store, at(T0));
+        let close = BehaviourCommand::CloseAlert { id, allow: true };
+        let error = learning
+            .answer(Some(&mut store), close, at(T0 + 60))
+            .unwrap_err();
+        assert!(error.contains("refused by the test"), "{error}");
+        let alert = store.alert(id).unwrap().unwrap();
+        assert!(!alert.dismissed, "still shown, so the user can try again");
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
