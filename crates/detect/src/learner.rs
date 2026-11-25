@@ -509,9 +509,10 @@ impl Learner {
     /// alert this Learner holds no links for (the service restarted), the
     /// destinations come from the alert's saved reasons: those still pending,
     /// unless the profile was reset after the alert, so the alert's
-    /// destinations are gone. A destination that could not be allowed keeps
-    /// its link, so trying again finds it. The caller still marks the alert
-    /// seen (`Store::dismiss_alert`).
+    /// destinations are gone, and except those linked to another open alert
+    /// by now. A destination that could not be allowed keeps its link, so
+    /// trying again finds it. The caller still marks the alert seen
+    /// (`Store::dismiss_alert`).
     pub fn alert_closed(
         &mut self,
         store: &mut Store,
@@ -522,6 +523,14 @@ impl Learner {
         let mut named = self.alerts.close(alert_id);
         if named.is_empty() {
             named = pending_named_by_saved(store, alert_id)?;
+            // A destination that now waits on a newer open alert is that
+            // alert's to answer.
+            named.retain(|(key, kind, value)| {
+                !matches!(
+                    self.alerts.link(key, *kind, value),
+                    Some(Link::Open(other)) if other != alert_id
+                )
+            });
         }
         if !allowed {
             for (key, kind, value) in &named {

@@ -1257,3 +1257,48 @@ fn a_value_the_cap_dropped_still_counts_on_its_alert_after_a_restart() {
     assert_eq!(saved[0].seen_again, 1);
     assert!(learner.take_errors().is_empty());
 }
+
+#[test]
+fn dismissing_a_superseded_alert_keeps_the_newer_alerts_links() {
+    let mut db = TestStore::open("dismiss-superseded");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let (first, second) = {
+        let mut before = Learner::new(Toggles::default(), 0);
+        let first = before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+        // "Remind me" reached the Learner, but marking the alert seen did
+        // not happen: it is still open.
+        before
+            .alert_closed(&mut db, first, false, at(T0 + 60))
+            .unwrap();
+        let again = before.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
+        assert_eq!(again.len(), 1);
+        assert!(before.take_errors().is_empty());
+        (first, again[0].id)
+    };
+    // After a restart, the domain waits on the newer alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(
+        learner
+            .finished(&usual(T0 + HOUR), &e, &mut db, at(T0 + HOUR))
+            .is_empty()
+    );
+
+    // Dismissing the older alert leaves the newer one's link alone.
+    learner
+        .alert_closed(&mut db, first, false, at(T0 + HOUR + 60))
+        .unwrap();
+    assert!(db.dismiss_alert(first, false, at(T0 + HOUR + 60)).unwrap());
+    let secs = T0 + 2 * HOUR;
+    assert!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .is_empty(),
+        "seen again on the newer alert, not a third alert"
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 2);
+    let newer = saved.iter().find(|a| a.id == second).unwrap();
+    assert_eq!(newer.seen_again, 1);
+    assert!(learner.take_errors().is_empty());
+}
