@@ -549,9 +549,10 @@ impl Learner {
         result
     }
 
-    /// Resets an app's profile (it learns again from `now`) and forgets what
-    /// is held about it here, including traffic not yet written. Returns
-    /// `false` if there is no such profile.
+    /// Resets an app's profile (it learns again from `now`), deletes its
+    /// lasting "this is fine" allows (beaconing, random-looking names,
+    /// unusual hours), and forgets what is held about it here, including
+    /// traffic not yet written. Returns `false` if there is no such profile.
     pub fn reset(
         &mut self,
         store: &mut Store,
@@ -560,6 +561,9 @@ impl Learner {
     ) -> Result<bool, StoreError> {
         let reset = store.reset_profile(key, now)?;
         self.forget(key);
+        if reset {
+            store.delete_behaviour_allows(key)?;
+        }
         Ok(reset)
     }
 

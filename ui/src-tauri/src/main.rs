@@ -452,7 +452,8 @@ async fn reset_profile(
             "Reset what Whereabouts learned?",
             &format!(
                 "{name} will start a new 7-day learning period. Until then you'll get no behaviour \
-                 warnings for it.\n\nProgram file: {}",
+                 warnings for it, and behaviour warnings you marked as fine for it can come \
+                 back.\n\nProgram file: {}",
                 display_safe(&path)
             ),
             "Reset",

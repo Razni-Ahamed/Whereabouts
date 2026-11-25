@@ -1091,6 +1091,29 @@ fn this_is_fine_after_a_reset_allows_nothing() {
 }
 
 #[test]
+fn reset_forgets_the_apps_lasting_allows() {
+    let mut db = TestStore::open("reset-allows");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let id = learner.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+    assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
+    learner
+        .alert_closed(&mut db, id, true, at(T0 + 60))
+        .unwrap();
+    let allow = format!("behaviour|{}|random_name|{RANDOM_DOMAIN}", key());
+    let other = r"behaviour|c:\apps\chat2.exe|random_name|x.example".to_owned();
+    db.add_allow_keys(std::slice::from_ref(&other), at(T0))
+        .unwrap();
+    assert!(db.is_allowed(&allow).unwrap());
+
+    assert!(learner.reset(&mut db, &key(), at(T0 + 120)).unwrap());
+    assert!(!db.is_allowed(&allow).unwrap(), "learns from scratch");
+    assert!(db.is_allowed(&other).unwrap(), "other apps keep theirs");
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
 fn reset_drops_traffic_not_yet_written() {
     let mut db = TestStore::open("reset-hour");
     seed(&mut db, GoesAnywhere::Auto, &[]);
