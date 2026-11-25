@@ -17,6 +17,11 @@
   scenario instance only if it fits the instance's type; one that matches
   but does not fit detects nothing and is still no false alarm (the staged
   problem caused it).
+- A **lab artifact** (R30) is an unmatched `bad_network` alert whose detail
+  names the lab's synthetic `SBL-LAB` DROP entry: that entry is example.com's
+  address, shared with other apps' traffic (e.g. Cloudflare), so such a hit on
+  another app is no real false alarm. It is counted separately, never as a
+  false alarm. Matching `known_bad` detections are unchanged.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from .timeline import DAY
 
 GRACE = 3_600
 SERIOUS = {"medium", "high", "critical"}
+LAB_ENTRY = "(SBL-LAB)"
 
 
 @dataclass
@@ -41,6 +47,7 @@ class Scored:
     fa_notified: float = 0.0
     kinds: Counter = field(default_factory=Counter)
     alerts_in_test_week: int = 0
+    artifacts: list[dict] = field(default_factory=list)
 
 
 def _matches(alert: dict, label: dict, grace: int) -> bool:
@@ -53,6 +60,11 @@ def _matches(alert: dict, label: dict, grace: int) -> bool:
     if alert.get("app_path") and label.get("app_path") and alert["app_path"] != label["app_path"]:
         return False
     return label["start"] <= alert["time"] <= label["end"] + grace
+
+
+def is_lab_artifact(alert: dict) -> bool:
+    """A bad-network hit on the lab's synthetic SBL-LAB entry (R30)."""
+    return alert.get("kind") == "bad_network" and LAB_ENTRY in (alert.get("detail") or "")
 
 
 def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE,
@@ -71,6 +83,8 @@ def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE
             for label in hits:
                 if fits is None or fits(alert, label["type"]):
                     first_hit.setdefault(label["scenario"], alert["time"] - label["start"])
+        elif is_lab_artifact(alert):
+            scored.artifacts.append(alert)
         else:
             scored.false_alarms.append(alert)
     scored.alerts_in_test_week = len(in_test)

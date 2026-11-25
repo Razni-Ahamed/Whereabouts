@@ -57,7 +57,10 @@ GAPS = (
     "per connection limit never rules a beacon out here (pessimistic). Each flow's bytes are spread "
     "evenly over the hours it spans, which smooths bursts across hour boundaries. Swapped programs "
     "are staged only for apps that were signed: a swap of a program that was never signed isn't "
-    "detected, by design. A swapped app's later rows from other scenarios are also unsigned."
+    "detected, by design. A swapped app's later rows from other scenarios are also unsigned. "
+    "The lab's synthetic DROP entry (SBL-LAB, the known_bad scenario's example.com address) is shared "
+    "with other apps' traffic, such as Chrome's to Cloudflare; those hits are lab artifacts, not false "
+    "alarms, and are excluded from the false-alarm counts and listed apart."
 )
 TARGET = 1.0  # design spec §6.6: at most 1 medium+ false alarm per user-week
 
@@ -148,6 +151,7 @@ def _metrics(scored: Scored, signal_table: dict[str, Scored] | None = None) -> d
         "alerts_in_test_week": scored.alerts_in_test_week,
         "false_alarms_per_user_week": {"medium_plus": scored.fa_medium_plus, "notified": scored.fa_notified},
         "false_alarms_medium_plus": sum(1 for a in scored.false_alarms if a["severity"] in SERIOUS),
+        "lab_artifacts_excluded": len(scored.artifacts),
         "kinds": dict(scored.kinds),
         "per_type": scored.per_type,
     }
@@ -230,6 +234,10 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path,
     ]
     for name, s in results:
         lines.append(f"| {name} | {_fmt(s.fa_medium_plus)} | {_fmt(s.fa_notified)} | ≤ {TARGET:g} |")
+    for name, s in results:
+        lines.append("")
+        lines.append(f"Lab artifacts excluded ({name}): {len(s.artifacts)} alerts from the synthetic SBL-LAB "
+                     "entry on other apps' traffic to shared addresses")
     lines += ["", "![False alarms](false_alarms.png)", "", "## Staged problems", "",
               "| Layers | Scenario | Instances | Detected | Rate | Time to detect (median / max) |",
               "|---|---|---|---|---|---|"]
@@ -274,6 +282,10 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path,
         total = sum(e["instances"] for e in s.per_type.values())
         found = sum(e["detected"] for e in s.per_type.values())
         summary.append(f"| {name} | {_fmt(s.fa_medium_plus)} | {_fmt(s.fa_notified)} | {found}/{total} |")
+    for name, s in results:
+        if s.artifacts:
+            summary += ["", f"Lab artifacts excluded ({name}): {len(s.artifacts)} alerts from the synthetic "
+                        "SBL-LAB entry on other apps' traffic to shared addresses"]
     for bar in bars:
         summary += ["", f"**{bar['label']}**, {bar['result']}: **{bar['line']}**"]
     summary += ["", "Full report and charts: the `lab-report` artifact."]

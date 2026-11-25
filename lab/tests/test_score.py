@@ -276,3 +276,25 @@ def test_report_command_rejects_empty_signals(tmp_path, capsys):
             run_report(tmp_path, data, [*alerts, "--signals", empty])
         assert stopped.value.code == 2
         assert "no signals" in capsys.readouterr().err
+
+
+def test_sbl_lab_hit_on_another_app_is_an_artifact_not_a_false_alarm():
+    known_bad = label(kind="known_bad", app="curl.exe")
+    hit = {**alert(app="curl.exe"), "detail": "93.184.215.0/24 (SBL-LAB)"}
+    other = {**alert(app="chrome.exe", time=TEST + 200), "detail": "104.20.0.0/16 (SBL-LAB)"}
+    real_drop = {**alert(app="chrome.exe", time=TEST + 300), "detail": "1.10.16.0/20 (SBL549867)"}
+    scored = score.match([hit, other, real_drop], [known_bad], INFO)
+    assert scored.per_type["known_bad"]["detected"] == 1
+    assert scored.artifacts == [other]
+    assert scored.false_alarms == [real_drop]
+    assert scored.fa_medium_plus == pytest.approx(1 / scored.user_weeks)
+    assert scored.fa_notified == pytest.approx(1 / scored.user_weeks)
+
+
+def test_report_prints_the_artifact_count(tmp_path):
+    other = {**alert(app="chrome.exe"), "detail": "104.20.0.0/16 (SBL-LAB)"}
+    scored = score.match([other], [], INFO)
+    report.write([("Layer 1", scored)], INFO, tmp_path)
+    text = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "Lab artifacts excluded (Layer 1): 1 alerts from the synthetic SBL-LAB entry" in text
+    assert "lab artifacts, not false alarms" in text
