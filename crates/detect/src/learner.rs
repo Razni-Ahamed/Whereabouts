@@ -38,7 +38,7 @@ use crate::meter::Delta;
 use crate::profile::Profile;
 use crate::signals::{self, Toggles, severity_of};
 use crate::{Raised, unix_secs};
-use alerts::{Alerts, Link, Saved, item_kind};
+use alerts::{Alerts, Link, Saved, allow_key, item_kind};
 
 /// How long, in seconds, a changed program file stays suspect: within this
 /// time, the first flow to somewhere new raises "binary changed".
@@ -502,28 +502,34 @@ impl Learner {
 
     /// The user closed behaviour alert `alert_id`. Its window ends either
     /// way. With `allowed` ("this is fine"), the pending destinations it
-    /// named become allowed, in the store and here. Otherwise (dismiss:
-    /// "remind me") they stay pending, and the next sighting of each raises
-    /// a new alert. For an alert raised before this Learner started (the
-    /// service restarted), the destinations come from the alert's saved
-    /// reasons: those still pending become allowed, unless the profile was
-    /// reset after the alert, so the alert's destinations are gone.
-    /// The caller still saves the alert's allow key (`Store::dismiss_alert`).
+    /// named become allowed, in the store and here, and every reason in it
+    /// that can be allowed (beaconing, random-looking name, unusual time)
+    /// gets its lasting allow key. Otherwise (dismiss: "remind me") they stay
+    /// pending, and the next sighting of each raises a new alert. For an
+    /// alert this Learner holds no links for (the service restarted), the
+    /// destinations come from the alert's saved reasons: those still pending,
+    /// unless the profile was reset after the alert, so the alert's
+    /// destinations are gone. A destination that could not be allowed keeps
+    /// its link, so trying again finds it. The caller still marks the alert
+    /// seen (`Store::dismiss_alert`).
     pub fn alert_closed(
         &mut self,
         store: &mut Store,
         alert_id: i64,
         allowed: bool,
-        _now: SystemTime,
+        now: SystemTime,
     ) -> Result<(), StoreError> {
-        let mut named = self.alerts.close(alert_id, allowed);
-        if !allowed {
-            return Ok(());
-        }
+        let mut named = self.alerts.close(alert_id);
         if named.is_empty() {
             named = pending_named_by_saved(store, alert_id)?;
         }
-        let mut result = Ok(());
+        if !allowed {
+            for (key, kind, value) in &named {
+                self.alerts.remind(key, *kind, value);
+            }
+            return Ok(());
+        }
+        let mut result = store.add_allow_keys(&allow_keys_of_saved(store, alert_id)?, now);
         for (key, kind, value) in named {
             if let Err(error) = store.set_item_state(&key, kind, &value, ItemState::Allowed) {
                 if result.is_ok() {
@@ -531,6 +537,7 @@ impl Learner {
                 }
                 continue;
             }
+            self.alerts.unlink(&key, kind, &value);
             if let Some(item) = self
                 .profiles
                 .get_mut(&key)
@@ -554,6 +561,54 @@ impl Learner {
         let reset = store.reset_profile(key, now)?;
         self.forget(key);
         Ok(reset)
+    }
+
+    /// Links the pending destinations of a profile just read from the store
+    /// to the alerts waiting on them, as this Learner would hold them had it
+    /// been running: to the newest open behaviour alert naming each (keeping
+    /// its "seen again" count), or, when the user already closed that alert,
+    /// to a reminder ("remind me"). Links this run already holds are kept.
+    fn relink(&mut self, key: &str, store: &Store) {
+        let Some(profile) = self.profiles.get(key) else {
+            return;
+        };
+        let pending: Vec<(ItemKind, String)> = profile
+            .stored()
+            .items
+            .iter()
+            .filter(|item| item.state == ItemState::Pending)
+            .map(|item| (item.kind, item.value.clone()))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let reset = profile.stored().row.reset_at;
+        let open = match store.open_behaviour_alerts(key) {
+            Ok(open) => open,
+            Err(error) => {
+                self.errors
+                    .push(format!("could not read behaviour alerts: {error}"));
+                return;
+            }
+        };
+        for (kind, value) in pending {
+            let naming = open
+                .iter()
+                .rev()
+                .filter(|alert| reset.is_none_or(|reset| alert.created >= reset))
+                .find(|alert| {
+                    alert.reasons.iter().any(|r| {
+                        item_kind(r.signal) == Some(kind) && r.value.as_deref() == Some(&value)
+                    })
+                });
+            match naming {
+                Some(alert) => {
+                    self.alerts
+                        .restore(key, kind, &value, Link::Open(alert.id), alert.seen_again);
+                }
+                None => self.alerts.restore(key, kind, &value, Link::Closed, 0),
+            }
+        }
     }
 
     /// Sets whether an app is expected to go anywhere, in the store and
@@ -603,7 +658,8 @@ impl Learner {
             .div_euclid(SECS_PER_DAY)
     }
 
-    /// Makes sure the app's profile is cached: read from the store, or
+    /// Makes sure the app's profile is cached: read from the store (with
+    /// its pending destinations linked again, see [`Learner::relink`]), or
     /// created (and saved) if it has none. `false` if the store failed.
     fn load(&mut self, key: &str, app: &AppFacts<'_>, store: &mut Store, now: SystemTime) -> bool {
         if self.profiles.contains_key(key) {
@@ -644,6 +700,8 @@ impl Learner {
             }
         };
         self.profiles.insert(key.to_owned(), Profile::new(stored));
+        // After a restart: what waits on which alert.
+        self.relink(key, store);
         true
     }
 }
@@ -686,6 +744,38 @@ fn pending_named_by_saved(
         }
     }
     Ok(named)
+}
+
+/// The lasting allow keys of every reason in a saved behaviour alert that
+/// can be allowed. None if there is no such alert, or its app's profile was
+/// reset after it was raised (the reset forgot the app's allows).
+fn allow_keys_of_saved(store: &Store, alert_id: i64) -> Result<Vec<String>, StoreError> {
+    let Some(alert) = store.alert(alert_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(path) = alert
+        .app_path
+        .as_deref()
+        .filter(|_| alert.kind == AlertKind::Behaviour)
+    else {
+        return Ok(Vec::new());
+    };
+    let key = known_app_key(path);
+    let reset = store
+        .profile(&key)?
+        .and_then(|stored| stored.row.reset_at)
+        .is_some_and(|reset| reset > alert.created);
+    if reset {
+        return Ok(Vec::new());
+    }
+    let mut keys: Vec<String> = alert
+        .reasons
+        .iter()
+        .filter_map(|reason| allow_key(&key, reason))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// The kinds of destination behind medium-or-higher reasons.

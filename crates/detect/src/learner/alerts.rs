@@ -237,30 +237,50 @@ impl Alerts {
     }
 
     /// The user closed alert `id`. Its window ends. Returns the pending
-    /// destinations it named. With `allowed` their links are dropped (the
-    /// caller allows them); otherwise ("remind me") the next sighting of
-    /// each raises a new alert, even today.
-    pub(super) fn close(&mut self, id: i64, allowed: bool) -> Vec<(String, ItemKind, String)> {
+    /// destinations linked to it; their links stay until the caller says
+    /// what happens to each ([`Alerts::remind`] or [`Alerts::unlink`]).
+    pub(super) fn close(&mut self, id: i64) -> Vec<(String, ItemKind, String)> {
         self.windows.retain(|_, window| window.id != id);
         self.seen_again.remove(&id);
-        let named: Vec<(String, ItemKind, String)> = self
-            .links
+        self.links
             .iter()
             .filter(|(_, link)| **link == Link::Open(id))
             .map(|(named, _)| named.clone())
-            .collect();
-        for (key, kind, value) in &named {
-            let link = (key.clone(), *kind, value.clone());
-            if allowed {
-                self.links.remove(&link);
-            } else {
-                self.links.insert(link, Link::Closed);
-                self.raised_today.retain(|(app, signal, raised)| {
-                    !(app == key && raised == value && item_kind(*signal) == Some(*kind))
-                });
-            }
+            .collect()
+    }
+
+    /// "Remind me": the next sighting of this pending destination raises a
+    /// new alert, even today.
+    pub(super) fn remind(&mut self, key: &str, kind: ItemKind, value: &str) {
+        self.links
+            .insert((key.to_owned(), kind, value.to_owned()), Link::Closed);
+        self.raised_today.retain(|(app, signal, raised)| {
+            !(app == key && raised == value && item_kind(*signal) == Some(kind))
+        });
+    }
+
+    /// Forgets the link of a destination that is no longer pending.
+    pub(super) fn unlink(&mut self, key: &str, kind: ItemKind, value: &str) {
+        self.links.remove(&(key.to_owned(), kind, value.to_owned()));
+    }
+
+    /// Restores a pending destination's link read back from the store (after
+    /// a restart), with the alert's saved "seen again" count. A link this
+    /// run already holds is more recent and is kept.
+    pub(super) fn restore(
+        &mut self,
+        key: &str,
+        kind: ItemKind,
+        value: &str,
+        link: Link,
+        seen_again: u32,
+    ) {
+        self.links
+            .entry((key.to_owned(), kind, value.to_owned()))
+            .or_insert(link);
+        if let Link::Open(id) = link {
+            self.seen_again.entry(id).or_insert(seen_again);
         }
-        named
     }
 
     /// Forgets everything about an app.
@@ -305,7 +325,7 @@ fn today(key: &str, reason: &Reason) -> (String, Signal, String) {
 
 /// The lasting "this is fine" key for a reason, for the signals that have
 /// one (beaconing, random-looking name, unusual time).
-fn allow_key(key: &str, reason: &Reason) -> Option<String> {
+pub(super) fn allow_key(key: &str, reason: &Reason) -> Option<String> {
     let allowable = matches!(
         reason.signal,
         Signal::Beaconing | Signal::RandomName | Signal::UnusualTime
@@ -387,11 +407,17 @@ mod tests {
         alerts.set_link("k", ItemKind::Company, "Acme", 8);
         alerts.mark_today("k", &[reason(Signal::NewCountry, Some("RU"))]);
         alerts.mark_today("k", &[reason(Signal::NewCompany, Some("Acme"))]);
-        let named = alerts.close(7, false);
+        let named = alerts.close(7);
         assert_eq!(
             named,
             [("k".to_owned(), ItemKind::Country, "RU".to_owned())]
         );
+        // Closing alone keeps the link; the caller decides.
+        assert_eq!(
+            alerts.link("k", ItemKind::Country, "RU"),
+            Some(Link::Open(7))
+        );
+        alerts.remind("k", ItemKind::Country, "RU");
         assert_eq!(
             alerts.link("k", ItemKind::Country, "RU"),
             Some(Link::Closed)
@@ -408,7 +434,25 @@ mod tests {
         );
         assert_eq!(alerts.raised_today.len(), 1);
         // Allowing drops the link.
-        alerts.close(8, true);
+        alerts.close(8);
+        alerts.unlink("k", ItemKind::Company, "Acme");
         assert_eq!(alerts.link("k", ItemKind::Company, "Acme"), None);
+    }
+
+    #[test]
+    fn restored_links_do_not_replace_newer_ones() {
+        let mut alerts = Alerts::default();
+        alerts.remind("k", ItemKind::Domain, "a.example");
+        alerts.restore("k", ItemKind::Domain, "a.example", Link::Open(3), 2);
+        assert_eq!(
+            alerts.link("k", ItemKind::Domain, "a.example"),
+            Some(Link::Closed)
+        );
+        alerts.restore("k", ItemKind::Domain, "b.example", Link::Open(4), 5);
+        assert_eq!(
+            alerts.link("k", ItemKind::Domain, "b.example"),
+            Some(Link::Open(4))
+        );
+        assert_eq!(alerts.seen_again.get(&4), Some(&5));
     }
 }

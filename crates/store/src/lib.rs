@@ -365,6 +365,51 @@ impl Store {
         )?)
     }
 
+    /// Saves lasting "this is fine" keys, so alerts with any of them are not
+    /// raised again (a behaviour alert can hold several reasons that can be
+    /// allowed; [`Store::dismiss_alert`] saves only the alert's own key).
+    pub fn add_allow_keys(&mut self, keys: &[String], now: SystemTime) -> Result<(), StoreError> {
+        let transaction = self.conn.transaction()?;
+        for key in keys {
+            transaction.execute(
+                "INSERT OR IGNORE INTO alert_allows (key, created) VALUES (?1, ?2)",
+                params![key, unix_ms(now)],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the lasting "this is fine" keys of one app's behaviour alerts
+    /// (those starting `behaviour|` and the app's key, see
+    /// [`known_app_key`]), as when its profile is reset. Returns how many.
+    pub fn delete_behaviour_allows(&mut self, app_key: &str) -> Result<u64, StoreError> {
+        let prefix = format!("behaviour|{app_key}|");
+        // Compared as text: a path may hold LIKE's wildcards.
+        let deleted = self.conn.execute(
+            "DELETE FROM alert_allows WHERE substr(key, 1, length(?1)) = ?1",
+            [&prefix],
+        )?;
+        Ok(u64::try_from(deleted).unwrap_or(0))
+    }
+
+    /// The behaviour alerts of one app (by its key, see [`known_app_key`])
+    /// that the user has not marked as seen, oldest first.
+    pub fn open_behaviour_alerts(&self, app_key: &str) -> Result<Vec<StoredAlert>, StoreError> {
+        let mut query = self.conn.prepare(&format!(
+            "SELECT {ALERT_COLUMNS} FROM alerts WHERE kind = 'behaviour' AND dismissed = 0 \
+             AND lower(app_path) = ?1 ORDER BY id"
+        ))?;
+        let rows = query.query_map([app_key], read_alert)?;
+        let mut alerts = Vec::new();
+        for row in rows {
+            if let Some(alert) = row? {
+                alerts.push(alert);
+            }
+        }
+        Ok(alerts)
+    }
+
     /// Gives alert `id` its allow key if it has none yet (a signal that can
     /// be allowed joined an alert that began without one). `false` if the
     /// alert is gone or already has a key.
@@ -2233,6 +2278,58 @@ mod tests {
                 .is_allowed("behaviour|c:\\a.exe|beaconing|other")
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn behaviour_allows_are_added_and_deleted_per_app() {
+        let path = temp_db("behaviour-allows");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let mine = [
+            String::from(r"behaviour|c:\a_%.exe|random_name|x.example"),
+            String::from(r"behaviour|c:\a_%.exe|unusual_time|03"),
+        ];
+        let other = String::from(r"behaviour|c:\ab%.exe|unusual_time|03");
+        store.add_allow_keys(&mine, at(10)).unwrap();
+        store
+            .add_allow_keys(std::slice::from_ref(&other), at(10))
+            .unwrap();
+        // Again: nothing changes.
+        store.add_allow_keys(&mine, at(11)).unwrap();
+        assert!(mine.iter().all(|k| store.is_allowed(k).unwrap()));
+        // `_` and `%` are not wildcards: the other app keeps its allow.
+        assert_eq!(store.delete_behaviour_allows(r"c:\a_%.exe").unwrap(), 2);
+        assert!(!store.is_allowed(&mine[0]).unwrap());
+        assert!(store.is_allowed(&other).unwrap());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn open_behaviour_alerts_are_listed_per_app() {
+        let path = temp_db("open-behaviour");
+        let mut store = Store::open(&path, &key(7)).unwrap();
+        let first = store
+            .add_alert(&behaviour_alert(vec![country("RU")]), at(10))
+            .unwrap()
+            .unwrap();
+        let mut second = behaviour_alert(vec![country("CN")]);
+        second.key = String::from("behaviour|c:\\a.exe|2");
+        let second = store.add_alert(&second, at(20)).unwrap().unwrap();
+        let mut other = behaviour_alert(vec![country("FR")]);
+        other.key = String::from("behaviour|c:\\b.exe|1");
+        other.app_path = Some(String::from(r"C:\b.exe"));
+        store.add_alert(&other, at(30)).unwrap().unwrap();
+        let ids = |store: &Store| -> Vec<i64> {
+            store
+                .open_behaviour_alerts(r"c:\a.exe")
+                .unwrap()
+                .iter()
+                .map(|a| a.id)
+                .collect()
+        };
+        assert_eq!(ids(&store), [first, second]);
+        assert!(store.dismiss_alert(first, false, at(40)).unwrap());
+        assert_eq!(ids(&store), [second]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

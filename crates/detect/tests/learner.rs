@@ -10,7 +10,7 @@ use whereabouts_detect::signals::Toggles;
 use whereabouts_enrich::{CompanyList, Enricher, GeoDatabases, TrackerList};
 use whereabouts_store::{
     AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, Key, MAX_ITEMS_PER_KIND, MAX_REASONS,
-    ProfileItem, ProfileRow, Severity, Signal, Store, StoredAlert, known_app_key,
+    NewAlert, ProfileItem, ProfileRow, Reason, Severity, Signal, Store, StoredAlert, known_app_key,
 };
 
 /// 2027-01-15 08:00 UTC, on the hour.
@@ -898,6 +898,167 @@ fn this_is_fine_after_a_restart_uses_the_saved_reasons() {
         ..random_flow(secs)
     };
     assert!(learner.finished(&swapped, &e, &mut db, at(secs)).is_empty());
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn dismissing_after_a_restart_still_reminds() {
+    let mut db = TestStore::open("dismiss-restart");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let id =
+        Learner::new(Toggles::default(), 0).finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+    // The service restarted: this Learner never saw the alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(db.dismiss_alert(id, false, at(T0 + 60)).unwrap());
+    learner
+        .alert_closed(&mut db, id, false, at(T0 + 60))
+        .unwrap();
+    let again = learner.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
+    assert_eq!(
+        again.len(),
+        1,
+        "remind me: the next sighting is a new alert"
+    );
+    assert_ne!(again[0].id, id);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn dismissed_before_a_restart_still_reminds() {
+    let mut db = TestStore::open("dismissed-restart");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let id = {
+        let mut before = Learner::new(Toggles::default(), 0);
+        let id = before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+        assert!(db.dismiss_alert(id, false, at(T0 + 60)).unwrap());
+        before
+            .alert_closed(&mut db, id, false, at(T0 + 60))
+            .unwrap();
+        id
+    };
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let again = learner.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
+    assert_eq!(again.len(), 1);
+    assert_ne!(again[0].id, id);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn a_sighting_after_a_restart_counts_on_the_open_alert() {
+    let mut db = TestStore::open("seen-restart");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    {
+        let mut before = Learner::new(Toggles::default(), 0);
+        assert_eq!(
+            before.finished(&random_flow(T0), &e, &mut db, at(T0)).len(),
+            1
+        );
+        let secs = T0 + HOUR;
+        assert!(
+            before
+                .finished(&random_flow(secs), &e, &mut db, at(secs))
+                .is_empty()
+        );
+    }
+    assert_eq!(behaviour(&db)[0].seen_again, 1);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let secs = T0 + 2 * HOUR;
+    assert!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .is_empty(),
+        "no new alert while one waits"
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].seen_again, 2, "counted on from the saved count");
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn allowing_with_a_failing_store_keeps_the_link() {
+    let mut db = TestStore::open("allow-read-only");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let path = db.dir.join("t.db");
+    let store_key = Key::from_bytes([9; 32]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    let id = learner.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+
+    drop(db.store.take());
+    set_read_only(&path, true);
+    let failed = Store::open(&path, &store_key)
+        .map(|mut read_only| learner.alert_closed(&mut read_only, id, true, at(T0 + 60)));
+    set_read_only(&path, false);
+    assert!(failed.unwrap().is_err());
+
+    // Still pending, and still linked to its alert: a sighting counts on it.
+    db.store = Some(Store::open(&path, &store_key).unwrap());
+    assert_eq!(
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
+        Some(ItemState::Pending)
+    );
+    let secs = T0 + HOUR;
+    assert!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .is_empty()
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].seen_again, 1);
+    // Trying again works.
+    learner
+        .alert_closed(&mut db, id, true, at(T0 + 2 * HOUR))
+        .unwrap();
+    assert_eq!(
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
+        Some(ItemState::Allowed)
+    );
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn this_is_fine_allows_every_lasting_reason() {
+    let mut db = TestStore::open("allow-every-reason");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let reason = |signal, value: &str| Reason {
+        signal,
+        value: Some(value.to_owned()),
+        observed: None,
+        usual: None,
+        count: None,
+    };
+    let name = format!("behaviour|{}|random_name|{RANDOM_DOMAIN}", key());
+    let hour = format!("behaviour|{}|unusual_time|03", key());
+    let alert = NewAlert {
+        key: format!("behaviour|{}|{T0}", key()),
+        allow_key: Some(name.clone()),
+        kind: AlertKind::Behaviour,
+        severity: Severity::Medium,
+        app_name: Some("Chat.exe".to_owned()),
+        app_path: Some(PATH.to_owned()),
+        target: Some(RANDOM_DOMAIN.to_owned()),
+        detail: None,
+        reasons: vec![
+            reason(Signal::RandomName, RANDOM_DOMAIN),
+            reason(Signal::UnusualTime, "03"),
+        ],
+    };
+    let id = db.add_alert(&alert, at(T0)).unwrap().unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
+    learner
+        .alert_closed(&mut db, id, true, at(T0 + 60))
+        .unwrap();
+    assert!(db.is_allowed(&name).unwrap());
+    assert!(
+        db.is_allowed(&hour).unwrap(),
+        "every reason that can be allowed"
+    );
     assert!(learner.take_errors().is_empty());
 }
 
