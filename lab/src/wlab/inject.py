@@ -9,9 +9,10 @@ active in the test week, and gets a label with its time window.
 - beacon: small connections every 60 s +/- 5 s for 3 hours to one new host:
   `connection` lines (when each was opened) plus one flow row with their bytes
 - random_domain: 5 connections to random-looking names not on any list
-- swapped_binary: the app's program changes (new SHA-256, unsigned: a swapped
-  vendor program can't keep the vendor's valid signature) and it reaches
-  3 new destinations
+- swapped_binary: a signed app's program changes (new SHA-256, unsigned: a
+  swapped vendor program can't keep the vendor's valid signature) and it
+  reaches 3 new destinations. Only apps signed (with a publisher) in the
+  learning week are chosen.
 """
 
 from __future__ import annotations
@@ -82,19 +83,27 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
     staged = {label.get("app_name") for label in labels if label.get("live")}
     for user in users:
         flows = [r for r in out if r["type"] == "flow" and r["user"] == user]
-        learned = sorted({r["app_name"] for r in flows if r["day"] <= 7} - staged)
-        # Beaconing is learned per program file: apps without a path are never profiled.
-        with_path = sorted({r["app_name"] for r in flows if r["day"] <= 7 and r.get("app_path")} - staged)
+        learning = [r for r in flows if r["day"] <= 7 and r["app_name"] not in staged]
+        # Each kind's template rows: any for most; beacons need a program path (apps
+        # without one are never profiled); swaps need a signed program with a publisher,
+        # path and hash (a program that was never signed can't lose a signature, so its
+        # swap isn't detected, by design).
+        templates = {
+            "beacon": [r for r in learning if r.get("app_path")],
+            "swapped_binary": [r for r in learning if r.get("app_path") and r.get("app_sha256")
+                               and r.get("signature") == "signed" and r.get("publisher")],
+        }
         active = [r for r in flows if r["day"] >= 8 and not r.get("scenario")]
-        if not learned or not active:
+        if not learning or not active:
             continue
         for kind in TYPES:
+            rows_for = templates.get(kind, learning)
+            candidates = sorted({r["app_name"] for r in rows_for})
             for k in range(per_user.get(kind, 0)):
-                candidates = with_path if kind == "beacon" else learned
                 if not candidates:
                     continue
                 app = rng.choice(candidates)
-                template = next(r for r in flows if r["app_name"] == app and r["day"] <= 7)
+                template = next(r for r in rows_for if r["app_name"] == app)
                 anchor = rng.choice(active)
                 start = min(anchor["first_seen"], end_of_test - BEACON_SPAN - 600)
                 scenario = f"{kind}-{user}-{k + 1}"

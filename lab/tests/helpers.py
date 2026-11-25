@@ -15,7 +15,7 @@ HEADER = [
 
 def flow(app: str = "chrome.exe", ip: str = "198.51.100.1", at: int = 1000, **extra) -> dict:
     row = {
-        "app_name": app, "app_path": f"C:\\Apps\\{app}", "app_sha256": "a" * 64, "signature": "valid",
+        "app_name": app, "app_path": f"C:\\Apps\\{app}", "app_sha256": "a" * 64, "signature": "signed",
         "publisher": "Example", "signature_confirmed": "true", "protocol": "TCP", "remote_ip": ip,
         "remote_port": "443", "domain": "example.org", "domain_source": "verified", "owner": "Example Ltd",
         "country": "US", "first_seen_unix_ms": str(at * 1000), "last_seen_unix_ms": str((at + 20) * 1000),

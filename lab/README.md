@@ -64,5 +64,6 @@ Python runs only through uv (the version is pinned in `.python-version`, depende
 - Beaconing false alarms are under-measured: sessions last about 8 minutes and beaconing needs 6 connections, so only check-ins every 90 seconds or less can show up; real telemetry every 5 to 15 minutes cannot.
 - Connection lines carry no bytes, so the 64 KB per connection limit never rules a beacon out in the lab (pessimistic: more beaconing alerts than in the app).
 - Each flow's bytes are spread evenly over the hours it spans, which smooths bursts that cross an hour boundary (upload spike and ratio flip see less than the app would).
+- `swapped_binary` only targets apps that were signed (with a publisher) in the learning week: a swap of a program that was never signed isn't detected, by design. A swapped app's later rows from other scenarios are also unsigned.
 - GitHub's runner agents (`Runner.Worker.exe`, the Azure guest agents, `provjobd.exe…`) are dropped from the data; `info.json` records how many flows were dropped.
 - Steam is left out (its terms assume an account); apps run logged out, so their traffic is start-up, update and telemetry chatter, not active use.

@@ -267,3 +267,12 @@ def test_report_command_rejects_unknown_signals(tmp_path, capsys):
         run_report(tmp_path, data, [*alerts, "--signals", "upload_spike,bogus"])
     assert stopped.value.code == 2
     assert "unknown signal bogus" in capsys.readouterr().err
+
+
+def test_report_command_rejects_empty_signals(tmp_path, capsys):
+    data, alerts = report_dataset(tmp_path)
+    for empty in ("", " , "):
+        with pytest.raises(SystemExit) as stopped:
+            run_report(tmp_path, data, [*alerts, "--signals", empty])
+        assert stopped.value.code == 2
+        assert "no signals" in capsys.readouterr().err

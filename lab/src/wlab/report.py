@@ -55,7 +55,9 @@ GAPS = (
     "8 minutes and beaconing needs 6 connections, so only check-ins every 90 s or less can show up "
     "(real telemetry every 5 to 15 minutes cannot). Connection lines carry no bytes, so the 64 KB "
     "per connection limit never rules a beacon out here (pessimistic). Each flow's bytes are spread "
-    "evenly over the hours it spans, which smooths bursts across hour boundaries."
+    "evenly over the hours it spans, which smooths bursts across hour boundaries. Swapped programs "
+    "are staged only for apps that were signed: a swap of a program that was never signed isn't "
+    "detected, by design. A swapped app's later rows from other scenarios are also unsigned."
 )
 TARGET = 1.0  # design spec §6.6: at most 1 medium+ false alarm per user-week
 
@@ -71,6 +73,8 @@ def _minutes(seconds: float | None) -> str:
 def parse_signals(text: str) -> set[str]:
     """'upload_spike,beaconing' -> {'upload_spike', 'beaconing'}."""
     chosen = {part.strip() for part in text.split(",") if part.strip()}
+    if not chosen:
+        raise ValueError(f"no signals given (known: {', '.join(SIGNALS)})")
     unknown = sorted(chosen - set(SIGNALS))
     if unknown:
         raise ValueError(f"unknown signal {', '.join(unknown)} (known: {', '.join(SIGNALS)})")

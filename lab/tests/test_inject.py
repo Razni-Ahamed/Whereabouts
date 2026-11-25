@@ -107,7 +107,7 @@ def test_swapped_binary_changes_hash_after_start_only(tmp_path):
         # A swapped vendor program can't keep the vendor's valid signature (R25).
         swapped = [r for r in app_rows if r["first_seen"] >= label["start"]]
         assert all(r["signature"] == "unsigned" and r["publisher"] is None for r in swapped)
-        assert all(r["signature"] == "valid" for r in app_rows if r["first_seen"] < label["start"])
+        assert all(r["signature"] == "signed" for r in app_rows if r["first_seen"] < label["start"])
 
 
 def test_beacons_only_target_apps_with_a_path(tmp_path):
@@ -161,3 +161,40 @@ def test_never_targets_apps_of_live_scenarios(tmp_path):
     rows, labels = inject.add(rows, labels, seed=4, per_user={"upload": 3, "beacon": 3})
     targets = {label["app_name"] for label in labels if not label["live"]}
     assert targets == {"chrome.exe"}
+
+
+def test_swaps_only_target_signed_apps(tmp_path):
+    # A program that was never signed can't lose a signature: a swap of it isn't
+    # detected by design, so it would be no test of the detector.
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="chrome.exe", at=1010 + i),
+                             flow(app="unsigned.exe", at=1020 + i, signature="unsigned", publisher=""),
+                             flow(app="nopub.exe", at=1030 + i, publisher="")])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"swapped_binary": 4})
+    swaps = [label for label in labels if label["type"] == "swapped_binary"]
+    assert len(swaps) == 12
+    assert {label["app_name"] for label in swaps} == {"chrome.exe"}
+
+
+def test_no_signed_app_means_no_swap(tmp_path):
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="unsigned.exe", at=1010 + i, signature="unsigned", publisher="")])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 2, seed=2)
+    _, labels = inject.add(rows, labels, seed=4, per_user={"swapped_binary": 1, "upload": 1})
+    assert {label["type"] for label in labels} == {"upload"}
+
+
+def test_beacon_template_has_a_path(tmp_path):
+    # One app name seen with and without a path (a process whose file wasn't read).
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="chrome.exe", at=1010 + i, app_path=""),
+                             flow(app="chrome.exe", at=1020 + i)])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"beacon": 2})
+    beacons = [label for label in labels if label["type"] == "beacon"]
+    assert beacons and all(label["app_path"] for label in beacons)
+    assert all(r["app_path"] for r in rows if r["type"] == "connection")
