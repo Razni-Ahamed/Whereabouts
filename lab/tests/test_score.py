@@ -95,16 +95,39 @@ def test_release_bar_pass_and_fail():
     two = {**three, "random_domain": 0.0}
     passed, line = report.release_bar(bar_result(0.8, three))
     assert passed
-    assert line == "Release bar: PASS (false alarms 0.80 ≤ 1.0; types at ≥ 50 %: 3 of 5)"
+    assert line == "Release bar: PASS (false alarms 0.800 ≤ 1.0; types at ≥ 50 %: 3 of 5)"
     passed, line = report.release_bar(bar_result(1.2, three))
     assert not passed
-    assert line == "Release bar: FAIL (false alarms 1.20 ≤ 1.0; types at ≥ 50 %: 3 of 5)"
+    assert line == "Release bar: FAIL (false alarms 1.200 ≤ 1.0; types at ≥ 50 %: 3 of 5)"
     passed, line = report.release_bar(bar_result(0.5, two))
     assert not passed
-    assert line == "Release bar: FAIL (false alarms 0.50 ≤ 1.0; types at ≥ 50 %: 2 of 5)"
+    assert line == "Release bar: FAIL (false alarms 0.500 ≤ 1.0; types at ≥ 50 %: 2 of 5)"
     # Only the five Layer 2 scenario types count; missing ones count as 0 %.
     passed, _ = report.release_bar(bar_result(0.0, {"known_bad": 1.0, "upload": 1.0, "beacon": 1.0}))
     assert not passed
+    # Compared as printed: 1.0004 shows as 1.000, so it passes.
+    passed, line = report.release_bar(bar_result(1.0004, three))
+    assert passed and "false alarms 1.000 ≤" in line
+    passed, _ = report.release_bar(bar_result(1.0006, three))
+    assert not passed
+
+
+def test_bar_counts_only_fitting_reasons():
+    upload, beacon = label(kind="upload"), label(kind="beacon", start=TEST + 20_000, end=TEST + 30_000)
+    off_topic = behaviour(["new_company"], time=TEST + 200)  # during the upload, but not about it
+    fitting = behaviour(["beaconing"], time=TEST + 21_000)
+    general = score.match([off_topic, fitting], [upload, beacon], INFO)
+    assert general.per_type["upload"]["detected"] == 1
+    bar = score.match([off_topic, fitting], [upload, beacon], INFO, fits=report.fits_type)
+    assert bar.per_type["upload"]["detected"] == 0
+    assert bar.per_type["beacon"]["detected"] == 1
+    assert bar.false_alarms == []  # caused by a staged problem: never a false alarm
+    for kind, reasons in [("upload", ["ratio_flip"]), ("upload", ["upload_spike"]),
+                          ("random_domain", ["new_site", "random_name"]), ("swapped_binary", ["binary_changed"]),
+                          ("renamed_binary", ["new_country"])]:
+        assert report.fits_type(behaviour(reasons), kind), (kind, reasons)
+    assert not report.fits_type(behaviour(["new_site", "new_company"]), "random_domain")
+    assert report.fits_type(alert(), "upload")  # a Layer 1 alert always fits
 
 
 def behaviour(reasons, severity="medium", time=TEST + 100, app="chat.exe"):
@@ -138,14 +161,15 @@ def test_per_signal_table(tmp_path):
     assert table["new_site"].alerts_in_test_week == 1
     assert table["new_site"].fa_medium_plus == 0  # info on its own
     results = [("Layers 1+2", score.match(alerts, labels, INFO))]
-    report.write(results, INFO, tmp_path, signal_tables=[("Layers 1+2", table)],
-                 bar=("Layers 1+2", sorted(report.SIGNALS)))
+    bars = [report.bar_check("shipped signals", "Layers 1+2", alerts, labels, INFO, report.SHIPPED)]
+    report.write(results, INFO, tmp_path, signal_tables=[("Layers 1+2", table)], bars=bars)
     text = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "| upload_spike | 1 |" in text
     assert "Release bar: FAIL" in text
     assert "Release bar: FAIL" in (tmp_path / "summary.md").read_text(encoding="utf-8")
     metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
-    assert metrics["release_bar"]["passed"] is False
+    assert metrics["release_bar"][0]["passed"] is False
+    assert metrics["release_bar"][0]["label"] == "shipped signals"
     assert metrics["Layers 1+2"]["per_signal"]["beaconing"]["alerts_in_test_week"] == 2
 
 
@@ -170,27 +194,76 @@ def test_same_day_repeat_is_covered():
     assert entry["ttd_max"] == 5  # covered instances have no delay of their own
 
 
-def test_report_command_scores_the_chosen_signals(tmp_path, capsys):
+def report_dataset(tmp_path):
+    """A dataset with a Layer 1 run and a Layers 1+2 run; returns (folder, alerts args)."""
     from wlab import cli
 
     data = tmp_path / "dataset"
     data.mkdir()
-    upload = label(kind="upload")
-    cli.write_jsonl(data / "labels.jsonl", [upload])
+    cli.write_jsonl(data / "labels.jsonl", [label(kind="upload"),
+                                            label(kind="beacon", start=TEST + 20_000, end=TEST + 30_000)])
     (data / "info.json").write_text(json.dumps(INFO), encoding="utf-8")
     cli.write_jsonl(data / "layer1.jsonl", [alert(time=TEST + 200_000)])
     spike = behaviour(["upload_spike"], severity="high", time=TEST + 200)
-    unusual = behaviour(["new_country"], time=TEST + 300_000)
-    cli.write_jsonl(data / "layer2.jsonl", [alert(time=TEST + 200_000), spike, unusual])
+    beacon = behaviour(["beaconing"], time=TEST + 21_000)
+    country = behaviour(["new_country"], time=TEST + 300_000)
+    cli.write_jsonl(data / "layer2.jsonl", [alert(time=TEST + 200_000), spike, beacon, country])
+    return data, ["--alerts", f"Layer 1={data / 'layer1.jsonl'}", "--alerts", f"Layers 1+2={data / 'layer2.jsonl'}"]
+
+
+def run_report(tmp_path, data, extra):
+    from wlab import cli
+
     out = tmp_path / "report"
-    cli.main(["report", "--timeline-dir", str(data), "--alerts", f"Layer 1={data / 'layer1.jsonl'}",
-              "--alerts", f"Layers 1+2={data / 'layer2.jsonl'}", "--signals", "upload_spike",
-              "--out", str(out)])
-    metrics = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
-    assert metrics["release_bar"]["result"] == "Layers 1+2"
-    assert metrics["release_bar"]["signals"] == ["upload_spike"]
-    # new_country is off: its alert is gone, so only the Layer 1 false alarm is left.
+    cli.main(["report", "--timeline-dir", str(data), *extra, "--out", str(out)])
+    return json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+
+
+def test_report_command_scores_the_chosen_signals(tmp_path, capsys):
+    data, alerts = report_dataset(tmp_path)
+    metrics = run_report(tmp_path, data, [*alerts, "--signals", "upload_spike"])
+    [bar] = metrics["release_bar"]
+    assert bar["result"] == "Layers 1+2" and bar["signals"] == ["upload_spike"]
+    # new_country and beaconing are off: only the Layer 1 false alarm is left.
     assert metrics["Layers 1+2"]["false_alarms_medium_plus"] == 1
     assert metrics["Layers 1+2"]["per_type"]["upload"]["detected"] == 1
-    assert list(metrics["Layers 1+2"]["per_signal"]) == ["upload_spike"]
+    assert "beacon" not in {k for k, v in metrics["Layers 1+2"]["per_type"].items() if v["detected"]}
+    # Each signal on its own is shown for all of them.
+    assert list(metrics["Layers 1+2"]["per_signal"]) == list(report.SIGNALS)
     assert "Release bar: FAIL" in capsys.readouterr().out
+
+
+def test_report_command_checks_what_ships_and_everything(tmp_path, capsys):
+    data, alerts = report_dataset(tmp_path)
+    metrics = run_report(tmp_path, data, alerts)
+    shipped, everything = metrics["release_bar"]
+    assert shipped["signals"] == list(report.SHIPPED) and "beaconing" not in shipped["signals"]
+    assert everything["signals"] == list(report.SIGNALS)
+    assert "not shipped" in everything["label"]
+    # Beaconing is off in what ships: its detection does not count there.
+    assert metrics["Layers 1+2"]["per_type"]["beacon"]["detected"] == 0
+    text = (tmp_path / "report" / "report.md").read_text(encoding="utf-8")
+    assert text.count("Release bar: ") == 2
+
+
+def test_report_command_picks_the_layer2_run_or_the_named_one(tmp_path, capsys):
+    data, alerts = report_dataset(tmp_path)
+    swapped = [alerts[2], alerts[3], alerts[0], alerts[1]]  # Layers 1+2 first
+    metrics = run_report(tmp_path, data, swapped)
+    assert metrics["release_bar"][0]["result"] == "Layers 1+2"
+    metrics = run_report(tmp_path, data, [*swapped, "--bar", "Layer 1"])
+    assert metrics["release_bar"][0]["result"] == "Layer 1"
+    capsys.readouterr()
+    metrics = run_report(tmp_path, data, alerts[:2])  # no Layer 2 alerts anywhere
+    assert metrics["release_bar"][0]["result"] == "Layer 1"
+    assert "no run has Layer 2 alerts" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        run_report(tmp_path, data, [*alerts, "--bar", "Layer 3"])
+
+
+def test_report_command_rejects_unknown_signals(tmp_path, capsys):
+    data, alerts = report_dataset(tmp_path)
+    with pytest.raises(SystemExit) as stopped:
+        run_report(tmp_path, data, [*alerts, "--signals", "upload_spike,bogus"])
+    assert stopped.value.code == 2
+    assert "unknown signal bogus" in capsys.readouterr().err

@@ -193,7 +193,7 @@ jobs:
         run: >
           cargo run --release --locked -p whereabouts-lab-replay --
           --timeline "${{ runner.temp }}\dataset\timeline.jsonl"
-          --data data --lists "${{ runner.temp }}\lists" --layers 1,2
+          --data data --lists "${{ runner.temp }}\lists" --layers "1,2"
           --out "${{ runner.temp }}\dataset\alerts-layer2.jsonl"
       - name: Report
         shell: pwsh

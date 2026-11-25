@@ -56,19 +56,42 @@ def cmd_report(args: argparse.Namespace) -> None:
 
     labels = read_jsonl(args.timeline_dir / "labels.jsonl")
     info = json.loads((args.timeline_dir / "info.json").read_text(encoding="utf-8"))
-    chosen = report.parse_signals(args.signals) if args.signals else set(report.SIGNALS)
+    # By default, what ships; the tables are scored with these signals on.
+    chosen = args.signals if args.signals is not None else set(report.SHIPPED)
     signals = [signal for signal in report.SIGNALS if signal in chosen]
-    results = []
-    last_alerts: list[dict] = []
+    runs: list[tuple[str, list[dict]]] = []
     for spec in args.alerts:
         name, _, path = spec.partition("=")
-        last_alerts = report.only_signals(read_jsonl(Path(path)), chosen)
-        results.append((name, score.match(last_alerts, labels, info)))
-    # The release bar and the per-signal table are for the last --alerts (Layers 1+2).
-    last = results[-1][0]
-    table = report.per_signal(last_alerts, labels, info, signals)
-    report.write(results, info, args.out, signal_tables=[(last, table)], bar=(last, signals))
+        runs.append((name, read_jsonl(Path(path))))
+    names = [name for name, _ in runs]
+    if args.bar is not None and args.bar not in names:
+        args.parser.error(f"--bar {args.bar}: no --alerts with that name (given: {', '.join(names)})")
+    # The release bar and the per-signal table are for the named run, or else the last
+    # run with Layer 2 alerts.
+    with_layer2 = [name for name, alerts in runs if any(a.get("layer") == 2 for a in alerts)]
+    bar_name = args.bar or (with_layer2[-1] if with_layer2 else names[-1])
+    if args.bar is None and not with_layer2:
+        print(f"warning: no run has Layer 2 alerts; checking the release bar on {bar_name!r}", file=sys.stderr)
+    bar_alerts = dict(runs)[bar_name]
+
+    results = [(name, score.match(report.only_signals(alerts, chosen), labels, info)) for name, alerts in runs]
+    table = report.per_signal(bar_alerts, labels, info, list(report.SIGNALS))
+    label = "chosen signals" if args.signals is not None else "shipped signals"
+    bars = [report.bar_check(label, bar_name, bar_alerts, labels, info, signals)]
+    if args.signals is None:
+        bars.append(report.bar_check("every signal on, beaconing too (not shipped)", bar_name, bar_alerts,
+                                     labels, info, report.SIGNALS))
+    report.write(results, info, args.out, signal_tables=[(bar_name, table)], bars=bars)
     print((args.out / "summary.md").read_text(encoding="utf-8"))
+
+
+def _signals(text: str) -> set[str]:
+    from . import report
+
+    try:
+        return report.parse_signals(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def cmd_droplist(args: argparse.Namespace) -> None:
@@ -96,11 +119,14 @@ def main(argv: list[str] | None = None) -> None:
     r = sub.add_parser("report", help="alerts + labels -> report")
     r.add_argument("--timeline-dir", type=Path, required=True)
     r.add_argument("--alerts", action="append", required=True,
-                   help='"Layer 1=alerts.jsonl" (repeatable; the release bar is checked on the last)')
-    r.add_argument("--signals", default="",
-                   help="score only these Layer 2 signals, e.g. upload_spike,beaconing (default: all)")
+                   help='"Layer 1=alerts.jsonl" (repeatable)')
+    r.add_argument("--signals", type=_signals, default=None,
+                   help="score only these Layer 2 signals, e.g. upload_spike,beaconing (default: the ones "
+                        "that ship, plus a second release-bar line with every signal on)")
+    r.add_argument("--bar", default=None,
+                   help="the --alerts name to check the release bar on (default: the last with Layer 2 alerts)")
     r.add_argument("--out", type=Path, required=True)
-    r.set_defaults(func=cmd_report)
+    r.set_defaults(func=cmd_report, parser=r)
 
     d = sub.add_parser("droplist", help="Spamhaus DROP + the lab's test entries -> a lists folder")
     d.add_argument("--labels", type=Path, required=True)

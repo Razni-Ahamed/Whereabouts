@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use whereabouts_enrich::{CompanyList, DropList, Enricher, GeoDatabases, TrackerList};
-use whereabouts_lab_replay::replay::{AlertOut, Layers, run};
-use whereabouts_lab_replay::timeline::{Line, parse};
+use whereabouts_lab_replay::replay::{AlertOut, Layers, check_layers, run};
+use whereabouts_lab_replay::timeline::{Line, parse, parse_timeline};
 
 fn enricher() -> Enricher {
     Enricher::from_parts(
@@ -194,20 +194,74 @@ fn timeline_schema_1_still_reads() {
 }
 
 #[test]
+fn layer2_needs_schema_2() {
+    // Schema 1 has no signatures: browsers would lose their goes-anywhere
+    // exemption, so Layer 2 is refused on it.
+    let old = format!(
+        "{}\n{}",
+        r#"{"type":"header","schema":1}"#,
+        flow("u1", T0, "192.0.2.7", None, "verified")
+    );
+    let (schema, _) = parse_timeline(&old).unwrap();
+    assert_eq!(schema, 1);
+    assert!(check_layers(schema, Layers::One).is_ok());
+    let error = check_layers(schema, Layers::OneAndTwo).unwrap_err();
+    assert!(error.contains("schema 2"), "{error}");
+    assert!(check_layers(2, Layers::OneAndTwo).is_ok());
+}
+
+#[test]
 fn layer1_output_is_unchanged() {
-    // `--layers 1` writes exactly what it wrote before Layer 2 existed.
-    let alerts = replay("pin", &[flow("u1", T0, "192.0.2.7", None, "verified")]).unwrap();
+    // `--layers 1` writes exactly what it wrote before Layer 2 existed (taken
+    // from the old program's output for the same timeline).
+    let tracker = flow(
+        "u1",
+        T0 + 100,
+        "198.51.100.1",
+        Some("www.google-analytics.com"),
+        "verified",
+    );
+    let counters = [
+        format!(
+            r#"{{"type":"counters","user":"u1","time":{},"rejected":0,"unattributed":0}}"#,
+            T0 + 200
+        ),
+        format!(
+            r#"{{"type":"counters","user":"u1","time":{},"rejected":3,"unattributed":0}}"#,
+            T0 + 300
+        ),
+    ];
+    let lines = [
+        flow("u1", T0, "192.0.2.7", None, "verified"),
+        tracker,
+        counters[0].clone(),
+        counters[1].clone(),
+    ];
+    let alerts = replay("pin", &lines).unwrap();
     let text: Vec<String> = alerts
         .iter()
         .map(|alert| serde_json::to_string(alert).unwrap())
         .collect();
     assert_eq!(
         text,
-        [concat!(
-            r#"{"user":"u1","time":1800000000,"layer":1,"kind":"bad_network","severity":"high","#,
-            r#""app_name":"chat.exe","app_path":"C:\\Apps\\chat.exe","target":"192.0.2.7","#,
-            r#""detail":"192.0.2.0/24 (SBL-TEST)","reasons":[],"notified":true}"#
-        )]
+        [
+            concat!(
+                r#"{"user":"u1","time":1800000000,"layer":1,"kind":"bad_network","severity":"high","#,
+                r#""app_name":"chat.exe","app_path":"C:\\Apps\\chat.exe","target":"192.0.2.7","#,
+                r#""detail":"192.0.2.0/24 (SBL-TEST)","reasons":[],"notified":true}"#
+            ),
+            concat!(
+                r#"{"user":"u1","time":1800000100,"layer":1,"kind":"tracker","severity":"info","#,
+                r#""app_name":"chat.exe","app_path":"C:\\Apps\\chat.exe","#,
+                r#""target":"google-analytics.com","detail":"google-analytics.com","reasons":[],"#,
+                r#""notified":false}"#
+            ),
+            concat!(
+                r#"{"user":"u1","time":1800000300,"layer":1,"kind":"faked_dns","severity":"medium","#,
+                r#""app_name":null,"app_path":null,"target":null,"detail":"3 events","reasons":[],"#,
+                r#""notified":true}"#
+            )
+        ]
     );
 }
 

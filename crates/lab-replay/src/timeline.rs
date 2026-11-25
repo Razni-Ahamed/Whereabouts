@@ -92,8 +92,13 @@ impl Line {
 /// Reads a timeline: checks the header, then returns flows, connections and
 /// counters sorted by time (stable, so equal times keep their order).
 pub fn parse(text: &str) -> Result<Vec<Line>, String> {
+    parse_timeline(text).map(|(_, lines)| lines)
+}
+
+/// As [`parse`], also returning the timeline's schema.
+pub fn parse_timeline(text: &str) -> Result<(u32, Vec<Line>), String> {
     let mut lines = Vec::new();
-    let mut header = false;
+    let mut header = None;
     for (index, raw) in text.lines().enumerate() {
         let number = index + 1;
         if raw.trim().is_empty() {
@@ -102,25 +107,25 @@ pub fn parse(text: &str) -> Result<Vec<Line>, String> {
         let line: Line = serde_json::from_str(raw)
             .map_err(|error| format!("timeline line {number}: {error}"))?;
         match line {
-            Line::Header { schema } if !header => {
+            Line::Header { schema } if header.is_none() => {
                 if !(OLDEST_SCHEMA..=SCHEMA).contains(&schema) {
                     return Err(format!(
                         "timeline schema {schema} is not supported (this program reads \
                          {OLDEST_SCHEMA} to {SCHEMA})"
                     ));
                 }
-                header = true;
+                header = Some(schema);
             }
             Line::Header { .. } => return Err(format!("timeline line {number}: a second header")),
-            _ if !header => {
+            _ if header.is_none() => {
                 return Err(String::from("the timeline must start with a header line"));
             }
             other => lines.push(other),
         }
     }
-    if !header {
+    let Some(schema) = header else {
         return Err(String::from("the timeline must start with a header line"));
-    }
+    };
     lines.sort_by_key(Line::time);
-    Ok(lines)
+    Ok((schema, lines))
 }

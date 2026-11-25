@@ -9,7 +9,8 @@ active in the test week, and gets a label with its time window.
 - beacon: small connections every 60 s +/- 5 s for 3 hours to one new host:
   `connection` lines (when each was opened) plus one flow row with their bytes
 - random_domain: 5 connections to random-looking names not on any list
-- swapped_binary: the app's program changes (new SHA-256) and it reaches
+- swapped_binary: the app's program changes (new SHA-256, unsigned: a swapped
+  vendor program can't keep the vendor's valid signature) and it reaches
   3 new destinations
 """
 
@@ -82,12 +83,17 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
     for user in users:
         flows = [r for r in out if r["type"] == "flow" and r["user"] == user]
         learned = sorted({r["app_name"] for r in flows if r["day"] <= 7} - staged)
+        # Beaconing is learned per program file: apps without a path are never profiled.
+        with_path = sorted({r["app_name"] for r in flows if r["day"] <= 7 and r.get("app_path")} - staged)
         active = [r for r in flows if r["day"] >= 8 and not r.get("scenario")]
         if not learned or not active:
             continue
         for kind in TYPES:
             for k in range(per_user.get(kind, 0)):
-                app = rng.choice(learned)
+                candidates = with_path if kind == "beacon" else learned
+                if not candidates:
+                    continue
+                app = rng.choice(candidates)
                 template = next(r for r in flows if r["app_name"] == app and r["day"] <= 7)
                 anchor = rng.choice(active)
                 start = min(anchor["first_seen"], end_of_test - BEACON_SPAN - 600)
@@ -112,8 +118,7 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
                     out.append(_row(base, start, remote_ip=ip, domain=host, domain_source="verified",
                                     last_seen=times[-1], connections=len(times),
                                     bytes_sent=1000 * len(times), bytes_received=1000 * len(times)))
-                    if base.get("app_path"):  # programs without a path are never profiled
-                        out.extend(_connection(base, at, host) for at in times)
+                    out.extend(_connection(base, at, host) for at in times)
                     end = start + BEACON_SPAN
                 elif kind == "random_domain":
                     for i in range(5):
@@ -125,11 +130,12 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
                     for row in out:
                         if (row["type"] == "flow" and row["user"] == user and row["app_name"] == app
                                 and row["first_seen"] >= start):
-                            row["app_sha256"] = new_hash
+                            row.update(app_sha256=new_hash, signature="unsigned", publisher=None)
                     for i in range(3):
                         out.append(_row(base, start + 60 + i * 300, remote_ip=_new_ip(rng),
                                         domain=f"upd-{rng.randrange(16**6):06x}.example.com",
                                         domain_source="verified", app_sha256=new_hash,
+                                        signature="unsigned", publisher=None,
                                         bytes_sent=5000, bytes_received=20000))
                     end = start + HOUR
                 labels.append({"scenario": scenario, "type": kind, "user": user, "app_name": app,

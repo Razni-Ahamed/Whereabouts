@@ -104,6 +104,22 @@ def test_swapped_binary_changes_hash_after_start_only(tmp_path):
         assert len(after) == 1 and len(next(iter(after))) == 64
         new = [r for r in app_rows if r.get("scenario") == label["scenario"]]
         assert len(new) == 3
+        # A swapped vendor program can't keep the vendor's valid signature (R25).
+        swapped = [r for r in app_rows if r["first_seen"] >= label["start"]]
+        assert all(r["signature"] == "unsigned" and r["publisher"] is None for r in swapped)
+        assert all(r["signature"] == "valid" for r in app_rows if r["first_seen"] < label["start"])
+
+
+def test_beacons_only_target_apps_with_a_path(tmp_path):
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="chrome.exe", at=1010 + i), flow(app="nopath.exe", at=1020 + i, app_path="")])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"beacon": 4})
+    beacons = [label for label in labels if label["type"] == "beacon"]
+    assert len(beacons) == 12
+    assert {label["app_name"] for label in beacons} == {"chrome.exe"}
+    assert all(r["app_path"] for r in rows if r["type"] == "connection")
 
 
 def test_only_in_test_week(tmp_path):

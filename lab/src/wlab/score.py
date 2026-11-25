@@ -13,12 +13,17 @@
 - **False alarm** = a test-week alert that matches nothing; reported per
   simulated user-week, at medium and above, and as "notified" (what the app
   would have pushed).
+- With `fits` (the release bar's rule, R26), a matching alert **detects** a
+  scenario instance only if it fits the instance's type; one that matches
+  but does not fit detects nothing and is still no false alarm (the staged
+  problem caused it).
 """
 
 from __future__ import annotations
 
 import statistics
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .timeline import DAY
@@ -50,7 +55,8 @@ def _matches(alert: dict, label: dict, grace: int) -> bool:
     return label["start"] <= alert["time"] <= label["end"] + grace
 
 
-def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE) -> Scored:
+def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE,
+          fits: Callable[[dict, str], bool] | None = None) -> Scored:
     test_start = info["t0"] + info["learning_days"] * DAY
     users = info["users_per_persona"] * len(info["pools"])
     scored = Scored(user_weeks=users * info["test_days"] / 7)
@@ -63,7 +69,8 @@ def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE
         hits = [label for label in test_labels if _matches(alert, label, grace)]
         if hits:
             for label in hits:
-                first_hit.setdefault(label["scenario"], alert["time"] - label["start"])
+                if fits is None or fits(alert, label["type"]):
+                    first_hit.setdefault(label["scenario"], alert["time"] - label["start"])
         else:
             scored.false_alarms.append(alert)
     scored.alerts_in_test_week = len(in_test)

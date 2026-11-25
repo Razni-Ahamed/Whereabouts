@@ -59,7 +59,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 fn run(options: &Options) -> Result<usize, String> {
     let text = std::fs::read_to_string(&options.timeline)
         .map_err(|e| format!("{}: {e}", options.timeline.display()))?;
-    let lines = timeline::parse(&text)?;
+    let (schema, lines) = timeline::parse_timeline(&text)?;
+    replay::check_layers(schema, options.layers)?;
     let (enricher, _) = Enricher::load(&options.data);
     let drop = match &options.lists {
         Some(dir) => DropList::load(dir).map_err(|e| format!("{}: {e}", dir.display()))?,

@@ -48,6 +48,19 @@ pub enum Layers {
     OneAndTwo,
 }
 
+/// Whether a timeline of `schema` can be replayed through `layers`. Layer 2
+/// needs schema 2: without signatures, browsers would lose their
+/// goes-anywhere exemption and every new site would look suspicious.
+pub fn check_layers(schema: u32, layers: Layers) -> Result<(), String> {
+    if layers == Layers::OneAndTwo && schema < 2 {
+        return Err(format!(
+            "timeline schema {schema} has no signatures, which Layer 2 needs; build it again \
+             with `lab timeline` (schema 2)"
+        ));
+    }
+    Ok(())
+}
+
 /// One alert, as the lab's scoring reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AlertOut {

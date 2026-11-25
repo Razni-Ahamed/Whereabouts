@@ -11,17 +11,21 @@
 //! A connection counts as new when a flow's connection count rises between
 //! ticks: the signal the behaviour Learner's meter uses
 //! (`whereabouts_detect::meter::Meter`). A flow seen for the first time counts
-//! all of its connections. As for learning, only flows with a known program
-//! file count, and never the flow-limit overflow. The destination follows the
-//! profiles' rule (a confirmed name's registrable domain), else the address.
+//! all of its connections, and at most [`MAX_TIMES`] lines are written per
+//! flow per tick (the beacon tracker keeps no more). As for learning, only
+//! flows with a known program file count, and never the flow-limit overflow.
+//! The destination follows the profiles' rule (a confirmed name's registrable
+//! domain), else the address. The file must be new (or empty), so one
+//! recording is never mixed with another.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use whereabouts_core::flow::FlowKey;
+use whereabouts_detect::beacon::MAX_TIMES;
 use whereabouts_detect::destination::confirmed_domain;
 
 use crate::learning::FlowInput;
@@ -43,15 +47,28 @@ pub struct ConnectionLog {
 }
 
 impl ConnectionLog {
-    /// Opens `path` for appending (created if missing).
+    /// Creates `path`. An existing file is refused unless it is empty.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let size = file.metadata()?.len();
+        let file = match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let file = OpenOptions::new().append(true).open(path)?;
+                if file.metadata()?.len() > 0 {
+                    return Err(io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        "the file already exists and is not empty; record each session to a new \
+                         file",
+                    ));
+                }
+                file
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             out: BufWriter::new(file),
             path: path.to_owned(),
-            size,
-            full: size >= MAX_BYTES,
+            size: 0,
+            full: false,
             previous: HashMap::new(),
         })
     }
@@ -76,6 +93,7 @@ impl ConnectionLog {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let mut text = String::new();
+        let mut reached = false;
         for (key, flow) in &first {
             let before = self.previous.get(key).copied().unwrap_or(0);
             let opened = current
@@ -87,29 +105,41 @@ impl ConnectionLog {
                 continue;
             }
             let line = line(flow, time_ms);
-            for _ in 0..opened {
+            let lines = usize::try_from(opened).map_or(MAX_TIMES, |n| n.min(MAX_TIMES));
+            for _ in 0..lines {
+                // Counted line by line, so no tick can go past the limit.
+                let after = self.size + (text.len() + line.len() + 1) as u64;
+                if after > MAX_BYTES {
+                    reached = true;
+                    break;
+                }
                 text.push_str(&line);
                 text.push('\n');
             }
+            if reached {
+                break;
+            }
         }
         self.previous = current;
-        self.write(&text);
-    }
-
-    fn write(&mut self, text: &str) {
-        if self.full || text.is_empty() {
+        if self.full {
             return;
         }
-        let len = text.len() as u64;
-        if self.size.saturating_add(len) > MAX_BYTES {
+        self.write(&text);
+        if reached && !self.full {
             self.full = true;
             report!(
                 "warning: {} reached {} MB; no more connections are recorded",
                 self.path.display(),
                 MAX_BYTES / (1024 * 1024)
             );
+        }
+    }
+
+    fn write(&mut self, text: &str) {
+        if text.is_empty() {
             return;
         }
+        let len = text.len() as u64;
         let written = self
             .out
             .write_all(text.as_bytes())
@@ -292,30 +322,61 @@ mod tests {
     }
 
     #[test]
-    fn stops_at_the_size_limit() {
+    fn stops_at_the_size_limit_even_within_one_tick() {
         let path = temp("full");
         let app = identity(r"C:\Apps\beacon.exe");
         let mut log = ConnectionLog::open(&path).unwrap();
-        log.size = MAX_BYTES - 10;
+        let one = line(
+            &input(key(7, "203.0.113.9:443"), Some(&app), &stats(None, 1)),
+            T0 * 1000,
+        );
+        // Room for exactly two more lines: a tick with ten writes only two.
+        let room = 2 * (one.len() as u64 + 1);
+        log.size = MAX_BYTES - room;
+        let many = stats(None, 10);
         log.record(
-            &[input(
-                key(7, "203.0.113.9:443"),
-                Some(&app),
-                &stats(None, 1),
-            )],
+            &[input(key(7, "203.0.113.9:443"), Some(&app), &many)],
             at(T0),
         );
         assert!(log.full);
+        assert_eq!(log.size, MAX_BYTES);
+        assert_eq!(lines(&path).len(), 2);
+        // Nothing more once full.
         log.size = 0;
+        let more = stats(None, 1);
         log.record(
-            &[input(
-                key(8, "203.0.113.9:443"),
-                Some(&app),
-                &stats(None, 1),
-            )],
+            &[input(key(8, "203.0.113.9:443"), Some(&app), &more)],
             at(T0),
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(lines(&path).len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_huge_jump_is_capped_per_flow_and_tick() {
+        let path = temp("cap");
+        let app = identity(r"C:\Apps\beacon.exe");
+        let mut log = ConnectionLog::open(&path).unwrap();
+        let huge = stats(None, 100_000);
+        log.record(
+            &[input(key(7, "203.0.113.9:443"), Some(&app), &huge)],
+            at(T0),
+        );
+        assert_eq!(lines(&path).len(), MAX_TIMES);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_existing_recording_is_never_added_to() {
+        let path = temp("exists");
+        std::fs::write(&path, "{}\n").unwrap();
+        let error = ConnectionLog::open(&path).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("not empty"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+        // An empty one (e.g. made ready by a script) is fine.
+        std::fs::write(&path, "").unwrap();
+        assert!(ConnectionLog::open(&path).is_ok());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

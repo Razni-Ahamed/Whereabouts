@@ -15,7 +15,7 @@ pub const BEACON_WINDOW: u64 = 4 * 3600;
 /// Most app and destination pairs tracked; the least recently used goes first.
 pub const MAX_TRACKED: usize = 2_000;
 /// Most connection times kept per pair.
-const MAX_TIMES: usize = 64;
+pub const MAX_TIMES: usize = 64;
 
 /// The recent connections of one app and destination pair.
 #[derive(Debug, Default)]
