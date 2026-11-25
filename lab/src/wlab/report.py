@@ -20,7 +20,7 @@ from .score import SERIOUS, Scored, match  # noqa: E402
 
 # Layer 2's signals (the store's spellings) and their starting severities.
 SIGNAL_SEVERITY = {
-    "new_site": "info", "new_company": "medium", "new_country": "medium", "upload_spike": "high",
+    "new_site": "info", "new_company": "info", "new_country": "info", "upload_spike": "high",
     "ratio_flip": "medium", "beaconing": "medium", "unusual_time": "info", "random_name": "medium",
     "binary_changed": "high",
 }

@@ -340,12 +340,17 @@ mod tests {
 
     #[test]
     fn two_mediums_make_high() {
-        let country = reason(Signal::NewCountry, Some("RU"));
-        let company = reason(Signal::NewCompany, Some("Evil"));
+        let beacon = reason(Signal::Beaconing, Some("c2.example"));
+        let name = reason(Signal::RandomName, Some("xk3j9q2m7z.example"));
         let site = reason(Signal::NewSite, Some("a.example"));
+        let country = reason(Signal::NewCountry, Some("RU"));
         assert_eq!(combined(std::slice::from_ref(&site)), Severity::Info);
-        assert_eq!(combined(&[site, country.clone()]), Severity::Medium);
-        assert_eq!(combined(&[country, company]), Severity::High);
+        assert_eq!(combined(&[site, country]), Severity::Info);
+        assert_eq!(
+            combined(&[reason(Signal::NewSite, None), beacon.clone()]),
+            Severity::Medium
+        );
+        assert_eq!(combined(&[beacon, name]), Severity::High);
         assert_eq!(combined(&[]), Severity::Info);
     }
 

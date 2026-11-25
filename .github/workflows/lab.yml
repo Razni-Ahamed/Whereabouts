@@ -85,7 +85,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.reanalyse == ''
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Session length plus setup, build and upload time; a fixed 45 killed 30-minute sessions.
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.minutes) + 40 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}

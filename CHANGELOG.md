@@ -17,6 +17,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - App: the Apps screen now shows what Whereabouts learned is normal for each app (sites, companies, countries, usual upload and active hours), lets you reset it, and lets you say an app goes anywhere, like a browser. The history-off texts now say learning works either way, and "Block site" is only offered for host names.
 - Lab (for developers, never shipped): the lab now also runs its simulated weeks through behaviour learning (`--layers 1,2`, every signal on, with the same rule as the app for what a profile learns), scores each signal on its own, and checks the release bar with the signals that ship (and, for comparison, with every signal on): at most 1 false alarm per user-week, and at least half of the staged problems caught, by a fitting reason, in 3 of the 5 kinds. `lab report --signals` checks it for any set of signals.
 - Lab (for developers): the console engine has a lab-only `--record-connections <file>` that writes when each program opened each connection (unencrypted, never on by default; the installed service refuses it), so the lab can measure beaconing on real sessions.
+- Detection: a first connection to a new company or country is now only listed on the Alerts screen (as info), never notified, because global content networks made it too common; a random-looking name, a changed program file and the other signals are unchanged. Lab sessions of any length now get a matching time limit.
 
 ## [0.2.1] - 2026-11-24
 

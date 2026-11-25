@@ -86,15 +86,14 @@ impl Toggles {
     }
 }
 
-/// The starting severity of a signal.
+/// The starting severity of a signal. New sites, companies and countries are
+/// only listed (Info): global CDNs made them far too common to notify on
+/// (lab-tuned).
 pub fn severity_of(signal: Signal) -> Severity {
     match signal {
-        Signal::NewSite | Signal::UnusualTime => Severity::Info,
-        Signal::NewCompany
-        | Signal::NewCountry
-        | Signal::RatioFlip
-        | Signal::Beaconing
-        | Signal::RandomName => Severity::Medium,
+        Signal::NewSite | Signal::NewCompany | Signal::NewCountry => Severity::Info,
+        Signal::UnusualTime => Severity::Info,
+        Signal::RatioFlip | Signal::Beaconing | Signal::RandomName => Severity::Medium,
         Signal::UploadSpike | Signal::BinaryChanged => Severity::High,
     }
 }
@@ -317,10 +316,10 @@ mod tests {
     }
 
     #[test]
-    fn new_country_is_medium_new_site_is_info() {
-        assert_eq!(severity_of(Signal::NewCountry), Severity::Medium);
+    fn new_destinations_are_info_only() {
+        assert_eq!(severity_of(Signal::NewCountry), Severity::Info);
         assert_eq!(severity_of(Signal::NewSite), Severity::Info);
-        assert_eq!(severity_of(Signal::NewCompany), Severity::Medium);
+        assert_eq!(severity_of(Signal::NewCompany), Severity::Info);
         assert_eq!(severity_of(Signal::UploadSpike), Severity::High);
         assert_eq!(severity_of(Signal::RatioFlip), Severity::Medium);
         assert_eq!(severity_of(Signal::Beaconing), Severity::Medium);

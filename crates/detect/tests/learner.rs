@@ -105,6 +105,15 @@ fn flow<'a>(
     }
 }
 
+/// A random-looking domain: unknown to the profile, so it raises a medium
+/// signal (random name), unlike a new company or country, which are info.
+const RANDOM_DOMAIN: &str = "q7x9k2m4zt8w.example";
+
+/// A flow to [`RANDOM_DOMAIN`], otherwise to the usual places.
+fn random_flow(secs: u64) -> Finished<'static> {
+    flow(Some(RANDOM_DOMAIN), Some("Chat Inc"), Some("DE"), secs)
+}
+
 /// The usual destinations of the seeded app.
 fn usual(secs: u64) -> Finished<'static> {
     flow(Some("chat.example"), Some("Chat Inc"), Some("DE"), secs)
@@ -234,12 +243,51 @@ fn nothing_raised_while_learning() {
 }
 
 #[test]
-fn new_country_after_learning_is_pending() {
+fn new_country_is_listed_not_notified_and_learned() {
+    let mut db = TestStore::open("country-info");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let raised = learner.finished(&russia(T0), &enricher(), &mut db, at(T0));
+    assert!(learner.take_errors().is_empty());
+    assert!(raised.is_empty(), "info is listed, never notified");
+
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].severity, Severity::Info);
+    assert_eq!(signals_of_stored(&saved[0]), [Signal::NewCountry]);
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Learned)
+    );
+}
+
+#[test]
+fn new_company_is_listed_not_notified_and_learned() {
+    let mut db = TestStore::open("company-info");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let company = flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), T0);
+    assert!(
+        learner
+            .finished(&company, &enricher(), &mut db, at(T0))
+            .is_empty()
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].severity, Severity::Info);
+    assert_eq!(signals_of_stored(&saved[0]), [Signal::NewCompany]);
+    assert_eq!(
+        state(&db, ItemKind::Company, "Evil Corp"),
+        Some(ItemState::Learned)
+    );
+}
+
+#[test]
+fn random_name_after_learning_is_pending() {
     let mut db = TestStore::open("pending");
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let mut learner = Learner::new(Toggles::default(), 0);
-    let ru = flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), T0);
-    let raised = learner.finished(&ru, &enricher(), &mut db, at(T0));
+    let raised = learner.finished(&random_flow(T0), &enricher(), &mut db, at(T0));
     assert!(learner.take_errors().is_empty());
 
     assert_eq!(raised.len(), 1);
@@ -248,7 +296,7 @@ fn new_country_after_learning_is_pending() {
     assert_eq!(alert.severity, Severity::Medium);
     assert_eq!(alert.key, format!("behaviour|{}|{T0}", key()));
     assert_eq!(alert.allow_key, None);
-    assert_eq!(alert.target.as_deref(), Some("RU"));
+    assert_eq!(alert.target.as_deref(), Some(RANDOM_DOMAIN));
     assert_eq!(alert.detail, None);
     assert_eq!(alert.app_path.as_deref(), Some(PATH));
 
@@ -256,11 +304,13 @@ fn new_country_after_learning_is_pending() {
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].id, raised[0].id);
     assert_eq!(saved[0].severity, Severity::Medium);
-    assert_eq!(saved[0].reasons.len(), 1);
-    assert_eq!(saved[0].reasons[0].signal, Signal::NewCountry);
-    assert_eq!(saved[0].reasons[0].value.as_deref(), Some("RU"));
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        signals_of_stored(&saved[0]),
+        [Signal::NewSite, Signal::RandomName]
+    );
+    assert_eq!(saved[0].reasons[1].value.as_deref(), Some(RANDOM_DOMAIN));
+    assert_eq!(
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Pending)
     );
     assert_eq!(
@@ -275,13 +325,17 @@ fn pending_seen_again_updates_alert() {
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let mut learner = Learner::new(Toggles::default(), 0);
     let e = enricher();
-    let ru = |secs| flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), secs);
-    assert_eq!(learner.finished(&ru(T0), &e, &mut db, at(T0)).len(), 1);
+    assert_eq!(
+        learner
+            .finished(&random_flow(T0), &e, &mut db, at(T0))
+            .len(),
+        1
+    );
     for i in 1..=3 {
         let secs = T0 + i * HOUR;
         assert!(
             learner
-                .finished(&ru(secs), &e, &mut db, at(secs))
+                .finished(&random_flow(secs), &e, &mut db, at(secs))
                 .is_empty()
         );
     }
@@ -291,7 +345,7 @@ fn pending_seen_again_updates_alert() {
     assert_eq!(saved[0].seen_again, 3);
     assert_eq!(saved[0].severity, Severity::Medium);
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Pending)
     );
 }
@@ -302,27 +356,44 @@ fn signals_in_ten_minutes_combine() {
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let mut learner = Learner::new(Toggles::default(), 0);
     let e = enricher();
-    let company = flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), T0);
-    let first = learner.finished(&company, &e, &mut db, at(T0));
+    let first = learner.finished(&random_flow(T0), &e, &mut db, at(T0));
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].alert.severity, Severity::Medium);
 
-    // Five minutes later, a new country: two mediums make it high.
-    let country = flow(Some("chat.example"), Some("Chat Inc"), Some("RU"), T0 + 300);
-    let second = learner.finished(&country, &e, &mut db, at(T0 + 300));
+    // Five minutes later, another random name: two mediums make it high.
+    let other = flow(
+        Some("m3v8r1y6pd5c.example"),
+        Some("Chat Inc"),
+        Some("DE"),
+        T0 + 300,
+    );
+    let second = learner.finished(&other, &e, &mut db, at(T0 + 300));
     assert_eq!(second.len(), 1, "a severity raise is notified");
     assert_eq!(second[0].id, first[0].id);
     assert_eq!(second[0].alert.severity, Severity::High);
-    assert_eq!(second[0].alert.reasons.len(), 2);
+    assert_eq!(second[0].alert.reasons.len(), 4);
 
     let saved = behaviour(&db);
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].severity, Severity::High);
     let signals: Vec<Signal> = saved[0].reasons.iter().map(|r| r.signal).collect();
-    assert_eq!(signals, [Signal::NewCompany, Signal::NewCountry]);
+    assert_eq!(
+        signals,
+        [
+            Signal::NewSite,
+            Signal::RandomName,
+            Signal::NewSite,
+            Signal::RandomName
+        ]
+    );
 
     // After the window closes, a new signal is a new alert.
-    let later = flow(Some("chat.example"), Some("Other Co"), Some("DE"), T0 + 700);
+    let later = flow(
+        Some("h2n7b4w9tj6s.example"),
+        Some("Chat Inc"),
+        Some("DE"),
+        T0 + 700,
+    );
     assert_eq!(learner.finished(&later, &e, &mut db, at(T0 + 700)).len(), 1);
     assert_eq!(behaviour(&db).len(), 2);
     assert!(learner.take_errors().is_empty());
@@ -478,11 +549,11 @@ fn allowed_beacon_not_raised_again() {
     assert!(db.dismiss_alert(raised[0].id, true, at(T0 + 600)).unwrap());
     assert!(db.is_allowed(&allow).unwrap());
 
-    // The next day: a new company opens a window, and the beacon, though
-    // inside that window, is not added to it.
+    // The next day: a new company (listed, not notified) opens a window, and
+    // the beacon, though inside that window, is not added to it.
     let day2 = T0 + DAY;
     let company = flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), day2);
-    assert_eq!(learner.finished(&company, &e, &mut db, at(day2)).len(), 1);
+    assert!(learner.finished(&company, &e, &mut db, at(day2)).is_empty());
     assert!(beacon(&mut learner, &mut db, day2 + 10).is_empty());
     assert!(learner.take_errors().is_empty());
     let saved = behaviour(&db);
@@ -516,8 +587,12 @@ fn reset_profile_learns_again() {
 
     // Once the new learning period is over, something new alerts again.
     let day8 = T0 + 8 * DAY;
-    let cn = flow(Some("chat.example"), Some("Chat Inc"), Some("CN"), day8);
-    assert_eq!(learner.finished(&cn, &e, &mut db, at(day8)).len(), 1);
+    assert_eq!(
+        learner
+            .finished(&random_flow(day8), &e, &mut db, at(day8))
+            .len(),
+        1
+    );
     assert!(learner.take_errors().is_empty());
 }
 
@@ -537,6 +612,15 @@ fn russia(secs: u64) -> Finished<'static> {
 
 fn signals_of(alert: &whereabouts_store::NewAlert) -> Vec<Signal> {
     alert.reasons.iter().map(|r| r.signal).collect()
+}
+
+fn signals_of_stored(alert: &StoredAlert) -> Vec<Signal> {
+    alert.reasons.iter().map(|r| r.signal).collect()
+}
+
+/// The most recently saved behaviour alert.
+fn newest(store: &Store) -> StoredAlert {
+    behaviour(store).into_iter().max_by_key(|a| a.id).unwrap()
 }
 
 #[test]
@@ -572,8 +656,8 @@ fn swapped_program_is_caught_on_its_first_new_destination() {
         app: unsigned(),
         ..flow(Some("chat.example"), Some("Evil Corp"), Some("DE"), day2)
     };
-    let raised = learner.finished(&company, &e, &mut db, at(day2));
-    assert_eq!(signals_of(&raised[0].alert), [Signal::NewCompany]);
+    assert!(learner.finished(&company, &e, &mut db, at(day2)).is_empty());
+    assert_eq!(signals_of_stored(&newest(&db)), [Signal::NewCompany]);
 
     // A swap older than the window is no longer suspect.
     let other = AppFacts {
@@ -593,8 +677,8 @@ fn swapped_program_is_caught_on_its_first_new_destination() {
         app: other,
         ..flow(Some("chat.example"), Some("Chat Inc"), Some("CN"), later)
     };
-    let raised = learner.finished(&cn, &e, &mut db, at(later));
-    assert_eq!(signals_of(&raised[0].alert), [Signal::NewCountry]);
+    assert!(learner.finished(&cn, &e, &mut db, at(later)).is_empty());
+    assert_eq!(signals_of_stored(&newest(&db)), [Signal::NewCountry]);
     assert!(learner.take_errors().is_empty());
 }
 
@@ -604,19 +688,22 @@ fn dismissed_pending_value_raises_a_new_alert() {
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let mut learner = Learner::new(Toggles::default(), 0);
     let e = enricher();
-    let id = learner.finished(&russia(T0), &e, &mut db, at(T0))[0].id;
+    let id = learner.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
     assert!(db.dismiss_alert(id, false, at(T0 + 60)).unwrap());
     learner
         .alert_closed(&mut db, id, false, at(T0 + 60))
         .unwrap();
 
     // Remind me: the next sighting, even the same day, is a new alert.
-    let again = learner.finished(&russia(T0 + 120), &e, &mut db, at(T0 + 120));
+    let again = learner.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
     assert_eq!(again.len(), 1);
     assert_ne!(again[0].id, id);
-    assert_eq!(signals_of(&again[0].alert), [Signal::NewCountry]);
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        signals_of(&again[0].alert),
+        [Signal::NewSite, Signal::RandomName]
+    );
+    assert_eq!(
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Pending)
     );
 
@@ -624,7 +711,7 @@ fn dismissed_pending_value_raises_a_new_alert() {
     let secs = T0 + 2 * HOUR;
     assert!(
         learner
-            .finished(&russia(secs), &e, &mut db, at(secs))
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
             .is_empty()
     );
     let saved = behaviour(&db);
@@ -640,35 +727,35 @@ fn allowed_pending_value_is_known_in_store_and_cache() {
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let mut learner = Learner::new(Toggles::default(), 0);
     let e = enricher();
-    let id = learner.finished(&russia(T0), &e, &mut db, at(T0))[0].id;
+    let id = learner.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
     assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
     learner
         .alert_closed(&mut db, id, true, at(T0 + 60))
         .unwrap();
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Allowed)
     );
 
     let secs = T0 + HOUR;
     assert!(
         learner
-            .finished(&russia(secs), &e, &mut db, at(secs))
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
             .is_empty()
     );
-    // The cache knows RU is allowed: a swapped program reaching it is not
-    // new behaviour (a stale "pending" would count as new and fire).
+    // The cache knows the domain is allowed: a swapped program reaching it
+    // is not new behaviour (a stale "pending" would count as new and fire).
     let secs = T0 + 2 * HOUR;
     let swapped = Finished {
         app: unsigned(),
-        ..russia(secs)
+        ..random_flow(secs)
     };
     assert!(learner.finished(&swapped, &e, &mut db, at(secs)).is_empty());
     let saved = behaviour(&db);
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].seen_again, 0);
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Allowed)
     );
     assert!(learner.take_errors().is_empty());
@@ -681,7 +768,7 @@ fn this_is_fine_after_a_restart_uses_the_saved_reasons() {
     let e = enricher();
     let id = {
         let mut before = Learner::new(Toggles::default(), 0);
-        before.finished(&russia(T0), &e, &mut db, at(T0))[0].id
+        before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id
     };
     // The service restarted: this Learner never saw the alert.
     let mut learner = Learner::new(Toggles::default(), 0);
@@ -690,7 +777,7 @@ fn this_is_fine_after_a_restart_uses_the_saved_reasons() {
         .alert_closed(&mut db, id, true, at(T0 + 60))
         .unwrap();
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Allowed)
     );
     // Only pending items it named change.
@@ -698,12 +785,12 @@ fn this_is_fine_after_a_restart_uses_the_saved_reasons() {
         state(&db, ItemKind::Country, "DE"),
         Some(ItemState::Learned)
     );
-    // The cache agrees: RU is known, so a swapped program going there is
-    // not new behaviour.
+    // The cache agrees: the domain is known, so a swapped program going
+    // there is not new behaviour.
     let secs = T0 + HOUR;
     let swapped = Finished {
         app: unsigned(),
-        ..russia(secs)
+        ..random_flow(secs)
     };
     assert!(learner.finished(&swapped, &e, &mut db, at(secs)).is_empty());
     assert!(learner.take_errors().is_empty());
@@ -714,15 +801,16 @@ fn this_is_fine_after_a_reset_allows_nothing() {
     let mut db = TestStore::open("allow-after-reset");
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let e = enricher();
-    let id = Learner::new(Toggles::default(), 0).finished(&russia(T0), &e, &mut db, at(T0))[0].id;
+    let id =
+        Learner::new(Toggles::default(), 0).finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
     let mut learner = Learner::new(Toggles::default(), 0);
     assert!(learner.reset(&mut db, &key(), at(T0 + 60)).unwrap());
-    // RU waits on a newer alert by now.
+    // The domain waits on a newer alert by now.
     db.save_items(
         &key(),
         &[ProfileItem {
             state: ItemState::Pending,
-            ..item(ItemKind::Country, "RU")
+            ..item(ItemKind::Domain, RANDOM_DOMAIN)
         }],
     )
     .unwrap();
@@ -730,7 +818,7 @@ fn this_is_fine_after_a_reset_allows_nothing() {
         .alert_closed(&mut db, id, true, at(T0 + 120))
         .unwrap();
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Pending)
     );
     assert!(learner.take_errors().is_empty());
@@ -801,8 +889,9 @@ fn failed_alert_save_learns_nothing() {
 
     drop(db.store.take());
     set_read_only(&path, true);
-    let failed = Store::open(&path, &store_key)
-        .map(|mut read_only| learner.finished(&russia(T0 + 60), &e, &mut read_only, at(T0 + 60)));
+    let failed = Store::open(&path, &store_key).map(|mut read_only| {
+        learner.finished(&random_flow(T0 + 60), &e, &mut read_only, at(T0 + 60))
+    });
     set_read_only(&path, false);
     assert!(failed.unwrap().is_empty());
     let errors = learner.take_errors();
@@ -811,14 +900,14 @@ fn failed_alert_save_learns_nothing() {
         "{errors:?}"
     );
 
-    // RU was neither learned nor counted as raised today: the next flow
-    // raises it.
+    // The domain was neither learned nor counted as raised today: the next
+    // flow raises it.
     db.store = Some(Store::open(&path, &store_key).unwrap());
-    assert_eq!(state(&db, ItemKind::Country, "RU"), None);
-    let raised = learner.finished(&russia(T0 + 120), &e, &mut db, at(T0 + 120));
+    assert_eq!(state(&db, ItemKind::Domain, RANDOM_DOMAIN), None);
+    let raised = learner.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
     assert_eq!(raised.len(), 1);
     assert_eq!(
-        state(&db, ItemKind::Country, "RU"),
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Pending)
     );
     assert!(learner.take_errors().is_empty());
