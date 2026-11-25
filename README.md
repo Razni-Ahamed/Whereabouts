@@ -57,7 +57,7 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 |---|---|---|
 | v0.1 ✅ | *See* | Live view of every app's connections, companies and countries |
 | v0.2 ✅ | *Control* | Block apps, sites and addresses; alerts for trackers and known-bad networks; tray and notifications; signed list updates |
-| v0.3 | *Learn* | Per-app behaviour profiles and explained alerts |
+| v0.3 ✅ | *Learn* | Per-app behaviour profiles and explained alerts |
 | v0.4 | *Detect* | On-device anomaly model (if it passes testing) |
 | v1.0 | *Trust* | Signed installer, external security review |
 | Later | | Android app, PC + phone dashboard over your local network |

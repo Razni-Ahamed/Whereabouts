@@ -477,11 +477,29 @@ Implementation notes (v0.2, N5 Layer 1 alerts, 2026-11-19):
 | Notifications: *medium* and higher, at most one per app (or kind of system alert) an hour, *critical* always; trackers only in a **daily summary** (user's choice). No app, site or tracker names unless allowed | §6.4 alert fatigue protection; lock-screen privacy. |
 | Spamhaus is credited in the app's footer whenever DROP is in use, and in every alert it raised | Spamhaus' DROP terms ask for credit when DROP is used in a product. |
 
+Implementation notes (v0.3, Learn, 2026-11-25):
+
+| Decision | Reason |
+|---|---|
+| Behaviour signals (Layer 2) follow the same rules as Layer 1 alerts: signals for one app within **10 minutes** become one alert, and a warning still waiting for you is updated ("seen again") rather than repeated | Alert fatigue; the lab measured 0.562 false alarms per user-week with these rules. |
+| Only **medium and higher** behaviour alerts notify. New site, company, country and unusual hour are **info**: listed on the Alerts screen, never notified | Global CDNs made "new" common for ordinary apps (§6.2). |
+| Beaconing is built but ships **off** (U4) | Its false alarms were too high in the lab. |
+| Every behaviour alert stores its **reasons**; the app shows them in plain words, with how they compare with usual | The rule above: every alert is shown with its reasons. |
+
 ### 6.5 User feedback
 
 - **“This is fine”** adds the destination to the app's profile and suppresses that signal.
 - **“Block”** creates a WFP rule (§5.6).
 - **Profile review:** the user can see what was learned for each app and **reset** it. This matters if malware was already present during the learning period.
+
+Implementation notes (v0.3, Learn, 2026-11-25):
+
+| Decision | Reason |
+|---|---|
+| "This is fine" on a behaviour alert marks it seen; when the alert holds beaconing, random_name or unusual_time it also stops that signal for the app, kept like rules. "Dismiss" clears the alert only, and it can be raised again | The user decides what is normal. |
+| **Reset** clears one app's profile and starts a new 7-day learning period; "Delete everything" clears all profiles. **Deleting saved history keeps profiles** (U10), and profiles are kept while history saving is off (U1); the Privacy screen and the dialog say so | Warnings keep working without history. |
+| **Goes anywhere** can be set per app, and is automatic for genuine, administrator-installed, publisher-signed browsers (U5). Browsers still save their registrable sites (U9), so switching it off applies at once | Browsers reach new places constantly. |
+| On upgrade, profiles are built from saved history, so apps with 7 or more days of history warn at once (U2); "learned since" is shown next to Reset | Waiting a week would not be safer. |
 
 ### 6.6 Evaluation (lab, never on user data)
 
