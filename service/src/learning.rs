@@ -453,15 +453,20 @@ fn flow_domain(stats: &FlowStats) -> Option<String> {
     confirmed_domain(Some(&label.name), Some(label.source))
 }
 
+/// What the Learner is told about the program. When its signature could not
+/// be checked, its file hash is left out too: the Learner then neither
+/// compares the file with the profile's (no publisher would look like a lost
+/// signature) nor saves it as the profile's last known file.
 fn app_facts<'a>(app: &'a str, identity: &'a AppIdentity, installed: bool) -> AppFacts<'a> {
     let publisher = match &identity.signature {
         Signature::Signed { publisher, .. } => Some(publisher.as_str()),
         Signature::Unsigned | Signature::Invalid { .. } | Signature::Unknown => None,
     };
+    let checked = !matches!(identity.signature, Signature::Unknown);
     AppFacts {
         app_name: app,
         path: &identity.path,
-        sha256: identity.sha256.as_deref(),
+        sha256: identity.sha256.as_deref().filter(|_| checked),
         publisher,
         signature_valid: publisher.is_some(),
         installed_by_admins: installed,
@@ -674,6 +679,45 @@ mod tests {
         let hours = profile(&store).unwrap().hours;
         assert_eq!(hours.len(), 1);
         assert_eq!(hours[0].bytes_sent, 3_000);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_signature_that_could_not_be_checked_is_not_a_changed_program() {
+        use whereabouts_store::{GoesAnywhere, ProfileRow};
+        let (mut store, dir) = temp_store("signature-unknown");
+        // A signed program that finished learning long ago.
+        let row = ProfileRow {
+            key: known_app_key(PATH),
+            path: PATH.to_owned(),
+            app_name: String::from("chat.exe"),
+            first_data: at(T0 - 30 * 86_400),
+            learned_since: at(T0 - 30 * 86_400),
+            last_data: at(T0 - 86_400),
+            active_days: 20,
+            last_active_day: None,
+            last_sha256: Some("ab".repeat(32)),
+            last_publisher: Some(String::from("Chat Inc")),
+            goes_anywhere: GoesAnywhere::Auto,
+            reset_at: None,
+        };
+        store.save_profile_row(&row).unwrap();
+        let e = enricher();
+        let mut learning = ready(&mut store, at(T0));
+        // Its signature could not be checked this time, and it goes
+        // somewhere new: not "lost its signature".
+        let identity = AppIdentity {
+            signature: Signature::Unknown,
+            ..identity()
+        };
+        let flow = stats(Some(("new.example", LabelSource::Verified)), 10);
+        let row_in = input(key("203.0.113.9:443"), &identity, &flow);
+        let raised = learning.finished(&row_in, &e, &mut store, at(T0));
+        assert!(raised.is_empty(), "{raised:?}");
+        let kept = profile(&store).unwrap().row;
+        assert_eq!(kept.last_sha256, row.last_sha256);
+        assert_eq!(kept.last_publisher, row.last_publisher);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -185,10 +185,13 @@ fn installed_by_admins(path: &str) -> bool {
 fn app_facts(row: &FlowRow) -> Option<AppFacts<'_>> {
     let path = row.app_path.as_deref().filter(|path| !path.is_empty())?;
     let signed = row.signature.as_deref() == Some("signed");
+    // As the service does: a signature that could not be checked says
+    // nothing about the file, so its hash is left out too.
+    let checked = row.signature.as_deref() != Some("unknown");
     Some(AppFacts {
         app_name: &row.app_name,
         path,
-        sha256: row.app_sha256.as_deref(),
+        sha256: row.app_sha256.as_deref().filter(|_| checked),
         publisher: row.publisher.as_deref().filter(|_| signed),
         signature_valid: signed,
         installed_by_admins: installed_by_admins(path),
@@ -525,6 +528,16 @@ mod tests {
             connections: 1,
             scenario: None,
         }
+    }
+
+    #[test]
+    fn an_unchecked_signature_leaves_the_hash_out() {
+        let mut flow = row(0, 0, 0, 0);
+        flow.app_sha256 = Some(String::from("ab"));
+        flow.signature = Some(String::from("unknown"));
+        assert_eq!(app_facts(&flow).unwrap().sha256, None);
+        flow.signature = Some(String::from("unsigned"));
+        assert_eq!(app_facts(&flow).unwrap().sha256, Some("ab"));
     }
 
     #[test]
