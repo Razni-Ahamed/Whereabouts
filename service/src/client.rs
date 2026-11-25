@@ -319,6 +319,9 @@ fn print_status(version: &str, status: &Status) {
             }
         );
     }
+    if let Some(line) = learning_line(status) {
+        println!("{line}");
+    }
     if status.rejected > 0 {
         println!(
             "!! {} DNS events claimed to come from the Windows DNS service but did not.",
@@ -331,6 +334,14 @@ fn print_status(version: &str, status: &Status) {
             status.unattributed
         );
     }
+}
+
+/// How learning each app's usual behaviour is doing (`starting`, `ready` or
+/// `paused: ` and why), or `None` when nothing can be saved, so nothing is
+/// learned (or the service is older than 0.3).
+fn learning_line(status: &Status) -> Option<String> {
+    let state = status.behaviour_learning.as_deref()?;
+    Some(format!("Behaviour learning: {}", display_safe(state)))
 }
 
 fn print_flows(flows: &[FlowView]) {
@@ -436,6 +447,24 @@ mod tests {
         flow.publisher_confirmed = true;
         flow.publisher = String::from("Google LLC");
         assert_eq!(publisher_text(&flow), "Google LLC");
+    }
+
+    #[test]
+    fn status_says_how_behaviour_learning_is_doing() {
+        let mut status = Status::default();
+        assert_eq!(learning_line(&status), None, "nothing can be saved");
+        for (state, line) in [
+            ("starting", "Behaviour learning: starting"),
+            ("ready", "Behaviour learning: ready"),
+            ("paused: disk full", "Behaviour learning: paused: disk full"),
+        ] {
+            status.behaviour_learning = Some(String::from(state));
+            assert_eq!(learning_line(&status).as_deref(), Some(line));
+        }
+        // The service's words are made safe to print.
+        status.behaviour_learning = Some(String::from("paused: \u{1b}[31mred"));
+        let line = learning_line(&status).unwrap();
+        assert!(!line.contains('\u{1b}'), "{line:?}");
     }
 
     #[test]
