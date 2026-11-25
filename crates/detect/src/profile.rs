@@ -2,9 +2,13 @@
 //! v0.3): whether it is still learning, what it is known to talk to, and
 //! the traffic shape the detectors compare against.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use whereabouts_store::{GoesAnywhere, HourRow, ItemKind, ItemState, StoredProfile};
+use whereabouts_store::{
+    GoesAnywhere, HourRow, ItemKind, ItemState, MAX_ITEMS_PER_KIND, ProfileItem, ProfileRow,
+    StoredProfile,
+};
 
 use crate::browsers;
 
@@ -16,13 +20,96 @@ const SECS_PER_HOUR: i64 = 3_600;
 const SECS_PER_DAY: i64 = 86_400;
 
 /// One app's profile as stored, with the questions the detectors ask of it.
+/// Its items are indexed by kind and value; change them only through
+/// [`Profile::item_mut`] and [`Profile::add_item`], which keep the index and
+/// the store's limit per kind.
 #[derive(Debug, Clone)]
 pub struct Profile {
-    /// The profile as read from the store.
-    pub stored: StoredProfile,
+    stored: StoredProfile,
+    /// Where each item is in `stored.items`, by kind and value.
+    index: HashMap<ItemKind, HashMap<String, usize>>,
 }
 
 impl Profile {
+    /// A profile as read from the store.
+    pub fn new(stored: StoredProfile) -> Self {
+        let mut index: HashMap<ItemKind, HashMap<String, usize>> = HashMap::new();
+        for (at, item) in stored.items.iter().enumerate() {
+            index
+                .entry(item.kind)
+                .or_default()
+                .insert(item.value.clone(), at);
+        }
+        Self { stored, index }
+    }
+
+    /// The profile as stored.
+    pub fn stored(&self) -> &StoredProfile {
+        &self.stored
+    }
+
+    /// The summary line, to change.
+    pub fn row_mut(&mut self) -> &mut ProfileRow {
+        &mut self.stored.row
+    }
+
+    /// The per-hour totals (oldest first), to change.
+    pub fn hours_mut(&mut self) -> &mut Vec<HourRow> {
+        &mut self.stored.hours
+    }
+
+    /// The item of this kind and value, to change (not its kind or value).
+    pub fn item_mut(&mut self, kind: ItemKind, value: &str) -> Option<&mut ProfileItem> {
+        let at = self.position(kind, value)?;
+        self.stored.items.get_mut(at)
+    }
+
+    /// Adds an item new to the profile, then drops items of its kind beyond
+    /// [`MAX_ITEMS_PER_KIND`] the way the store does: the one seen longest
+    /// ago first, never an allowed one. (An item already held is replaced.)
+    pub fn add_item(&mut self, item: ProfileItem) {
+        let kind = item.kind;
+        if let Some(at) = self.position(kind, &item.value) {
+            self.stored.items[at] = item;
+            return;
+        }
+        let of_kind = self.index.entry(kind).or_default();
+        of_kind.insert(item.value.clone(), self.stored.items.len());
+        self.stored.items.push(item);
+        while self.index.get(&kind).map_or(0, HashMap::len) > MAX_ITEMS_PER_KIND {
+            let oldest = self
+                .stored
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.kind == kind && i.state != ItemState::Allowed)
+                .min_by_key(|(_, i)| i.last_seen)
+                .map(|(at, _)| at);
+            let Some(at) = oldest else {
+                break;
+            };
+            self.remove_at(at);
+        }
+    }
+
+    /// Where the item of this kind and value is in `stored.items`.
+    fn position(&self, kind: ItemKind, value: &str) -> Option<usize> {
+        self.index.get(&kind)?.get(value).copied()
+    }
+
+    /// Removes the item at `at`, keeping the index right.
+    fn remove_at(&mut self, at: usize) {
+        let removed = self.stored.items.swap_remove(at);
+        if let Some(of_kind) = self.index.get_mut(&removed.kind) {
+            of_kind.remove(&removed.value);
+        }
+        if let Some(moved) = self.stored.items.get(at)
+            && let Some(of_kind) = self.index.get_mut(&moved.kind)
+        {
+            of_kind.insert(moved.value.clone(), at);
+        }
+    }
+
     /// Returns `true` until [`LEARNING`] has passed since the first data.
     pub fn is_learning(&self, now: SystemTime) -> bool {
         now < self.stored.row.first_data + LEARNING
@@ -113,11 +200,8 @@ impl Profile {
     }
 
     fn state_of(&self, kind: ItemKind, value: &str) -> Option<ItemState> {
-        self.stored
-            .items
-            .iter()
-            .find(|i| i.kind == kind && i.value == value)
-            .map(|i| i.state)
+        let at = self.position(kind, value)?;
+        self.stored.items.get(at).map(|i| i.state)
     }
 
     fn active_hours(&self) -> impl Iterator<Item = &HourRow> {
@@ -132,30 +216,27 @@ impl Profile {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
-    use whereabouts_store::{ProfileItem, ProfileRow};
 
     fn profile(app: &str, goes: GoesAnywhere) -> Profile {
         let t = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        Profile {
-            stored: StoredProfile {
-                row: ProfileRow {
-                    key: "k".into(),
-                    path: format!("C:\\x\\{app}"),
-                    app_name: app.into(),
-                    first_data: t,
-                    learned_since: t + Duration::from_secs(3 * 86_400),
-                    last_data: t + Duration::from_secs(5 * 86_400),
-                    active_days: 1,
-                    last_active_day: None,
-                    last_sha256: None,
-                    last_publisher: None,
-                    goes_anywhere: goes,
-                    reset_at: None,
-                },
-                items: vec![],
-                hours: vec![],
+        Profile::new(StoredProfile {
+            row: ProfileRow {
+                key: "k".into(),
+                path: format!("C:\\x\\{app}"),
+                app_name: app.into(),
+                first_data: t,
+                learned_since: t + Duration::from_secs(3 * 86_400),
+                last_data: t + Duration::from_secs(5 * 86_400),
+                active_days: 1,
+                last_active_day: None,
+                last_sha256: None,
+                last_publisher: None,
+                goes_anywhere: goes,
+                reset_at: None,
             },
-        }
+            items: vec![],
+            hours: vec![],
+        })
     }
 
     fn item(kind: ItemKind, value: &str, state: ItemState) -> ProfileItem {
@@ -188,12 +269,13 @@ mod tests {
 
     #[test]
     fn pending_items_are_not_known() {
-        let mut p = profile("a.exe", GoesAnywhere::Auto);
-        p.stored.items = vec![
+        let mut stored = profile("a.exe", GoesAnywhere::Auto).stored;
+        stored.items = vec![
             item(ItemKind::Domain, "new.com", ItemState::Pending),
             item(ItemKind::Domain, "old.com", ItemState::Learned),
             item(ItemKind::Domain, "ok.com", ItemState::Allowed),
         ];
+        let p = Profile::new(stored);
         assert!(!p.knows(ItemKind::Domain, "new.com"));
         assert!(p.pending(ItemKind::Domain, "new.com"));
         assert!(p.knows(ItemKind::Domain, "old.com"));
@@ -201,6 +283,34 @@ mod tests {
         assert!(!p.pending(ItemKind::Domain, "old.com"));
         assert!(!p.knows(ItemKind::Domain, "absent.com"));
         assert!(!p.knows(ItemKind::Country, "new.com"));
+    }
+
+    #[test]
+    fn items_are_capped_per_kind_like_the_store() {
+        let mut p = profile("a.exe", GoesAnywhere::Auto);
+        let port = |n: u64, state: ItemState| ProfileItem {
+            last_seen: UNIX_EPOCH + Duration::from_secs(n),
+            ..item(ItemKind::Port, &n.to_string(), state)
+        };
+        // The oldest one is allowed: it is never dropped.
+        p.add_item(port(0, ItemState::Allowed));
+        for n in 1..6_000 {
+            p.add_item(port(n, ItemState::Learned));
+        }
+        p.add_item(item(ItemKind::Domain, "a.com", ItemState::Learned));
+        let ports = p.stored().items.iter().filter(|i| i.kind == ItemKind::Port);
+        assert_eq!(ports.count(), MAX_ITEMS_PER_KIND);
+        assert!(p.knows(ItemKind::Port, "0"), "allowed items stay");
+        // The ones seen longest ago went, and are unknown again.
+        assert!(!p.knows(ItemKind::Port, "1"));
+        assert!(!p.knows(ItemKind::Port, "1000"));
+        assert!(p.knows(ItemKind::Port, "1001"));
+        assert!(p.knows(ItemKind::Port, "5999"));
+        assert!(p.knows(ItemKind::Domain, "a.com"));
+        // The index still finds every item it holds.
+        for item in p.stored().items.clone() {
+            assert_eq!(p.item_mut(item.kind, &item.value), Some(&mut item.clone()));
+        }
     }
 
     #[test]
@@ -218,7 +328,7 @@ mod tests {
     fn hour_of_day_share_uses_local_offset() {
         let mut p = profile("a.exe", GoesAnywhere::Auto);
         // Day 10, 23:00 UTC; an idle hour is ignored.
-        p.stored.hours = vec![hour(10 * 24 + 23, 5, 5, 1), hour(10 * 24 + 5, 0, 0, 0)];
+        *p.hours_mut() = vec![hour(10 * 24 + 23, 5, 5, 1), hour(10 * 24 + 5, 0, 0, 0)];
         let share = p.hour_of_day_share(3_600);
         assert_eq!(share[0], 1.0);
         assert_eq!(share.iter().sum::<f64>(), 1.0);
@@ -238,7 +348,7 @@ mod tests {
     #[test]
     fn hourly_series_and_download_share_use_active_hours() {
         let mut p = profile("a.exe", GoesAnywhere::Auto);
-        p.stored.hours = vec![hour(1, 100, 300, 2), hour(2, 0, 0, 0), hour(3, 0, 0, 1)];
+        *p.hours_mut() = vec![hour(1, 100, 300, 2), hour(2, 0, 0, 0), hour(3, 0, 0, 1)];
         assert_eq!(p.hourly_sent(), vec![100.0, 0.0]);
         assert_eq!(p.hourly_received(), vec![300.0, 0.0]);
         assert_eq!(p.download_share(), Some(0.75));

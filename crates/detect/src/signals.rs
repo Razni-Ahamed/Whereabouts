@@ -230,7 +230,7 @@ pub fn binary_changed(
     signature_valid: bool,
     new_destination: bool,
 ) -> Option<Reason> {
-    let row = &profile.stored.row;
+    let row = &profile.stored().row;
     let (last, now) = (row.last_sha256.as_deref()?, sha256?);
     if !new_destination || last.eq_ignore_ascii_case(now) {
         return None;
@@ -253,26 +253,24 @@ mod tests {
 
     fn profile_with(items: Vec<ProfileItem>, hours: Vec<HourRow>) -> Profile {
         let t = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        Profile {
-            stored: StoredProfile {
-                row: ProfileRow {
-                    key: "k".into(),
-                    path: r"C:\x\a.exe".into(),
-                    app_name: "a.exe".into(),
-                    first_data: t,
-                    learned_since: t,
-                    last_data: t,
-                    active_days: 1,
-                    last_active_day: None,
-                    last_sha256: Some("aaaa".into()),
-                    last_publisher: Some("Good Inc".into()),
-                    goes_anywhere: GoesAnywhere::Auto,
-                    reset_at: None,
-                },
-                items,
-                hours,
+        Profile::new(StoredProfile {
+            row: ProfileRow {
+                key: "k".into(),
+                path: r"C:\x\a.exe".into(),
+                app_name: "a.exe".into(),
+                first_data: t,
+                learned_since: t,
+                last_data: t,
+                active_days: 1,
+                last_active_day: None,
+                last_sha256: Some("aaaa".into()),
+                last_publisher: Some("Good Inc".into()),
+                goes_anywhere: GoesAnywhere::Auto,
+                reset_at: None,
             },
-        }
+            items,
+            hours,
+        })
     }
 
     fn item(kind: ItemKind, value: &str, state: ItemState) -> ProfileItem {
@@ -487,12 +485,12 @@ mod tests {
         assert!(binary_changed(&p, Some("bbbb"), Some("Evil Ltd"), true, true).is_some());
         // An app that was never signed is not "losing" a signature.
         let mut unsigned = profile_with(vec![], vec![]);
-        unsigned.stored.row.last_publisher = None;
+        unsigned.row_mut().last_publisher = None;
         assert!(binary_changed(&unsigned, Some("bbbb"), None, false, true).is_none());
         // Unknown hash now, or none stored yet: nothing to compare.
         assert!(binary_changed(&p, None, None, false, true).is_none());
         let mut fresh = profile_with(vec![], vec![]);
-        fresh.stored.row.last_sha256 = None;
+        fresh.row_mut().last_sha256 = None;
         assert!(binary_changed(&fresh, Some("bbbb"), None, false, true).is_none());
     }
 

@@ -52,8 +52,8 @@ pub fn view(
     let Some(stored) = store.profile(&known_app_key(path))? else {
         return Ok(None);
     };
-    let profile = Profile { stored };
-    let row = &profile.stored.row;
+    let profile = Profile::new(stored);
+    let row = &profile.stored().row;
     let publisher = row.last_publisher.as_deref();
     let installed =
         whereabouts_win_secrets::installed_by_administrators(Path::new(&row.path)).unwrap_or(false);
@@ -75,9 +75,9 @@ pub fn view(
         goes_anywhere: profile.goes_anywhere(publisher, publisher.is_some(), installed),
         goes_anywhere_choice: choice_view(row.goes_anywhere),
         recognised_browser,
-        sites: items(&profile.stored.items, ItemKind::Domain),
-        companies: items(&profile.stored.items, ItemKind::Company),
-        countries: items(&profile.stored.items, ItemKind::Country),
+        sites: items(&profile.stored().items, ItemKind::Domain),
+        companies: items(&profile.stored().items, ItemKind::Company),
+        countries: items(&profile.stored().items, ItemKind::Country),
         usual_sent_per_hour: median(&sent).map(bytes),
         busiest_sent_per_hour: sent.last().copied().map(bytes),
         active_hours: profile

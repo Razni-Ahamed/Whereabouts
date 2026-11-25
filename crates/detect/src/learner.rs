@@ -194,7 +194,8 @@ impl Learner {
         let Some(profile) = self.profiles.get_mut(&key) else {
             return Vec::new();
         };
-        profile.stored.row.last_data = profile.stored.row.last_data.max(now);
+        let row = profile.row_mut();
+        row.last_data = row.last_data.max(now);
         let profile = &*profile;
         if profile.is_learning(now) {
             return Vec::new();
@@ -281,7 +282,7 @@ impl Learner {
         .filter_map(|(kind, value)| Some((kind, value.filter(|v| !v.is_empty())?)))
         .collect();
 
-        let row = &mut profile.stored.row;
+        let row = profile.row_mut();
         if row.last_active_day.is_none_or(|day| local_day > day) {
             row.active_days = row.active_days.saturating_add(1);
             row.last_active_day = Some(local_day);
@@ -307,7 +308,7 @@ impl Learner {
         )
         .is_some();
         if swapped {
-            let row = &profile.stored.row;
+            let row = &profile.stored().row;
             self.suspects.entry(key.clone()).or_insert_with(|| Suspect {
                 since: secs,
                 sha256: row.last_sha256.clone(),
@@ -368,7 +369,7 @@ impl Learner {
             }
         }
 
-        let row = &mut profile.stored.row;
+        let row = profile.row_mut();
         if let Some(sha256) = app.sha256 {
             row.last_sha256 = Some(sha256.to_owned());
             row.last_publisher = app.publisher.map(str::to_owned);
@@ -398,21 +399,16 @@ impl Learner {
         let Some(profile) = self.profiles.get_mut(&key) else {
             return saved.raised.into_iter().collect();
         };
-        if let Err(error) = store.save_profile_row(&profile.stored.row) {
+        if let Err(error) = store.save_profile_row(&profile.stored().row) {
             self.errors
                 .push(format!("could not save a behaviour profile: {error}"));
             return saved.raised.into_iter().collect();
         }
-        let seen_on_day = profile.stored.row.active_days;
+        let seen_on_day = profile.stored().row.active_days;
         let mut items = Vec::with_capacity(values.len());
         for &(kind, value) in &values {
             let is_waiting = waiting.contains(&kind);
-            let known = profile
-                .stored
-                .items
-                .iter_mut()
-                .find(|i| i.kind == kind && i.value == value);
-            if let Some(item) = known {
+            if let Some(item) = profile.item_mut(kind, value) {
                 item.first_seen = item.first_seen.min(flow.first_seen);
                 item.last_seen = item.last_seen.max(flow.last_seen);
                 item.seen_on_day = item.seen_on_day.max(seen_on_day);
@@ -440,7 +436,8 @@ impl Learner {
                 seen_on_day,
                 state,
             };
-            profile.stored.items.push(item.clone());
+            // Like the store, the profile keeps at most so many of a kind.
+            profile.add_item(item.clone());
             items.push(item);
         }
         if let Err(error) = store.save_items(&key, &items) {
@@ -476,7 +473,7 @@ impl Learner {
             // The profile row goes first (the store has no foreign keys),
             // with the latest `last_data`.
             let written = match self.profiles.get(&key) {
-                Some(profile) => store.save_profile_row(&profile.stored.row),
+                Some(profile) => store.save_profile_row(&profile.stored().row),
                 None => Ok(()),
             }
             .and_then(|()| store.add_hours(&key, &rows));
@@ -490,7 +487,7 @@ impl Learner {
                 self.hours.remove(&(key.clone(), row.hour));
             }
             if let Some(profile) = self.profiles.get_mut(&key) {
-                let hours = &mut profile.stored.hours;
+                let hours = profile.hours_mut();
                 for row in rows {
                     match hours.binary_search_by_key(&row.hour, |h| h.hour) {
                         Ok(at) => add_to(&mut hours[at], &row),
@@ -534,13 +531,11 @@ impl Learner {
                 }
                 continue;
             }
-            if let Some(item) = self.profiles.get_mut(&key).and_then(|profile| {
-                profile
-                    .stored
-                    .items
-                    .iter_mut()
-                    .find(|i| i.kind == kind && i.value == value)
-            }) {
+            if let Some(item) = self
+                .profiles
+                .get_mut(&key)
+                .and_then(|profile| profile.item_mut(kind, &value))
+            {
                 item.state = ItemState::Allowed;
             }
         }
@@ -571,7 +566,7 @@ impl Learner {
     ) -> Result<bool, StoreError> {
         let changed = store.set_goes_anywhere(key, value)?;
         if changed && let Some(profile) = self.profiles.get_mut(key) {
-            profile.stored.row.goes_anywhere = value;
+            profile.row_mut().goes_anywhere = value;
         }
         Ok(changed)
     }
@@ -648,7 +643,7 @@ impl Learner {
                 return false;
             }
         };
-        self.profiles.insert(key.to_owned(), Profile { stored });
+        self.profiles.insert(key.to_owned(), Profile::new(stored));
         true
     }
 }
@@ -680,7 +675,7 @@ fn pending_named_by_saved(
     {
         return Ok(Vec::new());
     }
-    let profile = Profile { stored };
+    let profile = Profile::new(stored);
     let mut named = Vec::new();
     for reason in &alert.reasons {
         if let (Some(kind), Some(value)) = (item_kind(reason.signal), reason.value.as_deref())
@@ -722,7 +717,7 @@ fn running_total(
     hour: i64,
 ) -> (u64, u64) {
     let held = memory.get(&(key.to_owned(), hour));
-    let stored = profile.stored.hours.iter().find(|h| h.hour == hour);
+    let stored = profile.stored().hours.iter().find(|h| h.hour == hour);
     [held, stored]
         .into_iter()
         .flatten()
@@ -737,34 +732,30 @@ fn running_total(
 /// The profile as history for checking `hour`: its hours without that one
 /// (destinations are not needed).
 fn history_without(profile: &Profile, hour: i64) -> Profile {
-    Profile {
-        stored: StoredProfile {
-            row: profile.stored.row.clone(),
-            items: Vec::new(),
-            hours: profile
-                .stored
-                .hours
-                .iter()
-                .filter(|h| h.hour != hour)
-                .cloned()
-                .collect(),
-        },
-    }
+    Profile::new(StoredProfile {
+        row: profile.stored().row.clone(),
+        items: Vec::new(),
+        hours: profile
+            .stored()
+            .hours
+            .iter()
+            .filter(|h| h.hour != hour)
+            .cloned()
+            .collect(),
+    })
 }
 
 /// The profile's program facts as they were before the suspect change
 /// (destinations and hours are not needed).
 fn facts_before(profile: &Profile, suspect: &Suspect) -> Profile {
-    let mut row = profile.stored.row.clone();
+    let mut row = profile.stored().row.clone();
     row.last_sha256.clone_from(&suspect.sha256);
     row.last_publisher.clone_from(&suspect.publisher);
-    Profile {
-        stored: StoredProfile {
-            row,
-            items: Vec::new(),
-            hours: Vec::new(),
-        },
-    }
+    Profile::new(StoredProfile {
+        row,
+        items: Vec::new(),
+        hours: Vec::new(),
+    })
 }
 
 fn empty_hour(hour: i64) -> HourRow {

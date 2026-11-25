@@ -9,8 +9,8 @@ use whereabouts_detect::meter::Delta;
 use whereabouts_detect::signals::Toggles;
 use whereabouts_enrich::{CompanyList, Enricher, GeoDatabases, TrackerList};
 use whereabouts_store::{
-    AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, Key, MAX_REASONS, ProfileItem,
-    ProfileRow, Severity, Signal, Store, StoredAlert, known_app_key,
+    AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, Key, MAX_ITEMS_PER_KIND, MAX_REASONS,
+    ProfileItem, ProfileRow, Severity, Signal, Store, StoredAlert, known_app_key,
 };
 
 /// 2027-01-15 08:00 UTC, on the hour.
@@ -465,6 +465,42 @@ fn thousands_of_new_companies_in_one_window_keep_the_alert_small() {
     let saved = newest(&db);
     assert!(signals_of_stored(&saved).contains(&Signal::RandomName));
     assert_eq!(saved.reasons.len(), MAX_REASONS);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn cache_and_store_drop_the_same_items_beyond_the_limit() {
+    let mut db = TestStore::open("item-limit");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    // The profile is full of sites, the oldest first.
+    let sites: Vec<ProfileItem> = (0..MAX_ITEMS_PER_KIND as u64 - 1)
+        .map(|n| ProfileItem {
+            last_seen: at(T0 - 2 * DAY + n),
+            ..item(ItemKind::Domain, &format!("d{n}.example"))
+        })
+        .collect();
+    db.save_items(&key(), &sites).unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    assert!(learner.finished(&usual(T0), &e, &mut db, at(T0)).is_empty());
+
+    // One more site: the oldest goes, in the store and in the Learner.
+    let new = flow(Some("new.example"), Some("Chat Inc"), Some("DE"), T0 + 60);
+    learner.finished(&new, &e, &mut db, at(T0 + 60));
+    assert_eq!(state(&db, ItemKind::Domain, "d0.example"), None);
+    assert_eq!(
+        state(&db, ItemKind::Domain, "d1.example"),
+        Some(ItemState::Learned)
+    );
+    let old = flow(Some("d0.example"), Some("Chat Inc"), Some("DE"), T0 + 120);
+    learner.finished(&old, &e, &mut db, at(T0 + 120));
+    let reasons = newest(&db).reasons;
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.signal == Signal::NewSite && r.value.as_deref() == Some("d0.example")),
+        "a dropped site is new again: {reasons:?}"
+    );
     assert!(learner.take_errors().is_empty());
 }
 
