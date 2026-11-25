@@ -568,6 +568,14 @@ fn alert_text(alert: &AlertNotice, show_names: bool) -> (String, String) {
             String::from("An app contacted a tracker"),
             String::from(see),
         ),
+        (AlertKind::Behaviour, Some(name)) => (
+            format!("{name} is behaving differently"),
+            format!("It did something it doesn't usually do. {see}"),
+        ),
+        (AlertKind::Behaviour, None) => (
+            String::from("An app is behaving differently"),
+            format!("It did something it doesn't usually do. {see}"),
+        ),
     }
 }
 
@@ -642,6 +650,8 @@ mod tests {
             detail: Some(company.to_owned()),
             dismissed: false,
             can_allow: true,
+            reasons: Vec::new(),
+            seen_again: 0,
         }
     }
 
@@ -671,6 +681,16 @@ mod tests {
         assert!(!title.contains("chat.exe") && !body.contains("chat.exe"));
         let (title, _) = alert_text(&alert, true);
         assert_eq!(title, "chat.exe connected to a risky network");
+
+        let behaviour = AlertNotice {
+            kind: AlertKind::Behaviour,
+            ..alert
+        };
+        let (title, body) = alert_text(&behaviour, false);
+        assert_eq!(title, "An app is behaving differently");
+        assert!(!body.contains("chat.exe"));
+        let (title, _) = alert_text(&behaviour, true);
+        assert_eq!(title, "chat.exe is behaving differently");
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod console;
 mod history;
 mod install;
 mod learning;
+mod profiles;
 mod server;
 mod service_mode;
 mod storage;
@@ -41,6 +42,8 @@ Options:
                        the top flows and apps
   --json               With --status, print only the status as one line of JSON
   --history            Show what is saved: top apps of the last 24 hours
+  --profile <PATH>     Show what Whereabouts learned is usual for a program
+                       (its behaviour profile), as JSON
   --export <FILE>      Write all saved flows to a CSV file
   --delete-all --yes   Delete all saved flows and totals (cannot be undone)
 
@@ -91,6 +94,8 @@ enum Command {
         json: bool,
     },
     History,
+    /// Print a program's behaviour profile as JSON.
+    Profile(PathBuf),
     Export(PathBuf),
     DeleteAll {
         confirmed: bool,
@@ -119,6 +124,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut status = false;
     let mut json = false;
     let mut history = false;
+    let mut profile = None;
     let mut export = None;
     let mut delete_all = false;
     let mut yes = false;
@@ -153,6 +159,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--status" => status = true,
             "--json" => json = true,
             "--history" => history = true,
+            "--profile" => {
+                let value = iter.next().ok_or("--profile needs a program path")?;
+                profile = Some(PathBuf::from(value));
+            }
             "--export" => {
                 let value = iter.next().ok_or("--export needs a file name")?;
                 export = Some(PathBuf::from(value));
@@ -216,6 +226,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         console,
         status,
         history,
+        profile.is_some(),
         export.is_some(),
         delete_all,
         install,
@@ -231,8 +242,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     .count();
     if chosen > 1 {
         return Err(String::from(
-            "choose only one of --console, --status, --history, --export, --delete-all, \
-             --install, --uninstall, --register, --unregister, or a blocking command",
+            "choose only one of --console, --status, --history, --profile, --export, \
+             --delete-all, --install, --uninstall, --register, --unregister, or a blocking \
+             command",
         ));
     }
     if json && !status {
@@ -276,6 +288,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         Command::Status { json }
     } else if history {
         Command::History
+    } else if let Some(path) = profile {
+        Command::Profile(path)
     } else if let Some(path) = export {
         Command::Export(path)
     } else if delete_all {
@@ -309,6 +323,7 @@ fn main() -> ExitCode {
         Ok(Command::Console { limit }) => console::run(limit),
         Ok(Command::Status { json }) => client::status(json),
         Ok(Command::History) => storage::show_history(),
+        Ok(Command::Profile(path)) => client::profile(&path),
         Ok(Command::Export(path)) => storage::export(&path),
         Ok(Command::DeleteAll { confirmed }) => storage::delete_all(confirmed),
         Ok(Command::Install) => install::install(),
@@ -394,6 +409,17 @@ mod tests {
             parse_args(&args(&["--delete-all", "--yes"])),
             Ok(Command::DeleteAll { confirmed: true })
         );
+    }
+
+    #[test]
+    fn parses_the_profile_command() {
+        assert_eq!(
+            parse_args(&args(&["--profile", r"C:\Apps\chat.exe"])),
+            Ok(Command::Profile(PathBuf::from(r"C:\Apps\chat.exe")))
+        );
+        assert!(parse_args(&args(&["--profile"])).is_err());
+        assert!(parse_args(&args(&["--profile", "a.exe", "--status"])).is_err());
+        assert!(parse_args(&args(&["--profile", "a.exe", "--rules"])).is_err());
     }
 
     #[test]

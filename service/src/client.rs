@@ -134,6 +134,37 @@ fn show_status(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `--profile PATH`: prints the program's behaviour profile as pretty JSON.
+/// Only reads, so it works without administrator rights.
+pub fn profile(path: &Path) -> ExitCode {
+    match profile_json(PIPE_NAME, path) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn profile_json(name: &str, path: &Path) -> Result<String, String> {
+    let path = full_path(path)?;
+    let mut client = Client::connect(name).map_err(|problem| explain(&problem))?;
+    match ask(&mut client, &Request::Profile { path: path.clone() })? {
+        Response::Profile {
+            profile: Some(profile),
+        } => serde_json::to_string_pretty(&profile).map_err(|e| e.to_string()),
+        Response::Profile { profile: None } => Err(format!(
+            "Whereabouts has no behaviour profile for {} (it has not seen the program use \
+             the network, or saves nothing)",
+            display_safe(&path)
+        )),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// A blocking command from the command line.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RuleAction {

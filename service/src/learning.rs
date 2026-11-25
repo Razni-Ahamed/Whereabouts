@@ -24,7 +24,7 @@ use whereabouts_core::model::{AppIdentity, Signature};
 use whereabouts_detect::learner::{AppFacts, Finished, Learner};
 use whereabouts_detect::meter::{Delta, FlowSample, Meter};
 use whereabouts_enrich::{Enricher, Scope, registrable_domain};
-use whereabouts_store::{DestinationFacts, Store, known_app_key};
+use whereabouts_store::{AlertKind, DestinationFacts, GoesAnywhere, Store, known_app_key};
 
 use crate::alerts::Raised;
 
@@ -81,6 +81,33 @@ pub enum BackfillState {
     Failed(String),
 }
 
+/// A change to the behaviour profiles that the user asked for. The engine
+/// makes it, so the Learner's cached profiles and alerts stay in step with
+/// the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BehaviourCommand {
+    /// Forget what was learned about an app (by its key); it learns again.
+    Reset {
+        /// The app's key (`known_app_key` of its path).
+        key: String,
+    },
+    /// Set whether an app is expected to go anywhere.
+    SetGoesAnywhere {
+        /// The app's key (`known_app_key` of its path).
+        key: String,
+        /// The user's choice.
+        value: GoesAnywhere,
+    },
+    /// Close a behaviour alert: dismiss it, or with `allow` ("this is
+    /// fine") also allow the destinations it named.
+    CloseAlert {
+        /// The alert's ID.
+        id: i64,
+        /// "This is fine".
+        allow: bool,
+    },
+}
+
 /// One flow as the engine shows it.
 #[derive(Debug, Clone, Copy)]
 pub struct FlowInput<'a> {
@@ -134,12 +161,85 @@ impl Learning {
     }
 
     /// How far turning the saved history into profiles has got.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "shown in the status from the next task on")
-    )]
     pub fn backfill_state(&self) -> &BackfillState {
         &self.backfill
+    }
+
+    /// The state of learning for clients' status: `starting`, `ready`, or
+    /// `paused: ` and the error.
+    pub fn status_text(&self) -> String {
+        match self.backfill_state() {
+            BackfillState::Running => String::from("starting"),
+            BackfillState::Done => String::from("ready"),
+            BackfillState::Failed(error) => format!("paused: {error}"),
+        }
+    }
+
+    /// Makes a change the user asked for (`store` is `None` when nothing
+    /// can be saved). `Ok(false)` if there is no such profile or alert.
+    /// Refused until the saved history has been turned into profiles:
+    /// before then, a reset profile would fill up again from history.
+    pub fn answer(
+        &mut self,
+        store: Option<&mut Store>,
+        command: BehaviourCommand,
+        now: SystemTime,
+    ) -> Result<bool, String> {
+        let Some(store) = store else {
+            return Err(String::from(
+                "Whereabouts can't save anything right now, so it has no behaviour profiles",
+            ));
+        };
+        match &self.backfill {
+            BackfillState::Done => {}
+            BackfillState::Running => {
+                return Err(String::from(
+                    "Whereabouts is still learning from the saved history; try again in a minute",
+                ));
+            }
+            BackfillState::Failed(error) => {
+                return Err(format!("learning behaviour is paused: {error}"));
+            }
+        }
+        let result = match command {
+            BehaviourCommand::Reset { key } => self.learner.reset(store, &key, now),
+            BehaviourCommand::SetGoesAnywhere { key, value } => {
+                self.learner.set_goes_anywhere(store, &key, value)
+            }
+            BehaviourCommand::CloseAlert { id, allow } => self.close_alert(store, id, allow, now),
+        };
+        result.map_err(|error| error.to_string())
+    }
+
+    /// Marks a behaviour alert seen and tells the Learner. "This is fine" on
+    /// an alert from before its profile was reset only marks it seen: what
+    /// it named was forgotten with the profile.
+    fn close_alert(
+        &mut self,
+        store: &mut Store,
+        id: i64,
+        allow: bool,
+        now: SystemTime,
+    ) -> Result<bool, whereabouts_store::StoreError> {
+        let Some(alert) = store
+            .alert(id)?
+            .filter(|alert| alert.kind == AlertKind::Behaviour)
+        else {
+            return Ok(false);
+        };
+        let reset_since = match alert.app_path.as_deref() {
+            Some(path) => store
+                .profile(&known_app_key(path))?
+                .and_then(|profile| profile.row.reset_at)
+                .is_some_and(|reset| reset > alert.created),
+            None => false,
+        };
+        let allow = allow && !reset_since;
+        if !store.dismiss_alert(id, allow, now)? {
+            return Ok(false);
+        }
+        self.learner.alert_closed(store, id, allow, now)?;
+        Ok(true)
     }
 
     fn ready(&self) -> bool {
@@ -558,6 +658,33 @@ mod tests {
         learning.retry_at = Some(Instant::now());
         learning.tick(&mut store, &e, at(T0 + 4));
         assert_eq!(learning.backfill_state(), &BackfillState::Done);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn user_changes_wait_for_the_history_to_be_caught_up() {
+        let (mut store, dir) = temp_store("not-ready-answer");
+        let reset = || BehaviourCommand::Reset {
+            key: known_app_key(PATH),
+        };
+        let mut learning = Learning::new(at(T0));
+        assert_eq!(learning.status_text(), "starting");
+        let refused = learning.answer(Some(&mut store), reset(), at(T0));
+        assert!(refused.unwrap_err().contains("still learning"));
+        learning.backfill = BackfillState::Failed(String::from("disk full"));
+        assert_eq!(learning.status_text(), "paused: disk full");
+        assert!(learning.answer(Some(&mut store), reset(), at(T0)).is_err());
+        // Nothing can be saved: no profiles to change.
+        assert!(learning.answer(None, reset(), at(T0)).is_err());
+        let mut learning = ready(&mut store, at(T0));
+        assert_eq!(learning.status_text(), "ready");
+        assert_eq!(
+            learning.answer(Some(&mut store), reset(), at(T0)),
+            Ok(false)
+        );
+        let close = BehaviourCommand::CloseAlert { id: 1, allow: true };
+        assert_eq!(learning.answer(Some(&mut store), close, at(T0)), Ok(false));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

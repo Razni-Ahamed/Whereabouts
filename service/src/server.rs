@@ -25,11 +25,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use whereabouts_client::peer::{self, Client};
 use whereabouts_ipc::{
-    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_BYTES, FlowView, MAX_NOTICES, Notice,
-    NoticeKind, PROTOCOL_VERSION, Request, Response, Status, read_message, write_message,
+    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_BYTES, FlowView, GoesAnywhereChoice,
+    MAX_NOTICES, MAX_RULE_PATH, Notice, NoticeKind, PROTOCOL_VERSION, Request, Response, Status,
+    read_message, write_message,
 };
-use whereabouts_store::{Store, csv_header};
+use whereabouts_store::{AlertKind, Store, csv_header, known_app_key};
 use whereabouts_win_pipe::{PipeConnection, PipeListener, current_user_sid};
+
+use crate::learning::BehaviourCommand;
 
 /// Most clients served at the same time.
 const MAX_CLIENTS: usize = 4;
@@ -39,6 +42,10 @@ const DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a client waits for the engine to change the blocking rules.
 const RULES_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a client waits for the engine to change a behaviour profile or
+/// close a behaviour alert.
+const BEHAVIOUR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The answer to a change asked for by a client that may not make it.
 const NEEDS_ADMIN: &str = "Changing what Whereabouts blocks, deletes or warns about needs the \
@@ -79,6 +86,15 @@ pub enum EngineCommand {
         command: crate::blocking::RuleCommand,
         /// Where to send the answer.
         reply: Sender<Response>,
+    },
+    /// Change a behaviour profile or close a behaviour alert, through the
+    /// Learner so that what it holds stays in step, and send back whether
+    /// there was such a profile or alert.
+    Behaviour {
+        /// What to do.
+        command: BehaviourCommand,
+        /// Where to send the result.
+        reply: Sender<Result<bool, String>>,
     },
 }
 
@@ -382,7 +398,9 @@ fn lock(state: &Mutex<LiveState>) -> MutexGuard<'_, LiveState> {
 }
 
 /// Whether `request` changes what Whereabouts blocks, deletes or warns
-/// about (or downloads), rather than only reading.
+/// about (or downloads), rather than only reading. Profiles count: a program
+/// that could reset its own profile, say it goes anywhere or say "this is
+/// fine" could make whatever it does next look usual.
 fn changes_something(request: &Request) -> bool {
     match request {
         Request::AddRule { .. }
@@ -391,7 +409,9 @@ fn changes_something(request: &Request) -> bool {
         | Request::DeleteAll { .. }
         | Request::DismissAlert { .. }
         | Request::SetListUpdates { .. }
-        | Request::SetSaveHistory { .. } => true,
+        | Request::SetSaveHistory { .. }
+        | Request::ResetProfile { .. }
+        | Request::SetGoesAnywhere { .. } => true,
         Request::Hello { .. }
         | Request::Status {}
         | Request::CheckListsNow {}
@@ -400,7 +420,8 @@ fn changes_something(request: &Request) -> bool {
         | Request::ExportPage { .. }
         | Request::ListRules {}
         | Request::Alerts { .. }
-        | Request::Notices { .. } => false,
+        | Request::Notices { .. }
+        | Request::Profile { .. } => false,
     }
 }
 
@@ -483,14 +504,24 @@ fn answer(
             Err(response) => *response,
         },
         Request::DismissAlert { id, allow } => match open_store(store) {
-            Ok(store) => match store.dismiss_alert(id, allow, SystemTime::now()) {
-                Ok(true) => Response::AlertDismissed {},
-                Ok(false) => Response::Error {
-                    message: format!("there is no alert {id}"),
-                },
-                Err(error) => Response::Error {
-                    message: format!("could not change the alert: {error}"),
-                },
+            Ok(store) => dismiss_alert(state, store, id, allow),
+            Err(response) => *response,
+        },
+        Request::Profile { path } => match program_path(&path) {
+            Ok(path) => match open_store(store) {
+                Ok(store) => profile(store, path),
+                Err(response) => *response,
+            },
+            Err(response) => *response,
+        },
+        Request::ResetProfile { path } => match program_path(&path) {
+            Ok(path) => reset_profile(state, path),
+            Err(response) => *response,
+        },
+        Request::SetGoesAnywhere { path, value } => match program_path(&path) {
+            Ok(path) => match open_store(store) {
+                Ok(store) => set_goes_anywhere(state, store, path, value),
+                Err(response) => *response,
             },
             Err(response) => *response,
         },
@@ -507,6 +538,117 @@ fn answer(
             }
         }
     }
+}
+
+/// A program path from a client: given, and at most [`MAX_RULE_PATH`]
+/// characters, as for rules.
+fn program_path(path: &str) -> Result<&str, Box<Response>> {
+    if path.is_empty() {
+        return Err(Box::new(Response::Error {
+            message: String::from("no program path was given"),
+        }));
+    }
+    if path.chars().count() > MAX_RULE_PATH {
+        return Err(Box::new(Response::Error {
+            message: format!("the program path is longer than {MAX_RULE_PATH} characters"),
+        }));
+    }
+    Ok(path)
+}
+
+fn no_profile() -> Response {
+    Response::Error {
+        message: String::from("Whereabouts has no behaviour profile for that program"),
+    }
+}
+
+/// Marks an alert as seen. A behaviour alert goes through the engine, so
+/// that "this is fine" also allows what it named, in the Learner too;
+/// other alerts are changed here.
+fn dismiss_alert(state: &Mutex<LiveState>, store: &mut Store, id: i64, allow: bool) -> Response {
+    let changed = match store.alert(id) {
+        Ok(Some(alert)) if alert.kind == AlertKind::Behaviour => {
+            behaviour(state, BehaviourCommand::CloseAlert { id, allow })
+        }
+        Ok(Some(_)) => store
+            .dismiss_alert(id, allow, SystemTime::now())
+            .map_err(|error| error.to_string()),
+        Ok(None) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    };
+    match changed {
+        Ok(true) => Response::AlertDismissed {},
+        Ok(false) => Response::Error {
+            message: format!("there is no alert {id}"),
+        },
+        Err(message) => Response::Error {
+            message: format!("could not change the alert: {message}"),
+        },
+    }
+}
+
+/// The program's behaviour profile, read from the connection's own store.
+fn profile(store: &Store, path: &str) -> Response {
+    let now = SystemTime::now();
+    match crate::profiles::view(store, path, now, crate::clock::local_offset_secs(now)) {
+        Ok(profile) => Response::Profile { profile },
+        Err(error) => Response::Error {
+            message: format!("could not read the profile: {error}"),
+        },
+    }
+}
+
+/// Asks the engine to reset the program's profile, and waits for it.
+fn reset_profile(state: &Mutex<LiveState>, path: &str) -> Response {
+    let command = BehaviourCommand::Reset {
+        key: known_app_key(path),
+    };
+    match behaviour(state, command) {
+        Ok(true) => Response::ProfileReset {},
+        Ok(false) => no_profile(),
+        Err(message) => Response::Error {
+            message: format!("could not reset the profile: {message}"),
+        },
+    }
+}
+
+/// Asks the engine to save whether the program goes anywhere, then answers
+/// with its profile as it is now.
+fn set_goes_anywhere(
+    state: &Mutex<LiveState>,
+    store: &Store,
+    path: &str,
+    value: GoesAnywhereChoice,
+) -> Response {
+    let command = BehaviourCommand::SetGoesAnywhere {
+        key: known_app_key(path),
+        value: crate::profiles::choice_to_store(value),
+    };
+    match behaviour(state, command) {
+        Ok(true) => profile(store, path),
+        Ok(false) => no_profile(),
+        Err(message) => Response::Error {
+            message: format!("could not change the profile: {message}"),
+        },
+    }
+}
+
+/// Asks the engine to make a behaviour change, and waits for the result:
+/// whether there was such a profile or alert.
+fn behaviour(state: &Mutex<LiveState>, command: BehaviourCommand) -> Result<bool, String> {
+    let Some(commands) = lock(state).commands.clone() else {
+        return Err(String::from("Whereabouts is still starting"));
+    };
+    let (reply, result) = mpsc::channel();
+    if commands
+        .send(EngineCommand::Behaviour { command, reply })
+        .is_err()
+    {
+        return Err(String::from("Whereabouts is stopping"));
+    }
+    result
+        .recv_timeout(BEHAVIOUR_TIMEOUT)
+        .unwrap_or_else(|_| Err(String::from("Whereabouts did not answer in time")))
 }
 
 /// Asks the engine to list or change the blocking rules, and waits for the
@@ -980,6 +1122,439 @@ mod tests {
             Response::Status(status) => assert_eq!(status.events, 42),
             other => panic!("{other:?}"),
         }
+    }
+
+    const PATH: &str = r"C:\Apps\chat.exe";
+    const STORE_KEY: [u8; 32] = [5; 32];
+
+    fn path() -> String {
+        String::from(PATH)
+    }
+
+    /// A temporary store and the folder to delete afterwards.
+    fn temp_store(name: &str) -> (Store, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("whereabouts-server-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(
+            &dir.join("t.db"),
+            &whereabouts_store::Key::from_bytes(STORE_KEY),
+        )
+        .unwrap();
+        (store, dir)
+    }
+
+    fn ago(days: u64) -> SystemTime {
+        SystemTime::now() - Duration::from_secs(days * 86_400)
+    }
+
+    /// Saves a profile of `PATH` that finished learning, where RU waits on
+    /// a behaviour alert raised an hour ago (as after a restart: no Learner
+    /// holds it). Returns the alert's ID.
+    fn seed_pending_ru(store: &mut Store) -> i64 {
+        use whereabouts_store::{
+            AlertKind, GoesAnywhere, ItemKind, ItemState, NewAlert, ProfileItem, ProfileRow,
+            Reason, Severity, Signal, known_app_key,
+        };
+        let key = known_app_key(PATH);
+        store
+            .save_profile_row(&ProfileRow {
+                key: key.clone(),
+                path: path(),
+                app_name: String::from("chat.exe"),
+                first_data: ago(10),
+                learned_since: ago(10),
+                last_data: ago(1),
+                active_days: 10,
+                last_active_day: None,
+                last_sha256: None,
+                last_publisher: None,
+                goes_anywhere: GoesAnywhere::Auto,
+                reset_at: None,
+            })
+            .unwrap();
+        let item = |kind, value: &str, state| ProfileItem {
+            kind,
+            value: value.to_owned(),
+            first_seen: ago(9),
+            last_seen: ago(1),
+            seen_on_day: 9,
+            state,
+        };
+        store
+            .save_items(
+                &key,
+                &[
+                    item(ItemKind::Country, "DE", ItemState::Learned),
+                    item(ItemKind::Country, "RU", ItemState::Pending),
+                    item(ItemKind::Domain, "chat.example", ItemState::Learned),
+                ],
+            )
+            .unwrap();
+        let alert = NewAlert {
+            key: format!("behaviour|{key}|1"),
+            allow_key: None,
+            kind: AlertKind::Behaviour,
+            severity: Severity::Medium,
+            app_name: Some(String::from("chat.exe")),
+            app_path: Some(path()),
+            target: Some(String::from("RU")),
+            detail: None,
+            reasons: vec![Reason {
+                signal: Signal::NewCountry,
+                value: Some(String::from("RU")),
+                observed: None,
+                usual: None,
+                count: None,
+            }],
+        };
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3_600);
+        store.add_alert(&alert, an_hour_ago).unwrap().unwrap()
+    }
+
+    fn item_states(store: &Store) -> Vec<(String, whereabouts_store::ItemState)> {
+        let key = whereabouts_store::known_app_key(PATH);
+        let profile = store.profile(&key).unwrap().expect("a profile");
+        profile
+            .items
+            .into_iter()
+            .map(|item| (item.value, item.state))
+            .collect()
+    }
+
+    /// A stand-in for the engine, with its own connection to the store in
+    /// `dir`, that answers behaviour commands as the real one does until the
+    /// channel closes.
+    fn behaviour_engine(
+        dir: &std::path::Path,
+        commands: mpsc::Receiver<EngineCommand>,
+    ) -> std::thread::JoinHandle<()> {
+        let db = dir.join("t.db");
+        std::thread::spawn(move || {
+            let mut store =
+                Store::open(&db, &whereabouts_store::Key::from_bytes(STORE_KEY)).unwrap();
+            let enricher = whereabouts_enrich::Enricher::from_parts(
+                whereabouts_enrich::TrackerList::parse(""),
+                whereabouts_enrich::CompanyList::built_in(),
+                whereabouts_enrich::GeoDatabases::default(),
+            );
+            let mut learning = crate::learning::Learning::new(SystemTime::now());
+            learning.tick(&mut store, &enricher, SystemTime::now());
+            for command in commands {
+                match command {
+                    EngineCommand::Behaviour { command, reply } => {
+                        let answer = learning.answer(Some(&mut store), command, SystemTime::now());
+                        reply.send(answer).unwrap();
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn profile_changes_need_trust() {
+        assert!(changes_something(&Request::ResetProfile { path: path() }));
+        for value in [
+            whereabouts_ipc::GoesAnywhereChoice::Auto,
+            whereabouts_ipc::GoesAnywhereChoice::On,
+            whereabouts_ipc::GoesAnywhereChoice::Off,
+        ] {
+            assert!(changes_something(&Request::SetGoesAnywhere {
+                path: path(),
+                value
+            }));
+        }
+        assert!(changes_something(&Request::DismissAlert {
+            id: 1,
+            allow: true
+        }));
+        assert!(!changes_something(&Request::Profile { path: path() }));
+    }
+
+    #[test]
+    fn untrusted_client_cannot_reset() {
+        let state = shared(0);
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        let mut store = None;
+        // A program on this PC that starts the command line as itself.
+        let tool = Client::Tool { elevated: false };
+        for request in [
+            Request::ResetProfile { path: path() },
+            Request::SetGoesAnywhere {
+                path: path(),
+                value: whereabouts_ipc::GoesAnywhereChoice::On,
+            },
+            Request::DismissAlert { id: 1, allow: true },
+        ] {
+            assert_eq!(
+                answer(request, &state, &mut store, tool),
+                Response::Error {
+                    message: String::from(NEEDS_ADMIN)
+                }
+            );
+        }
+        assert!(commands.try_recv().is_err(), "nothing reached the engine");
+        assert!(store.is_none(), "nothing was even read");
+    }
+
+    #[test]
+    fn this_is_fine_allows_pending_items() {
+        use whereabouts_store::ItemState;
+        let (mut saved, dir) = temp_store("allow");
+        let id = seed_pending_ru(&mut saved);
+        let state = shared(0);
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        let engine = behaviour_engine(&dir, commands);
+        let mut store = Some(saved);
+        assert_eq!(
+            answer(
+                Request::DismissAlert { id, allow: true },
+                &state,
+                &mut store,
+                Client::App
+            ),
+            Response::AlertDismissed {}
+        );
+        lock(&state).commands = None;
+        engine.join().unwrap();
+        let store = store.unwrap();
+        assert!(store.alert(id).unwrap().unwrap().dismissed);
+        assert_eq!(
+            item_states(&store),
+            [
+                (String::from("DE"), ItemState::Learned),
+                (String::from("RU"), ItemState::Allowed),
+                (String::from("chat.example"), ItemState::Learned),
+            ]
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn this_is_fine_after_reset_only_marks_seen() {
+        use whereabouts_store::{ItemKind, ItemState, ProfileItem, known_app_key};
+        let (mut saved, dir) = temp_store("allow-after-reset");
+        let id = seed_pending_ru(&mut saved);
+        let state = shared(0);
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        let engine = behaviour_engine(&dir, commands);
+        let mut store = Some(saved);
+        assert_eq!(
+            answer(
+                Request::ResetProfile { path: path() },
+                &state,
+                &mut store,
+                Client::App
+            ),
+            Response::ProfileReset {}
+        );
+        assert!(item_states(store.as_ref().unwrap()).is_empty());
+        // RU turned up again since, waiting on a newer alert.
+        store
+            .as_mut()
+            .unwrap()
+            .save_items(
+                &known_app_key(PATH),
+                &[ProfileItem {
+                    kind: ItemKind::Country,
+                    value: String::from("RU"),
+                    first_seen: SystemTime::now(),
+                    last_seen: SystemTime::now(),
+                    seen_on_day: 1,
+                    state: ItemState::Pending,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            answer(
+                Request::DismissAlert { id, allow: true },
+                &state,
+                &mut store,
+                Client::App
+            ),
+            Response::AlertDismissed {}
+        );
+        lock(&state).commands = None;
+        engine.join().unwrap();
+        let store = store.unwrap();
+        assert!(store.alert(id).unwrap().unwrap().dismissed, "marked seen");
+        assert_eq!(
+            item_states(&store),
+            [(String::from("RU"), ItemState::Pending)],
+            "the old alert allows nothing in the reset profile"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn other_alerts_are_dismissed_without_the_engine() {
+        let (mut saved, dir) = temp_store("tracker");
+        let id = saved
+            .add_alert(
+                &whereabouts_store::NewAlert {
+                    key: String::from("tracker|1"),
+                    allow_key: Some(String::from("tracker|chat.exe|ads.example")),
+                    kind: whereabouts_store::AlertKind::Tracker,
+                    severity: whereabouts_store::Severity::Info,
+                    app_name: Some(String::from("chat.exe")),
+                    app_path: Some(path()),
+                    target: Some(String::from("ads.example")),
+                    detail: None,
+                    reasons: Vec::new(),
+                },
+                SystemTime::now(),
+            )
+            .unwrap()
+            .unwrap();
+        // No engine at all.
+        let state = shared(0);
+        let mut store = Some(saved);
+        let dismiss = |id| Request::DismissAlert { id, allow: true };
+        assert_eq!(
+            answer(dismiss(id), &state, &mut store, Client::App),
+            Response::AlertDismissed {}
+        );
+        assert!(
+            store
+                .as_ref()
+                .unwrap()
+                .is_allowed("tracker|chat.exe|ads.example")
+                .unwrap()
+        );
+        assert!(matches!(
+            answer(dismiss(id + 1), &state, &mut store, Client::App),
+            Response::Error { .. }
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profiles_are_read_by_anyone_and_changed_by_the_engine() {
+        use whereabouts_ipc::GoesAnywhereChoice;
+        let (mut saved, dir) = temp_store("profile");
+        seed_pending_ru(&mut saved);
+        let state = shared(0);
+        let mut store = Some(saved);
+        let tool = Client::Tool { elevated: false };
+        let Response::Profile {
+            profile: Some(view),
+        } = answer(Request::Profile { path: path() }, &state, &mut store, tool)
+        else {
+            panic!("no profile");
+        };
+        assert_eq!(view.path, PATH);
+        assert!(!view.learning);
+        assert_eq!(view.goes_anywhere_choice, GoesAnywhereChoice::Auto);
+        assert!(!view.goes_anywhere && !view.recognised_browser);
+        let countries: Vec<(&str, &str)> = view
+            .countries
+            .iter()
+            .map(|c| (c.value.as_str(), c.state.as_str()))
+            .collect();
+        assert_eq!(countries, [("DE", "learned"), ("RU", "pending")]);
+        assert_eq!(view.sites.len(), 1);
+        // The same program by another spelling; and one with no profile.
+        let other = answer(
+            Request::Profile {
+                path: PATH.to_uppercase(),
+            },
+            &state,
+            &mut store,
+            tool,
+        );
+        assert!(matches!(other, Response::Profile { profile: Some(_) }));
+        assert_eq!(
+            answer(
+                Request::Profile {
+                    path: String::from(r"C:\Apps\none.exe")
+                },
+                &state,
+                &mut store,
+                tool
+            ),
+            Response::Profile { profile: None }
+        );
+        // Paths must be given, and not too long.
+        for bad in [
+            String::new(),
+            "x".repeat(whereabouts_ipc::MAX_RULE_PATH + 1),
+        ] {
+            for request in [
+                Request::Profile { path: bad.clone() },
+                Request::ResetProfile { path: bad.clone() },
+            ] {
+                let answer = answer(request, &state, &mut store, Client::App);
+                assert!(matches!(answer, Response::Error { .. }), "{answer:?}");
+            }
+        }
+
+        let (sender, commands) = mpsc::channel();
+        lock(&state).commands = Some(sender);
+        let engine = behaviour_engine(&dir, commands);
+        let Response::Profile {
+            profile: Some(view),
+        } = answer(
+            Request::SetGoesAnywhere {
+                path: path(),
+                value: GoesAnywhereChoice::On,
+            },
+            &state,
+            &mut store,
+            Client::App,
+        )
+        else {
+            panic!("no profile");
+        };
+        assert_eq!(view.goes_anywhere_choice, GoesAnywhereChoice::On);
+        assert!(view.goes_anywhere);
+        let none = answer(
+            Request::SetGoesAnywhere {
+                path: String::from(r"C:\Apps\none.exe"),
+                value: GoesAnywhereChoice::On,
+            },
+            &state,
+            &mut store,
+            Client::App,
+        );
+        assert!(matches!(none, Response::Error { .. }), "{none:?}");
+        lock(&state).commands = None;
+        engine.join().unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn behaviour_changes_report_when_the_engine_is_not_there() {
+        let (mut saved, dir) = temp_store("no-engine");
+        let id = seed_pending_ru(&mut saved);
+        let state = shared(0);
+        let mut store = Some(saved);
+        for request in [
+            Request::ResetProfile { path: path() },
+            Request::DismissAlert { id, allow: true },
+        ] {
+            let answer = answer(request, &state, &mut store, Client::App);
+            assert!(matches!(answer, Response::Error { .. }), "{answer:?}");
+        }
+        assert!(
+            !store
+                .as_ref()
+                .unwrap()
+                .alert(id)
+                .unwrap()
+                .unwrap()
+                .dismissed
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Sends `request` and reads the answer.

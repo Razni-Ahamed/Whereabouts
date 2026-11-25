@@ -378,6 +378,12 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                     }
                     let _ = reply.send(answer);
                 }
+                crate::server::EngineCommand::Behaviour { command, reply } => {
+                    // Through the Learner, so its cached profiles and open
+                    // alerts follow the change.
+                    let result = learning.answer(store.as_mut(), command, SystemTime::now());
+                    let _ = reply.send(result);
+                }
             }
         }
         if last_draw.elapsed() >= REFRESH {
@@ -477,6 +483,7 @@ pub fn run_engine(options: &Options) -> Result<(), String> {
                 drop_list: detector.has_drop(),
                 // Filled in from the updater's state when answering.
                 lists: whereabouts_ipc::ListsView::default(),
+                behaviour_learning: store.is_some().then(|| learning.status_text()),
             };
             publish(&live, &view, &names, &enricher, status);
             if options.show_table {

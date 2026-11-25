@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use whereabouts_detect::learner::Learner;
 use whereabouts_detect::signals::Toggles;
 pub use whereabouts_detect::{Detector, FlowFacts, Raised};
-use whereabouts_store::{AlertKind, Severity};
+use whereabouts_store::{AlertKind, Reason, Severity};
 
 /// The detector, with this computer's Spamhaus DROP list if it downloaded one.
 pub fn load_detector() -> Detector {
@@ -37,10 +37,18 @@ pub fn kind_view(kind: AlertKind) -> whereabouts_ipc::AlertKind {
         AlertKind::BadNetwork => whereabouts_ipc::AlertKind::BadNetwork,
         AlertKind::FakedDns => whereabouts_ipc::AlertKind::FakedDns,
         AlertKind::Unattributed => whereabouts_ipc::AlertKind::Unattributed,
-        // Nothing raises behaviour alerts yet, and clients have no kind for
-        // them until the IPC changes of v0.3 land; show them as the
-        // closest existing kind meanwhile.
-        AlertKind::Behaviour => whereabouts_ipc::AlertKind::Unattributed,
+        AlertKind::Behaviour => whereabouts_ipc::AlertKind::Behaviour,
+    }
+}
+
+/// A behaviour alert's reason as clients see it.
+fn reason_view(reason: Reason) -> whereabouts_ipc::ReasonView {
+    whereabouts_ipc::ReasonView {
+        signal: String::from(reason.signal.as_str()),
+        value: reason.value,
+        observed: reason.observed,
+        usual: reason.usual,
+        count: reason.count,
     }
 }
 
@@ -67,6 +75,8 @@ pub fn view(alert: whereabouts_store::StoredAlert) -> whereabouts_ipc::AlertView
         detail: alert.detail,
         dismissed: alert.dismissed,
         can_allow: alert.can_allow,
+        reasons: alert.reasons.into_iter().map(reason_view).collect(),
+        seen_again: alert.seen_again,
     }
 }
 

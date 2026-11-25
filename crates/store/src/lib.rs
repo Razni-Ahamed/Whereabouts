@@ -418,7 +418,8 @@ impl Store {
     /// info alerts can never push a serious one out of the list.
     pub fn alerts(&self, since: SystemTime, limit: usize) -> Result<Vec<StoredAlert>, StoreError> {
         let mut query = self.conn.prepare(&format!(
-            "SELECT {ALERT_COLUMNS} FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2"
+            "SELECT {ALERT_COLUMNS} FROM alerts WHERE created >= ?1 \
+             ORDER BY severity = 'info', id DESC LIMIT ?2"
         ))?;
         let rows = query.query_map(
             params![unix_ms(since), i64::try_from(limit).unwrap_or(i64::MAX)],
@@ -1024,15 +1025,15 @@ fn reasons_from_json(text: &str) -> Vec<Reason> {
 }
 
 /// The columns [`read_alert`] reads, in order.
-const ALERT_COLUMNS: &str = "id, created, kind, severity, app_name, app_path, target, detail,                              dismissed, allow_key IS NOT NULL, reasons, seen_again";
+const ALERT_COLUMNS: &str = "id, created, kind, severity, app_name, app_path, target, detail, \
+                             dismissed, allow_key IS NOT NULL, reasons, seen_again";
 
 /// One alert from a row of [`ALERT_COLUMNS`]; `None` if its kind or severity
 /// is not known to this version.
 fn read_alert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<StoredAlert>> {
     let kind: String = row.get(2)?;
     let severity: String = row.get(3)?;
-    let (Some(kind), Some(severity)) = (AlertKind::parse(&kind), Severity::parse(&severity))
-    else {
+    let (Some(kind), Some(severity)) = (AlertKind::parse(&kind), Severity::parse(&severity)) else {
         return Ok(None);
     };
     let reasons: String = row.get(10)?;

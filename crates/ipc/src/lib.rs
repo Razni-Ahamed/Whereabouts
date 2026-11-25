@@ -156,13 +156,49 @@ pub enum Request {
         /// totals saved so far. Ignored when turning it on.
         delete_saved: bool,
     },
-    /// Marks an alert as seen and fine.
+    /// Marks an alert as seen and fine. For a behaviour alert, `allow`
+    /// ("this is fine") also adds the destinations it named to the app's
+    /// profile.
     DismissAlert {
         /// The alert's ID.
         id: i64,
         /// Also stop alerts like it (same app and target), if it can.
         allow: bool,
     },
+    /// One program's behaviour profile. Answered with
+    /// [`Response::Profile`] (`None` if it has none).
+    Profile {
+        /// The program's full path (at most [`MAX_RULE_PATH`] characters).
+        path: String,
+    },
+    /// Forgets what was learned about a program; it learns again from now.
+    /// Answered with [`Response::ProfileReset`].
+    ResetProfile {
+        /// The program's full path (at most [`MAX_RULE_PATH`] characters).
+        path: String,
+    },
+    /// Sets whether a program is expected to connect anywhere (a web
+    /// browser), so new sites, companies and countries are not unusual for
+    /// it. Answered with [`Response::Profile`].
+    SetGoesAnywhere {
+        /// The program's full path (at most [`MAX_RULE_PATH`] characters).
+        path: String,
+        /// The user's choice.
+        value: GoesAnywhereChoice,
+    },
+}
+
+/// Whether a program is expected to connect anywhere, as the user chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoesAnywhereChoice {
+    /// Decided by Whereabouts: yes for a genuine web browser installed by
+    /// administrators.
+    Auto,
+    /// The user said it goes anywhere.
+    On,
+    /// The user said it does not.
+    Off,
 }
 
 /// How much an alert matters.
@@ -194,10 +230,28 @@ pub enum AlertKind {
     FakedDns,
     /// Traffic could not be tied to any process (`detail` says how much).
     Unattributed,
+    /// An app behaved differently from what Whereabouts learned is usual
+    /// for it (`reasons` say how; `target` is the first reason's value).
+    Behaviour,
+}
+
+/// One reason behind a behaviour alert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasonView {
+    /// Which signal fired, e.g. `new_country` or `upload_spike`.
+    pub signal: String,
+    /// The domain, company, country code or port concerned.
+    pub value: Option<String>,
+    /// What was seen (e.g. bytes sent in the hour).
+    pub observed: Option<f64>,
+    /// What is usual for this app.
+    pub usual: Option<f64>,
+    /// A count (e.g. connections).
+    pub count: Option<u32>,
 }
 
 /// A saved alert.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertView {
     /// The alert's ID.
     pub id: i64,
@@ -217,6 +271,64 @@ pub struct AlertView {
     pub dismissed: bool,
     /// Whether "this is fine" can also stop alerts like it.
     pub can_allow: bool,
+    /// Why a behaviour alert was raised (empty for other kinds).
+    #[serde(default)]
+    pub reasons: Vec<ReasonView>,
+    /// How many more times a behaviour alert's destinations were seen
+    /// while it waited for the user.
+    #[serde(default)]
+    pub seen_again: u32,
+}
+
+/// One program's behaviour profile: what Whereabouts learned is usual for
+/// it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileView {
+    /// The program's full path (at most [`MAX_RULE_PATH`] characters).
+    pub path: String,
+    /// Executable file name.
+    pub app: String,
+    /// Whether it is still in its first week of learning (no behaviour
+    /// alerts meanwhile).
+    pub learning: bool,
+    /// When learning ends (or ended), in seconds since 1970.
+    pub learning_ends_secs: u64,
+    /// When learning started (it starts again on reset), in seconds since
+    /// 1970.
+    pub learned_since_secs: u64,
+    /// Whether new sites, companies and countries are expected of it, all
+    /// things considered.
+    pub goes_anywhere: bool,
+    /// The user's choice behind `goes_anywhere`.
+    pub goes_anywhere_choice: GoesAnywhereChoice,
+    /// Whether Whereabouts recognises it as a genuine web browser (what
+    /// [`GoesAnywhereChoice::Auto`] goes by).
+    pub recognised_browser: bool,
+    /// Sites (registrable domains), newest first, at most [`MAX_ROWS`].
+    pub sites: Vec<ProfileItemView>,
+    /// Companies, newest first, at most [`MAX_ROWS`].
+    pub companies: Vec<ProfileItemView>,
+    /// Country codes, newest first, at most [`MAX_ROWS`].
+    pub countries: Vec<ProfileItemView>,
+    /// Bytes sent in a typical active hour (the median), if it was active.
+    pub usual_sent_per_hour: Option<u64>,
+    /// Bytes sent in its busiest hour, if it was active.
+    pub busiest_sent_per_hour: Option<u64>,
+    /// The share of its active hours in each local hour of the day (0 to
+    /// 23); all zeros if it was never active.
+    pub active_hours: [f32; 24],
+}
+
+/// One destination in a [`ProfileView`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileItemView {
+    /// The domain, company or country code.
+    pub value: String,
+    /// When the program last used it, in seconds since 1970.
+    pub last_seen_secs: u64,
+    /// `learned` (seen during normal use), `allowed` (the user said it is
+    /// fine) or `pending` (raised an alert that waits for the user).
+    pub state: String,
 }
 
 /// Most notices the service keeps; older ones are dropped.
@@ -331,7 +443,7 @@ impl Request {
 }
 
 /// What the service answers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     /// Answer to [`Request::Hello`].
@@ -390,6 +502,13 @@ pub enum Response {
     },
     /// Answer to [`Request::DismissAlert`].
     AlertDismissed {},
+    /// Answer to [`Request::Profile`] and [`Request::SetGoesAnywhere`].
+    Profile {
+        /// The profile, or `None` if the program has none (yet).
+        profile: Option<ProfileView>,
+    },
+    /// Answer to [`Request::ResetProfile`]: the profile is learning again.
+    ProfileReset {},
     /// Answer to [`Request::SetListUpdates`] and [`Request::CheckListsNow`].
     Lists(ListsView),
     /// Answer to [`Request::SetSaveHistory`]: the choice is saved and in
@@ -463,6 +582,12 @@ pub struct Status {
     /// List updates.
     #[serde(default)]
     pub lists: ListsView,
+    /// Learning each app's usual behaviour: `starting` (still reading the
+    /// saved history), `ready`, or `paused: ` and what went wrong (it is
+    /// tried again later). `None` when nothing can be saved, so nothing is
+    /// learned.
+    #[serde(default)]
+    pub behaviour_learning: Option<String>,
 }
 
 /// List updates: the user's switches and what was downloaded.
@@ -792,6 +917,8 @@ mod tests {
                 detail: Some(String::from("203.0.113.0/24 (SBL1)")),
                 dismissed: false,
                 can_allow: true,
+                reasons: Vec::new(),
+                seen_again: 0,
             }],
         });
         assert_eq!(
@@ -806,6 +933,101 @@ mod tests {
             }
         );
         assert!(Severity::Critical > Severity::Medium);
+    }
+
+    #[test]
+    fn alert_view_carries_reasons() {
+        let alert = AlertView {
+            id: 9,
+            created_secs: 1_800_000_000,
+            kind: AlertKind::Behaviour,
+            severity: Severity::High,
+            app: Some(String::from("chat.exe")),
+            path: Some(String::from(r"C:\Apps\chat.exe")),
+            target: Some(String::from("RU")),
+            detail: None,
+            dismissed: false,
+            can_allow: false,
+            reasons: vec![
+                ReasonView {
+                    signal: String::from("new_country"),
+                    value: Some(String::from("RU")),
+                    observed: None,
+                    usual: None,
+                    count: None,
+                },
+                ReasonView {
+                    signal: String::from("upload_spike"),
+                    value: None,
+                    observed: Some(5e7),
+                    usual: Some(1e6),
+                    count: Some(3),
+                },
+            ],
+            seen_again: 2,
+        };
+        round_trip(Response::Alerts {
+            alerts: vec![alert.clone()],
+        });
+        let json = serde_json::to_string(&alert).unwrap();
+        assert!(json.contains(r#""kind":"behaviour""#), "{json}");
+        assert!(json.contains(r#""signal":"new_country""#), "{json}");
+        // An alert from an older service, without reasons, still reads.
+        let old = r#"{"id":1,"created_secs":2,"kind":"tracker","severity":"info","app":null,
+            "path":null,"target":null,"detail":null,"dismissed":false,"can_allow":true}"#;
+        let old: AlertView = serde_json::from_str(old).unwrap();
+        assert!(old.reasons.is_empty());
+        assert_eq!(old.seen_again, 0);
+    }
+
+    #[test]
+    fn profile_messages_round_trip() {
+        let path = String::from(r"C:\Apps\chat.exe");
+        round_trip(Request::Profile { path: path.clone() });
+        round_trip(Request::ResetProfile { path: path.clone() });
+        for value in [
+            GoesAnywhereChoice::Auto,
+            GoesAnywhereChoice::On,
+            GoesAnywhereChoice::Off,
+        ] {
+            round_trip(Request::SetGoesAnywhere {
+                path: path.clone(),
+                value,
+            });
+        }
+        let mut active_hours = [0.0; 24];
+        active_hours[9] = 0.75;
+        active_hours[14] = 0.25;
+        round_trip(Response::Profile {
+            profile: Some(ProfileView {
+                path,
+                app: String::from("chat.exe"),
+                learning: false,
+                learning_ends_secs: 1_800_604_800,
+                learned_since_secs: 1_800_000_000,
+                goes_anywhere: false,
+                goes_anywhere_choice: GoesAnywhereChoice::Auto,
+                recognised_browser: false,
+                sites: vec![ProfileItemView {
+                    value: String::from("chat.example"),
+                    last_seen_secs: 1_800_700_000,
+                    state: String::from("learned"),
+                }],
+                companies: Vec::new(),
+                countries: vec![ProfileItemView {
+                    value: String::from("RU"),
+                    last_seen_secs: 1_800_700_000,
+                    state: String::from("pending"),
+                }],
+                usual_sent_per_hour: Some(12_000),
+                busiest_sent_per_hour: Some(90_000),
+                active_hours,
+            }),
+        });
+        round_trip(Response::Profile { profile: None });
+        round_trip(Response::ProfileReset {});
+        let json = r#"{"type":"set_goes_anywhere","path":"x","value":"sometimes"}"#;
+        assert!(serde_json::from_str::<Request>(json).is_err());
     }
 
     #[test]
