@@ -342,6 +342,8 @@ export function demoResetProfile(path: string, app: string): boolean {
 }
 
 export function demoGoesAnywhere(path: string, choice: GoesAnywhereChoice): ProfileView | null {
+  const widens = choice === 'on' || (choice === 'auto' && !!demoProfile(path)?.recognised_browser);
+  if (widens && !window.confirm('Demo: treat every site as normal for this app?')) return null;
   demoProfiles = demoProfiles.map((p) =>
     p.path.toLowerCase() === path.toLowerCase()
       ? {

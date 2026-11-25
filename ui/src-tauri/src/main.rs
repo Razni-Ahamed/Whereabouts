@@ -226,9 +226,9 @@ async fn delete_history(
         let confirmed = whereabouts_win_dialog::confirm(
             main_window(&app),
             "Delete everything Whereabouts saved?",
-            "All saved connection history and hourly totals will be deleted and overwritten. \
-             This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards. \
-             Behaviour profiles are kept. Reset them on the Apps screen, or use Delete everything.",
+            "All saved connection history, hourly totals and behaviour profiles (what each app \
+             normally uses) will be deleted and overwritten. This cannot be undone.\n\nWhereabouts \
+             keeps recording new connections afterwards.",
             "Delete everything",
         );
         if !confirmed {
@@ -452,7 +452,8 @@ async fn reset_profile(
             "Reset what Whereabouts learned?",
             &format!(
                 "{name} will start a new 7-day learning period. Until then you'll get no behaviour \
-                 warnings for it."
+                 warnings for it.\n\nProgram file: {}",
+                display_safe(&path)
             ),
             "Reset",
         );
@@ -476,10 +477,42 @@ async fn reset_profile(
 async fn set_goes_anywhere(
     path: String,
     value: GoesAnywhereChoice,
+    app: tauri::AppHandle,
     connection: tauri::State<'_, Arc<Connection>>,
 ) -> Result<Option<ProfileView>, Problem> {
     let connection = Arc::clone(&connection);
     blocking(move || {
+        // Widening what counts as normal silences warnings, so it is
+        // confirmed natively. Whether Auto widens is asked of the service,
+        // not taken from the web view.
+        let widens = match value {
+            GoesAnywhereChoice::On => true,
+            GoesAnywhereChoice::Off => false,
+            GoesAnywhereChoice::Auto => connection.with(|client| {
+                match client.ask(&Request::Profile { path: path.clone() })? {
+                    Response::Profile { profile } => {
+                        Ok(profile.is_some_and(|p| p.recognised_browser))
+                    }
+                    other => Err(unexpected(&other)),
+                }
+            })?,
+        };
+        if widens {
+            // Cancel is the default: Enter must not silence warnings.
+            let confirmed = whereabouts_win_dialog::confirm(
+                main_window(&app),
+                &format!("Treat every site as normal for {}?", program_name(&path)),
+                &format!(
+                    "Whereabouts will stop warning about new sites, companies and countries for \
+                     this program:\n\n{}",
+                    display_safe(&path)
+                ),
+                "Treat as normal",
+            );
+            if !confirmed {
+                return Ok(None);
+            }
+        }
         connection.with(|client| {
             let request = Request::SetGoesAnywhere {
                 path: path.clone(),
@@ -643,8 +676,9 @@ async fn set_save_history(
                 .message(
                     "Whereabouts will still show live connections, raise alerts and block what \
                      you choose. But finished connections will no longer be saved, so the \
-                     History view and Export get nothing new, and per-app learning (coming in \
-                     version 0.3) has nothing to learn from.\n\nWhat should happen to the \
+                     History view and Export get nothing new. Learning what is normal for each \
+                     app works either way, and behaviour profiles are kept. Reset them on the \
+                     Apps screen, or use Delete everything.\n\nWhat should happen to the \
                      history saved so far? If you keep it, it is deleted as it ages: each \
                      connection after 30 days, hourly totals after 180 days.",
                 )

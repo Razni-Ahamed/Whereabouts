@@ -4,6 +4,7 @@
   import BlockMenu from '../lib/components/BlockMenu.svelte';
   import { appKey } from '../lib/apps';
   import { appLabel } from '../lib/format';
+  import { isIpLiteral } from '../lib/host';
   import { alertTitle, reasonText } from '../lib/reasons';
   import { store } from '../lib/state.svelte';
   import type { AlertView, FlowView } from '../lib/types';
@@ -81,11 +82,6 @@
     return site?.value ?? null;
   }
 
-  /** Whether `host` is an IPv4 or IPv6 address, not a host name (an address cannot be blocked as a site). */
-  function isIpLiteral(host: string): boolean {
-    const bare = host.replace(/^\[|\]$/g, '');
-    return /^\d{1,3}(\.\d{1,3}){3}$/.test(bare) || (bare.includes(':') && /^[0-9a-f:.]+$/i.test(bare));
-  }
 
   /** A stand-in connection, so the Block… picker can offer its choices. `site` makes it about one domain. */
   function asFlow(alert: AlertView, site: string | null = null): FlowView {

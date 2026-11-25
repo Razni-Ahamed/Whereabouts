@@ -17,21 +17,33 @@
 
   let view = $state<ProfileView | null>(null);
   let loaded = $state(false);
+  /** Why the profile could not be read, shown in the panel with a Try again. */
+  let failure = $state<string | null>(null);
   let busy = $state(false);
   let showAll = $state<Record<Section, boolean>>({ sites: false, companies: false, countries: false });
 
-  // Load again whenever another app is picked; ignore answers that arrive late.
-  $effect(() => {
+  /** Reads the profile; an answer that arrives after another app was picked is ignored. */
+  async function load() {
     const wanted = path;
+    failure = null;
+    const result = await loadProfile(wanted);
+    if (wanted !== path) return;
+    if (result.ok) {
+      view = result.value;
+    } else {
+      view = null;
+      failure = result.problem.message;
+    }
+    loaded = true;
+  }
+
+  // Load again whenever another app is picked.
+  $effect(() => {
+    void path;
     view = null;
     loaded = false;
     showAll = { sites: false, companies: false, countries: false };
-    loadProfile(wanted).then((result) => {
-      if (wanted !== path) return;
-      if (result.ok) view = result.value;
-      else store.showNote({ text: result.problem.message, tone: 'bad' });
-      loaded = true;
-    });
+    void load();
   });
 
   const date = (secs: number) =>
@@ -43,8 +55,9 @@
     if (!result.ok) store.showNote({ text: result.problem.message, tone: 'bad' });
     else if (result.value) {
       store.showNote({ text: 'Learning again from now.', tone: 'good' });
-      const fresh = await loadProfile(path);
-      if (fresh.ok) view = fresh.value;
+      view = null;
+      loaded = false;
+      await load();
     }
     busy = false;
   }
@@ -53,7 +66,8 @@
     busy = true;
     const result = await setGoesAnywhere(path, choice);
     if (!result.ok) store.showNote({ text: result.problem.message, tone: 'bad' });
-    else if (result.value) view = result.value;
+    if (result.ok && result.value) view = result.value;
+    else await load(); // cancelled or failed: show the real state, not the switch as flipped
     busy = false;
   }
 
@@ -76,6 +90,9 @@
 
   {#if !loaded}
     <p class="muted">Loading…</p>
+  {:else if failure}
+    <p class="muted">{failure}</p>
+    <div><button class="btn btn-ghost reset" type="button" onclick={load}>Try again</button></div>
   {:else if !view}
     <p class="muted">Nothing learned yet. Whereabouts starts learning when this app next uses the network.</p>
   {:else}
@@ -117,7 +134,7 @@
       {#if view.usual_sent_per_hour !== null}
         <p>
           Usually sends about <b class="num">{bytes(view.usual_sent_per_hour)}</b> an hour{#if view.busiest_sent_per_hour !== null}
-            (busiest hour <b class="num">{bytes(view.busiest_sent_per_hour)}</b>){/if}.
+            {' '}(busiest hour <b class="num">{bytes(view.busiest_sent_per_hour)}</b>){/if}.
         </p>
       {:else}
         <p class="muted">No active hours yet.</p>

@@ -186,7 +186,11 @@ export async function resetProfile(path: string, app: string): Promise<Result<bo
   return call<boolean>('reset_profile', { path });
 }
 
-/** Sets whether a program is expected to connect anywhere (a browser). The updated profile. */
+/**
+ * Sets whether a program is expected to connect anywhere (a browser).
+ * Widening it is confirmed in a native Windows dialog. The updated profile,
+ * or `null` if the user said no.
+ */
 export async function setGoesAnywhere(path: string, value: GoesAnywhereChoice): Promise<Result<ProfileView | null>> {
   if (isDemo) return { ok: true, value: demoGoesAnywhere(path, value) };
   return call<ProfileView | null>('set_goes_anywhere', { path, value });
