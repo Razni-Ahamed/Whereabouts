@@ -34,7 +34,7 @@ export function reasonText(r: ReasonView): string {
     case 'random_name':
       return present(r.value) ? `Used a random-looking name: ${r.value}` : 'Used a random-looking name.';
     case 'binary_changed':
-      return 'Its program file changed and lost its signature, and it reached somewhere new.';
+      return 'Its program file changed and is no longer signed by the same publisher, and it reached somewhere new.';
     default:
       return 'Unusual behaviour';
   }

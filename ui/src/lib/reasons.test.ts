@@ -46,7 +46,7 @@ test('describes the other signals', () => {
   );
   assert.equal(
     reasonText(reason({ signal: 'binary_changed' })),
-    'Its program file changed and lost its signature, and it reached somewhere new.',
+    'Its program file changed and is no longer signed by the same publisher, and it reached somewhere new.',
   );
 });
 
