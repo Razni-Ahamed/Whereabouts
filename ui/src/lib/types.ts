@@ -105,7 +105,20 @@ export interface Rules {
 }
 
 export type Severity = 'info' | 'medium' | 'high' | 'critical';
-export type AlertKind = 'tracker' | 'bad_network' | 'faked_dns' | 'unattributed';
+export type AlertKind = 'tracker' | 'bad_network' | 'faked_dns' | 'unattributed' | 'behaviour';
+
+/** One reason behind a behaviour alert. */
+export interface ReasonView {
+  /** new_site, new_company, new_country, upload_spike, ratio_flip, beaconing, unusual_time, random_name or binary_changed. */
+  signal: string;
+  /** The domain, company, country code or hour concerned. */
+  value: string | null;
+  /** What was seen (e.g. bytes sent in the hour). */
+  observed: number | null;
+  /** What is usual for this app. */
+  usual: number | null;
+  count: number | null;
+}
 
 export interface AlertView {
   id: number;
@@ -122,6 +135,10 @@ export interface AlertView {
   dismissed: boolean;
   /** Whether "this is fine" also stops alerts like it. */
   can_allow: boolean;
+  /** Why a behaviour alert was raised. Missing from older services. */
+  reasons?: ReasonView[];
+  /** How many more times it happened after the alert was raised. Missing from older services. */
+  seen_again?: number;
 }
 
 /** The app's own settings (per Windows user). */

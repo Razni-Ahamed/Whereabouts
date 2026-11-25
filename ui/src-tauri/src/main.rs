@@ -432,8 +432,8 @@ async fn alerts(
 }
 
 /// Marks an alert as seen and fine; with `allow`, alerts like it stop.
-/// Stopping alerts about a risky network is confirmed in a native Windows
-/// dialog first, so the web view cannot silence them on its own. `false` if
+/// Stopping alerts about a risky network, or after a high behaviour alert, is
+/// confirmed in a native Windows dialog first, so the web view cannot silence them on its own. `false` if
 /// the user said no.
 #[tauri::command]
 async fn dismiss_alert(
@@ -463,21 +463,33 @@ async fn dismiss_alert(
                     .as_deref()
                     .or(alert.app.as_deref())
                     .map_or_else(|| String::from("this app"), display_safe);
-                let target = alert
-                    .detail
-                    .as_deref()
-                    .or(alert.target.as_deref())
-                    .map_or_else(|| String::from("this network"), display_safe);
                 // Cancel is the default: Enter must not silence a warning.
-                let confirmed = whereabouts_win_dialog::confirm(
-                    main_window(&app),
-                    "Stop these warnings?",
-                    &format!(
-                        "Whereabouts will no longer warn you when this program connects to this \
-                         network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
-                    ),
-                    "Stop these warnings",
-                );
+                let confirmed = if alert.kind == whereabouts_ipc::AlertKind::Behaviour {
+                    whereabouts_win_dialog::confirm(
+                        main_window(&app),
+                        "Treat this as normal?",
+                        &format!(
+                            "Whereabouts will stop warning you about these destinations for \
+                             this program:\n\n{program}\n\nOnly do this if you trust it."
+                        ),
+                        "Treat as normal",
+                    )
+                } else {
+                    let target = alert
+                        .detail
+                        .as_deref()
+                        .or(alert.target.as_deref())
+                        .map_or_else(|| String::from("this network"), display_safe);
+                    whereabouts_win_dialog::confirm(
+                        main_window(&app),
+                        "Stop these warnings?",
+                        &format!(
+                            "Whereabouts will no longer warn you when this program connects to \
+                             this network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
+                        ),
+                        "Stop these warnings",
+                    )
+                };
                 if !confirmed {
                     return Ok(false);
                 }

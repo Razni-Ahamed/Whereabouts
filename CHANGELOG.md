@@ -13,6 +13,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 - Detection: Whereabouts can now learn each app's usual behaviour from its traffic and raise explained alerts when it changes: signals within 10 minutes combine into one alert, and a warning that's still waiting for you is updated ("seen again") instead of repeated. Not switched on yet.
 - Service: the service now learns each app's usual behaviour from its live traffic, also while history saving is off, and on first start after the upgrade from the history already saved. Behaviour profiles age out on their own and are cleared by "Delete everything". Programs whose file is not known are never profiled.
 - Service: behaviour alerts now reach the app as their own kind, with the reasons behind them and how often they were seen again. The app (and `--profile <path>` on the command line) can show what Whereabouts learned is usual for a program; resetting a profile, saying a program goes anywhere, and "this is fine" need the Whereabouts app or administrator rights, so a program can't do them for itself. "This is fine" also works after a restart, and on an alert from before a reset it only marks the alert seen. `--status` reports whether learning is starting, ready or paused.
+- App: the Alerts screen now shows behaviour alerts with the reasons in plain words (what was new or unusual, and how it compares with usual), and lets you block the app or site or treat it as normal.
 
 ## [0.2.1] - 2026-11-24
 

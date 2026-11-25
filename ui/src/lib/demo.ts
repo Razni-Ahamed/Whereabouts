@@ -186,6 +186,8 @@ export function demoSetPaused(paused: boolean): Rules {
 // Demo alerts, kept in memory while the page is open.
 const minute = 60;
 let demoAlertList: AlertView[] = [
+  { id: 8, created_secs: now() - 9 * minute, kind: 'behaviour', severity: 'high', app: 'Discord.exe', path: PATHS['Discord.exe'] ?? null, target: null, detail: null, dismissed: false, can_allow: true, seen_again: 2, reasons: [{ signal: 'upload_spike', value: null, observed: 356_515_840, usual: 5_242_880, count: null }] },
+  { id: 7, created_secs: now() - 21 * minute, kind: 'behaviour', severity: 'medium', app: 'Code.exe', path: PATHS['Code.exe'] ?? null, target: 'RU', detail: null, dismissed: false, can_allow: true, seen_again: 0, reasons: [{ signal: 'new_country', value: 'RU', observed: null, usual: null, count: null }, { signal: 'new_company', value: 'Selectel', observed: null, usual: null, count: null }] },
   { id: 6, created_secs: now() - 4 * minute, kind: 'bad_network', severity: 'high', app: 'updater.exe', path: PATHS['updater.exe'] ?? null, target: '185.215.113.66', detail: '185.215.113.0/24 (SBL549867)', dismissed: false, can_allow: true },
   { id: 5, created_secs: now() - 38 * minute, kind: 'faked_dns', severity: 'medium', app: null, path: null, target: null, detail: '3 events', dismissed: false, can_allow: false },
   { id: 4, created_secs: now() - 52 * minute, kind: 'tracker', severity: 'info', app: 'chrome.exe', path: PATHS['chrome.exe'] ?? null, target: 'google-analytics.com', detail: 'Google', dismissed: false, can_allow: true },
