@@ -675,6 +675,68 @@ fn allowed_pending_value_is_known_in_store_and_cache() {
 }
 
 #[test]
+fn this_is_fine_after_a_restart_uses_the_saved_reasons() {
+    let mut db = TestStore::open("allow-restart");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let id = {
+        let mut before = Learner::new(Toggles::default(), 0);
+        before.finished(&russia(T0), &e, &mut db, at(T0))[0].id
+    };
+    // The service restarted: this Learner never saw the alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
+    learner
+        .alert_closed(&mut db, id, true, at(T0 + 60))
+        .unwrap();
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Allowed)
+    );
+    // Only pending items it named change.
+    assert_eq!(
+        state(&db, ItemKind::Country, "DE"),
+        Some(ItemState::Learned)
+    );
+    // The cache agrees: RU is known, so a swapped program going there is
+    // not new behaviour.
+    let secs = T0 + HOUR;
+    let swapped = Finished {
+        app: unsigned(),
+        ..russia(secs)
+    };
+    assert!(learner.finished(&swapped, &e, &mut db, at(secs)).is_empty());
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn this_is_fine_after_a_reset_allows_nothing() {
+    let mut db = TestStore::open("allow-after-reset");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let id = Learner::new(Toggles::default(), 0).finished(&russia(T0), &e, &mut db, at(T0))[0].id;
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(learner.reset(&mut db, &key(), at(T0 + 60)).unwrap());
+    // RU waits on a newer alert by now.
+    db.save_items(
+        &key(),
+        &[ProfileItem {
+            state: ItemState::Pending,
+            ..item(ItemKind::Country, "RU")
+        }],
+    )
+    .unwrap();
+    learner
+        .alert_closed(&mut db, id, true, at(T0 + 120))
+        .unwrap();
+    assert_eq!(
+        state(&db, ItemKind::Country, "RU"),
+        Some(ItemState::Pending)
+    );
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
 fn reset_drops_traffic_not_yet_written() {
     let mut db = TestStore::open("reset-hour");
     seed(&mut db, GoesAnywhere::Auto, &[]);

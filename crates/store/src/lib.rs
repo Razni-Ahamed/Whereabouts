@@ -21,7 +21,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, ErrorCode, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use whereabouts_core::dns::LabelSource;
 use whereabouts_core::model::{Protocol, Signature};
 
@@ -417,66 +417,36 @@ impl Store {
     /// look (above info) first, then the rest, each newest first. So many
     /// info alerts can never push a serious one out of the list.
     pub fn alerts(&self, since: SystemTime, limit: usize) -> Result<Vec<StoredAlert>, StoreError> {
-        let mut query = self.conn.prepare(
-            "SELECT id, created, kind, severity, app_name, app_path, target, detail, dismissed, \
-             allow_key IS NOT NULL, reasons, seen_again FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2",
-        )?;
+        let mut query = self.conn.prepare(&format!(
+            "SELECT {ALERT_COLUMNS} FROM alerts WHERE created >= ?1              ORDER BY severity = 'info', id DESC LIMIT ?2"
+        ))?;
         let rows = query.query_map(
             params![unix_ms(since), i64::try_from(limit).unwrap_or(i64::MAX)],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, bool>(8)?,
-                    row.get::<_, bool>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, u32>(11)?,
-                ))
-            },
+            read_alert,
         )?;
         let mut alerts = Vec::new();
         for row in rows {
-            let (
-                id,
-                created,
-                kind,
-                severity,
-                app_name,
-                app_path,
-                target,
-                detail,
-                dismissed,
-                can_allow,
-                reasons,
-                seen_again,
-            ) = row?;
-            let (Some(kind), Some(severity)) =
-                (AlertKind::parse(&kind), Severity::parse(&severity))
-            else {
-                continue;
-            };
-            alerts.push(StoredAlert {
-                id,
-                created: from_unix_ms(created),
-                kind,
-                severity,
-                app_name,
-                app_path,
-                target,
-                detail,
-                dismissed,
-                can_allow,
-                reasons: reasons_from_json(&reasons),
-                seen_again,
-            });
+            // An alert of a kind or severity this version does not know is
+            // left out.
+            if let Some(alert) = row? {
+                alerts.push(alert);
+            }
         }
         Ok(alerts)
+    }
+
+    /// One alert by its ID, or `None` if there is no such alert (or it is
+    /// of a kind or severity this version does not know).
+    pub fn alert(&self, id: i64) -> Result<Option<StoredAlert>, StoreError> {
+        let alert = self
+            .conn
+            .query_row(
+                &format!("SELECT {ALERT_COLUMNS} FROM alerts WHERE id = ?1"),
+                [id],
+                read_alert,
+            )
+            .optional()?;
+        Ok(alert.flatten())
     }
 
     /// Marks an alert as seen and fine. With `allow`, alerts like it (same
@@ -1051,6 +1021,35 @@ fn reasons_to_json(reasons: &[Reason]) -> String {
 /// Reasons from their stored text; text that cannot be read gives none.
 fn reasons_from_json(text: &str) -> Vec<Reason> {
     serde_json::from_str(text).unwrap_or_default()
+}
+
+/// The columns [`read_alert`] reads, in order.
+const ALERT_COLUMNS: &str = "id, created, kind, severity, app_name, app_path, target, detail,                              dismissed, allow_key IS NOT NULL, reasons, seen_again";
+
+/// One alert from a row of [`ALERT_COLUMNS`]; `None` if its kind or severity
+/// is not known to this version.
+fn read_alert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<StoredAlert>> {
+    let kind: String = row.get(2)?;
+    let severity: String = row.get(3)?;
+    let (Some(kind), Some(severity)) = (AlertKind::parse(&kind), Severity::parse(&severity))
+    else {
+        return Ok(None);
+    };
+    let reasons: String = row.get(10)?;
+    Ok(Some(StoredAlert {
+        id: row.get(0)?,
+        created: from_unix_ms(row.get(1)?),
+        kind,
+        severity,
+        app_name: row.get(4)?,
+        app_path: row.get(5)?,
+        target: row.get(6)?,
+        detail: row.get(7)?,
+        dismissed: row.get(8)?,
+        can_allow: row.get(9)?,
+        reasons: reasons_from_json(&reasons),
+        seen_again: row.get(11)?,
+    }))
 }
 
 /// Schema version 5 (Whereabouts 0.3): alerts get reasons, and per-app
@@ -2160,6 +2159,22 @@ mod tests {
         let alerts = store.alerts(UNIX_EPOCH, 10).unwrap();
         assert_eq!(alerts[0].kind, AlertKind::Behaviour);
         assert_eq!(alerts[0].reasons, reasons);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn one_alert_is_read_by_its_id() {
+        let path = temp_db("one-alert");
+        let mut store = Store::open(&path, &key(4)).unwrap();
+        let id = store
+            .add_alert(&behaviour_alert(vec![country("RU")]), at(10))
+            .unwrap()
+            .unwrap();
+        let alert = store.alert(id).unwrap().expect("saved");
+        assert_eq!(alert, store.alerts(UNIX_EPOCH, 10).unwrap()[0]);
+        assert_eq!(alert.created, at(10));
+        assert_eq!(alert.reasons, [country("RU")]);
+        assert_eq!(store.alert(id + 1).unwrap(), None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

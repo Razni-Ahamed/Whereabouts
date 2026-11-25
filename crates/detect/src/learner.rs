@@ -29,8 +29,8 @@ use std::time::SystemTime;
 
 use whereabouts_enrich::Enricher;
 use whereabouts_store::{
-    GoesAnywhere, HourRow, ItemKind, ItemState, PROFILE_HOURS_KEPT, ProfileItem, ProfileRow,
-    Reason, Severity, Signal, Store, StoreError, StoredProfile, known_app_key,
+    AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, PROFILE_HOURS_KEPT, ProfileItem,
+    ProfileRow, Reason, Severity, Signal, Store, StoreError, StoredProfile, known_app_key,
 };
 
 use crate::beacon::BeaconTracker;
@@ -507,7 +507,10 @@ impl Learner {
     /// way. With `allowed` ("this is fine"), the pending destinations it
     /// named become allowed, in the store and here. Otherwise (dismiss:
     /// "remind me") they stay pending, and the next sighting of each raises
-    /// a new alert. Only alerts raised since this Learner started are known.
+    /// a new alert. For an alert raised before this Learner started (the
+    /// service restarted), the destinations come from the alert's saved
+    /// reasons: those still pending become allowed, unless the profile was
+    /// reset after the alert, so the alert's destinations are gone.
     /// The caller still saves the alert's allow key (`Store::dismiss_alert`).
     pub fn alert_closed(
         &mut self,
@@ -516,9 +519,12 @@ impl Learner {
         allowed: bool,
         _now: SystemTime,
     ) -> Result<(), StoreError> {
-        let named = self.alerts.close(alert_id, allowed);
+        let mut named = self.alerts.close(alert_id, allowed);
         if !allowed {
             return Ok(());
+        }
+        if named.is_empty() {
+            named = pending_named_by_saved(store, alert_id)?;
         }
         let mut result = Ok(());
         for (key, kind, value) in named {
@@ -645,6 +651,46 @@ impl Learner {
         self.profiles.insert(key.to_owned(), Profile { stored });
         true
     }
+}
+
+/// The destinations a saved behaviour alert named that are still pending in
+/// its app's profile, as `(app key, kind, value)`. None if there is no such
+/// alert or profile, or the profile was reset after the alert was raised.
+fn pending_named_by_saved(
+    store: &Store,
+    alert_id: i64,
+) -> Result<Vec<(String, ItemKind, String)>, StoreError> {
+    let Some(alert) = store.alert(alert_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(path) = alert
+        .app_path
+        .filter(|_| alert.kind == AlertKind::Behaviour)
+    else {
+        return Ok(Vec::new());
+    };
+    let key = known_app_key(&path);
+    let Some(stored) = store.profile(&key)? else {
+        return Ok(Vec::new());
+    };
+    if stored
+        .row
+        .reset_at
+        .is_some_and(|reset| reset > alert.created)
+    {
+        return Ok(Vec::new());
+    }
+    let profile = Profile { stored };
+    let mut named = Vec::new();
+    for reason in &alert.reasons {
+        if let (Some(kind), Some(value)) = (item_kind(reason.signal), reason.value.as_deref())
+            && profile.pending(kind, value)
+            && !named.iter().any(|(_, k, v)| *k == kind && v == value)
+        {
+            named.push((key.clone(), kind, value.to_owned()));
+        }
+    }
+    Ok(named)
 }
 
 /// The kinds of destination behind medium-or-higher reasons.
