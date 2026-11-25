@@ -562,14 +562,11 @@ async fn dismiss_alert(
     let connection = Arc::clone(&connection);
     blocking(move || {
         if allow {
-            let alert = connection.with(|client| {
-                match client.ask(&Request::Alerts {
-                    hours: MAX_HOURS,
-                    limit: MAX_ROWS,
-                })? {
-                    Response::Alerts { alerts } => Ok(alerts.into_iter().find(|a| a.id == id)),
-                    other => Err(unexpected(&other)),
-                }
+            // Asked by ID: the alert list is trimmed to fit a message, so an
+            // alert on screen may be missing from it.
+            let alert = connection.with(|client| match client.ask(&Request::Alert { id })? {
+                Response::Alert { alert } => Ok(alert),
+                other => Err(unexpected(&other)),
             })?;
             let Some(alert) = alert else {
                 return Err(Problem::other("That alert no longer exists."));

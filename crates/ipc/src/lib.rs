@@ -137,6 +137,12 @@ pub enum Request {
         /// Most alerts to return; clamped to [`MAX_ROWS`].
         limit: u32,
     },
+    /// One saved alert by its ID, however old. Answered with
+    /// [`Response::Alert`] (`None` if there is no such alert).
+    Alert {
+        /// The alert's ID.
+        id: i64,
+    },
     /// Turns list updates on or off (both are off until the user chooses).
     SetListUpdates {
         /// Whereabouts' signed data updates.
@@ -503,6 +509,11 @@ pub enum Response {
     Alerts {
         /// The alerts, newest first.
         alerts: Vec<AlertView>,
+    },
+    /// Answer to [`Request::Alert`].
+    Alert {
+        /// The alert, or `None` if there is no such alert.
+        alert: Option<AlertView>,
     },
     /// Answer to [`Request::DismissAlert`].
     AlertDismissed {},
@@ -938,6 +949,31 @@ mod tests {
             }
         );
         assert!(Severity::Critical > Severity::Medium);
+    }
+
+    #[test]
+    fn one_alert_round_trips() {
+        round_trip(Request::Alert { id: 3 });
+        round_trip(Response::Alert {
+            alert: Some(AlertView {
+                id: 3,
+                created_secs: 1_800_000_000,
+                kind: AlertKind::Behaviour,
+                severity: Severity::Info,
+                app: Some(String::from("chat.exe")),
+                path: Some(String::from(r"C:\Apps\chat.exe")),
+                target: Some(String::from("03")),
+                detail: None,
+                dismissed: false,
+                can_allow: true,
+                reasons: Vec::new(),
+                seen_again: 0,
+                dropped_reasons: 0,
+            }),
+        });
+        round_trip(Response::Alert { alert: None });
+        let json = r#"{"type":"alert","id":3,"hours":1}"#;
+        assert!(serde_json::from_str::<Request>(json).is_err());
     }
 
     #[test]

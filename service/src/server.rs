@@ -420,6 +420,7 @@ fn changes_something(request: &Request) -> bool {
         | Request::ExportPage { .. }
         | Request::ListRules {}
         | Request::Alerts { .. }
+        | Request::Alert { .. }
         | Request::Notices { .. }
         | Request::Profile { .. } => false,
     }
@@ -501,6 +502,10 @@ fn answer(
         }
         Request::Alerts { hours, limit } => match open_store(store) {
             Ok(store) => alerts(store, hours, limit),
+            Err(response) => *response,
+        },
+        Request::Alert { id } => match open_store(store) {
+            Ok(store) => alert(store, id),
             Err(response) => *response,
         },
         Request::DismissAlert { id, allow } => match open_store(store) {
@@ -704,6 +709,18 @@ fn alerts(store: &Store, hours: u32, limit: u32) -> Response {
         }
         Err(error) => Response::Error {
             message: format!("could not read the alerts: {error}"),
+        },
+    }
+}
+
+/// One alert by its ID, read from the connection's own store.
+fn alert(store: &Store, id: i64) -> Response {
+    match store.alert(id) {
+        Ok(alert) => Response::Alert {
+            alert: alert.map(crate::alerts::view),
+        },
+        Err(error) => Response::Error {
+            message: format!("could not read the alert: {error}"),
         },
     }
 }
@@ -1584,6 +1601,33 @@ mod tests {
         assert!(matches!(none, Response::Error { .. }), "{none:?}");
         lock(&state).commands = None;
         engine.join().unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn one_alert_is_read_by_anyone_from_the_store() {
+        let (mut saved, dir) = temp_store("one-alert");
+        let id = seed_pending_ru(&mut saved);
+        assert!(!changes_something(&Request::Alert { id }));
+        // No engine: the connection's own store answers.
+        let state = shared(0);
+        let mut store = Some(saved);
+        let tool = Client::Tool { elevated: false };
+        let Response::Alert { alert: Some(alert) } =
+            answer(Request::Alert { id }, &state, &mut store, tool)
+        else {
+            panic!("no alert");
+        };
+        assert_eq!(alert.id, id);
+        assert_eq!(alert.kind, whereabouts_ipc::AlertKind::Behaviour);
+        assert_eq!(alert.severity, whereabouts_ipc::Severity::Medium);
+        assert_eq!(alert.path.as_deref(), Some(PATH));
+        assert!(!alert.dismissed);
+        assert_eq!(
+            answer(Request::Alert { id: id + 1 }, &state, &mut store, tool),
+            Response::Alert { alert: None }
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
