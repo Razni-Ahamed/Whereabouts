@@ -42,7 +42,7 @@ fn choice_view(value: GoesAnywhere) -> GoesAnywhereChoice {
 /// not keep: a publisher saved with the profile counts as a valid
 /// signature from that publisher (the Learner saves one only for a valid
 /// signature). Whether the file is installed by administrators is checked
-/// now; an error counts as no.
+/// now, for a file on a local drive only; an error counts as no.
 pub fn view(
     store: &Store,
     path: &str,
@@ -55,8 +55,10 @@ pub fn view(
     let profile = Profile::new(stored);
     let row = &profile.stored().row;
     let publisher = row.last_publisher.as_deref();
-    let installed =
-        whereabouts_win_secrets::installed_by_administrators(Path::new(&row.path)).unwrap_or(false);
+    // A network path could keep the pipe's thread waiting: it counts as no.
+    let installed = is_local_drive_path(&row.path)
+        && whereabouts_win_secrets::installed_by_administrators(Path::new(&row.path))
+            .unwrap_or(false);
     let recognised_browser = auto_goes_anywhere(
         program_file_name(&row.path),
         publisher,
@@ -90,6 +92,24 @@ pub fn view(
     };
     fit(&mut view);
     Ok(Some(view))
+}
+
+/// Whether `path` is on a local drive: a drive path (`C:\…`, also written
+/// `\\?\C:\…`), not a network (UNC or WebDAV) or device path, which Windows
+/// may take long to open.
+fn is_local_drive_path(path: &str) -> bool {
+    if path.starts_with("//") {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix(r"\\") else {
+        return true;
+    };
+    let rest = rest.as_bytes();
+    rest.len() >= 5
+        && rest[..2] == *br"?\"
+        && rest[2].is_ascii_alphabetic()
+        && rest[3] == b':'
+        && rest[4] == b'\\'
 }
 
 /// One kind of the profile's destinations, newest first, at most
@@ -163,6 +183,17 @@ mod tests {
         assert_eq!(median(&[5.0]), Some(5.0));
         assert_eq!(median(&[1.0, 2.0, 10.0]), Some(2.0));
         assert_eq!(median(&[1.0, 2.0, 4.0, 10.0]), Some(3.0));
+    }
+
+    #[test]
+    fn only_local_drive_paths_are_opened() {
+        assert!(is_local_drive_path(r"C:\Program Files\x.exe"));
+        assert!(is_local_drive_path(r"\\?\C:\Program Files\x.exe"));
+        assert!(!is_local_drive_path(r"\\server\share\x.exe"));
+        assert!(!is_local_drive_path(r"\\?\UNC\server\share\x.exe"));
+        assert!(!is_local_drive_path(r"\\.\pipe\x"));
+        assert!(!is_local_drive_path(r"\\?\"));
+        assert!(!is_local_drive_path("//server/share/x.exe"));
     }
 
     #[test]
