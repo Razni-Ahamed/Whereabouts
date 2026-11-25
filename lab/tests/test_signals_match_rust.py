@@ -7,7 +7,11 @@ from pathlib import Path
 
 from wlab import report
 
-SIGNALS_RS = Path(__file__).resolve().parents[2] / "crates" / "detect" / "src" / "signals.rs"
+ROOT = Path(__file__).resolve().parents[2]
+SIGNALS_RS = ROOT / "crates" / "detect" / "src" / "signals.rs"
+# The severity table lives with the store's `Signal` (`Signal::severity`), so
+# the store can keep an alert's most severe reasons; `severity_of` uses it.
+REASONS_RS = ROOT / "crates" / "store" / "src" / "reasons.rs"
 
 
 def snake(name: str) -> str:
@@ -31,10 +35,11 @@ def body(text: str, start: str) -> str:
 
 
 def test_severities_match_severity_of():
-    arms = re.findall(r"((?:\|?\s*Signal::\w+\s*)+)=>\s*Severity::(\w+)",
-                      body(rust_source(), "pub fn severity_of"))
+    assert "signal.severity()" in body(rust_source(), "pub fn severity_of")
+    arms = re.findall(r"((?:\|?\s*Self::\w+\s*)+)=>\s*\{?\s*Severity::(\w+)",
+                      body(REASONS_RS.read_text(encoding="utf-8"), "pub fn severity(self)"))
     rust = {snake(signal): severity.lower()
-            for signals, severity in arms for signal in re.findall(r"Signal::(\w+)", signals)}
+            for signals, severity in arms for signal in re.findall(r"Self::(\w+)", signals)}
     assert len(rust) == 9
     assert report.SIGNAL_SEVERITY == rust
     assert set(report.SIGNALS) == set(rust)
