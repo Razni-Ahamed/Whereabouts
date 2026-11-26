@@ -585,10 +585,12 @@ impl Learner {
     /// been running: to the newest open behaviour alert naming each (keeping
     /// its "seen again" count), or, when the user already closed that alert,
     /// to a reminder ("remind me"), as is one any closed alert names. A
-    /// destination no alert names may be one whose reason the alert dropped
-    /// (it keeps only so many): it waits on the newest open alert that
-    /// dropped reasons and whose window it was first seen in. Links this
-    /// run already holds are kept.
+    /// destination may also be one whose reason an alert dropped (it keeps
+    /// only so many): it waits on the newest open alert that dropped
+    /// reasons and was raised by the time it was last seen, and whose
+    /// window it was first seen in or, after a reminder, that was raised
+    /// after the closed alert's last update. Links this run already holds
+    /// are kept.
     fn relink(&mut self, key: &str, store: &Store) {
         let Some(profile) = self.profiles.get(key) else {
             return;
@@ -632,22 +634,30 @@ impl Learner {
                     item_kind(r.signal) == Some(kind) && r.value.as_deref() == Some(&value)
                 })
             };
+            // An open alert that dropped reasons and was raised by the
+            // time the destination was last seen.
+            let dropping = |alert: &&StoredAlert| {
+                !alert.dismissed && alert.dropped_reasons > 0 && alert.created <= last_seen
+            };
             let naming = since_reset()
                 .filter(|alert| !alert.dismissed)
                 .find(names)
-                .or_else(|| {
-                    if since_reset().any(|alert| alert.dismissed && names(&alert)) {
-                        return None;
+                .or_else(|| match since_reset().find(|a| a.dismissed && names(a)) {
+                    // Reminded: only a sighting after the closed alert's
+                    // last update can have joined (and been dropped by) a
+                    // newer alert; otherwise it raises a new one.
+                    Some(closed) => {
+                        let after = closed.updated.unwrap_or(closed.created);
+                        since_reset().find(|alert| dropping(alert) && alert.created > after)
                     }
-                    since_reset().find(|alert| {
-                        !alert.dismissed
-                            && alert.dropped_reasons > 0
-                            && alert.created <= last_seen
+                    // First seen inside the window of the alert that dropped it.
+                    None => since_reset().find(|alert| {
+                        dropping(alert)
                             && alert
                                 .created
                                 .checked_add(window)
                                 .is_none_or(|end| first_seen < end)
-                    })
+                    }),
                 });
             match naming {
                 Some(alert) => {

@@ -1109,6 +1109,8 @@ pub struct StoredAlert {
     pub seen_again: u32,
     /// Reasons left out because the alert already held [`MAX_REASONS`].
     pub dropped_reasons: u32,
+    /// When it was last updated (reasons added, seen again), if ever.
+    pub updated: Option<SystemTime>,
 }
 
 /// Reasons as stored: JSON text.
@@ -1125,7 +1127,7 @@ fn reasons_from_json(text: &str) -> Vec<Reason> {
 /// The columns [`read_alert`] reads, in order.
 const ALERT_COLUMNS: &str = "id, created, kind, severity, app_name, app_path, target, detail, \
                              dismissed, allow_key IS NOT NULL, reasons, seen_again, \
-                             dropped_reasons";
+                             dropped_reasons, updated";
 
 /// One alert from a row of [`ALERT_COLUMNS`]; `None` if its kind or severity
 /// is not known to this version.
@@ -1150,6 +1152,7 @@ fn read_alert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<StoredAlert>> 
         reasons: reasons_from_json(&reasons),
         seen_again: row.get(11)?,
         dropped_reasons: row.get(12)?,
+        updated: row.get::<_, Option<i64>>(13)?.map(from_unix_ms),
     }))
 }
 
@@ -2433,6 +2436,7 @@ mod tests {
             .add_alert(&behaviour_alert(vec![country("RU")]), at(10))
             .unwrap()
             .unwrap();
+        assert_eq!(store.alert(id).unwrap().unwrap().updated, None);
         let spike = Reason {
             signal: Signal::UploadSpike,
             value: None,
@@ -2458,6 +2462,7 @@ mod tests {
         assert_eq!(alert.reasons.len(), 2);
         assert_eq!(alert.severity, Severity::High);
         assert_eq!(alert.seen_again, 3);
+        assert_eq!(alert.updated, Some(at(30)));
         assert!(
             !store
                 .update_alert(999, &[], Severity::Info, 0, at(40))

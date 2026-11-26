@@ -1377,3 +1377,94 @@ fn dismissing_a_superseded_alert_before_its_profile_is_loaded() {
     assert_eq!(saved.iter().find(|a| a.id == second).unwrap().seen_again, 1);
     assert!(learner.take_errors().is_empty());
 }
+
+#[test]
+fn a_reminded_value_dropped_by_a_newer_alert_counts_on_it_after_a_restart() {
+    let mut db = TestStore::open("reminded-dropped");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let newer = {
+        let mut before = Learner::new(Toggles::default(), 0);
+        // Alert Y names the domain; "remind me".
+        let first = before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+        before
+            .alert_closed(&mut db, first, false, at(T0 + 60))
+            .unwrap();
+        assert!(db.dismiss_alert(first, false, at(T0 + 60)).unwrap());
+        // An hour later alert Z fills up with other random names, and the
+        // domain's next sighting joins it, dropped by the cap.
+        for (n, domain) in random_domains(MAX_REASONS + 1).iter().enumerate().skip(1) {
+            let secs = T0 + HOUR + n as u64;
+            let other = flow(Some(domain), Some("Chat Inc"), Some("DE"), secs);
+            before.finished(&other, &e, &mut db, at(secs));
+        }
+        let secs = T0 + HOUR + 100;
+        assert!(
+            before
+                .finished(&random_flow(secs), &e, &mut db, at(secs))
+                .is_empty()
+        );
+        assert!(before.take_errors().is_empty());
+        let newer = newest(&db);
+        assert!(
+            !newer
+                .reasons
+                .iter()
+                .any(|r| r.value.as_deref() == Some(RANDOM_DOMAIN)),
+            "the cap dropped it"
+        );
+        newer.id
+    };
+    // After a restart, it still counts on Z: no extra alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let secs = T0 + 2 * HOUR;
+    assert!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .is_empty(),
+        "seen again on the newer alert"
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved.iter().find(|a| a.id == newer).unwrap().seen_again, 1);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn a_value_counted_on_its_alert_before_a_reminder_is_not_moved_to_a_newer_one() {
+    let mut db = TestStore::open("counted-then-reminded");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    {
+        let mut before = Learner::new(Toggles::default(), 0);
+        let first = before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+        // A newer alert fills up and drops reasons.
+        for (n, domain) in random_domains(MAX_REASONS + 2).iter().enumerate().skip(1) {
+            let secs = T0 + HOUR + n as u64;
+            let other = flow(Some(domain), Some("Chat Inc"), Some("DE"), secs);
+            before.finished(&other, &e, &mut db, at(secs));
+        }
+        assert!(newest(&db).dropped_reasons > 0);
+        // The domain is seen again meanwhile: it counts on its own alert,
+        // which the user then dismisses ("remind me").
+        let secs = T0 + HOUR + 100;
+        before.finished(&random_flow(secs), &e, &mut db, at(secs));
+        before
+            .alert_closed(&mut db, first, false, at(secs + 60))
+            .unwrap();
+        assert!(db.dismiss_alert(first, false, at(secs + 60)).unwrap());
+        assert!(before.take_errors().is_empty());
+    }
+    // After a restart, the next sighting is a reminder, not a count on the
+    // newer alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let secs = T0 + 2 * HOUR;
+    assert_eq!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .len(),
+        1
+    );
+    assert_eq!(behaviour(&db).len(), 3);
+    assert!(learner.take_errors().is_empty());
+}
