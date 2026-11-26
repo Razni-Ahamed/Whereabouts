@@ -1302,3 +1302,35 @@ fn dismissing_a_superseded_alert_keeps_the_newer_alerts_links() {
     assert_eq!(newer.seen_again, 1);
     assert!(learner.take_errors().is_empty());
 }
+
+#[test]
+fn a_reminder_is_not_folded_into_an_older_alert_with_dropped_reasons() {
+    let mut db = TestStore::open("remind-not-folded");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    {
+        let mut before = Learner::new(Toggles::default(), 0);
+        // An info alert that dropped reasons, never answered.
+        for n in 0..30u64 {
+            let company = format!("Company {n}");
+            let new = flow(Some("chat.example"), Some(&company), Some("DE"), T0 + n);
+            before.finished(&new, &e, &mut db, at(T0 + n));
+        }
+        assert!(behaviour(&db)[0].dropped_reasons > 0);
+        // An hour later a random name raises its own alert: "remind me".
+        let id = before.finished(&random_flow(T0 + HOUR), &e, &mut db, at(T0 + HOUR))[0].id;
+        before
+            .alert_closed(&mut db, id, false, at(T0 + HOUR + 60))
+            .unwrap();
+        assert!(db.dismiss_alert(id, false, at(T0 + HOUR + 60)).unwrap());
+        assert!(before.take_errors().is_empty());
+    }
+    // After a restart, the next sighting is a new medium alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let secs = T0 + 2 * HOUR;
+    let again = learner.finished(&random_flow(secs), &e, &mut db, at(secs));
+    assert_eq!(again.len(), 1, "remind me: a new alert");
+    assert_eq!(again[0].alert.severity, Severity::Medium);
+    assert_eq!(behaviour(&db).len(), 3);
+    assert!(learner.take_errors().is_empty());
+}

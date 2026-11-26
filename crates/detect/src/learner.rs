@@ -25,12 +25,13 @@ mod alerts;
 pub use alerts::COMBINE_WINDOW;
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use whereabouts_enrich::Enricher;
 use whereabouts_store::{
     AlertKind, GoesAnywhere, HourRow, ItemKind, ItemState, PROFILE_HOURS_KEPT, ProfileItem,
-    ProfileRow, Reason, Severity, Signal, Store, StoreError, StoredProfile, known_app_key,
+    ProfileRow, Reason, Severity, Signal, Store, StoreError, StoredAlert, StoredProfile,
+    known_app_key,
 };
 
 use crate::beacon::BeaconTracker;
@@ -580,28 +581,35 @@ impl Learner {
     /// to the alerts waiting on them, as this Learner would hold them had it
     /// been running: to the newest open behaviour alert naming each (keeping
     /// its "seen again" count), or, when the user already closed that alert,
-    /// to a reminder ("remind me"). A destination no open alert names may
-    /// be one whose reason the alert dropped (it keeps only so many): it
-    /// waits on the newest open alert that dropped reasons and was raised
-    /// by the time the destination was last seen. Links this run already
-    /// holds are kept.
+    /// to a reminder ("remind me"), as is one any closed alert names. A
+    /// destination no alert names may be one whose reason the alert dropped
+    /// (it keeps only so many): it waits on the newest open alert that
+    /// dropped reasons and whose window it was first seen in. Links this
+    /// run already holds are kept.
     fn relink(&mut self, key: &str, store: &Store) {
         let Some(profile) = self.profiles.get(key) else {
             return;
         };
-        let pending: Vec<(ItemKind, String, SystemTime)> = profile
+        let pending: Vec<(ItemKind, String, SystemTime, SystemTime)> = profile
             .stored()
             .items
             .iter()
             .filter(|item| item.state == ItemState::Pending)
-            .map(|item| (item.kind, item.value.clone(), item.last_seen))
+            .map(|item| {
+                (
+                    item.kind,
+                    item.value.clone(),
+                    item.first_seen,
+                    item.last_seen,
+                )
+            })
             .collect();
         if pending.is_empty() {
             return;
         }
         let reset = profile.stored().row.reset_at;
-        let open = match store.open_behaviour_alerts(key) {
-            Ok(open) => open,
+        let alerts = match store.behaviour_alerts(key) {
+            Ok(alerts) => alerts,
             Err(error) => {
                 self.errors
                     .push(format!("could not read behaviour alerts: {error}"));
@@ -609,20 +617,34 @@ impl Learner {
             }
         };
         let since_reset = || {
-            open.iter()
+            alerts
+                .iter()
                 .rev()
                 .filter(|alert| reset.is_none_or(|reset| alert.created >= reset))
         };
-        for (kind, value, last_seen) in pending {
-            let naming = since_reset()
-                .find(|alert| {
-                    alert.reasons.iter().any(|r| {
-                        item_kind(r.signal) == Some(kind) && r.value.as_deref() == Some(&value)
-                    })
+        let window = Duration::from_secs(COMBINE_WINDOW);
+        for (kind, value, first_seen, last_seen) in pending {
+            let names = |alert: &&StoredAlert| {
+                alert.reasons.iter().any(|r| {
+                    item_kind(r.signal) == Some(kind) && r.value.as_deref() == Some(&value)
                 })
+            };
+            let naming = since_reset()
+                .filter(|alert| !alert.dismissed)
+                .find(names)
                 .or_else(|| {
-                    since_reset()
-                        .find(|alert| alert.dropped_reasons > 0 && alert.created <= last_seen)
+                    if since_reset().any(|alert| alert.dismissed && names(&alert)) {
+                        return None;
+                    }
+                    since_reset().find(|alert| {
+                        !alert.dismissed
+                            && alert.dropped_reasons > 0
+                            && alert.created <= last_seen
+                            && alert
+                                .created
+                                .checked_add(window)
+                                .is_none_or(|end| first_seen < end)
+                    })
                 });
             match naming {
                 Some(alert) => {

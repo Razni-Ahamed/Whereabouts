@@ -411,11 +411,11 @@ impl Store {
         Ok(u64::try_from(deleted).unwrap_or(0))
     }
 
-    /// The behaviour alerts of one app (by its key, see [`known_app_key`])
-    /// that the user has not marked as seen, oldest first.
-    pub fn open_behaviour_alerts(&self, app_key: &str) -> Result<Vec<StoredAlert>, StoreError> {
+    /// The behaviour alerts of one app (by its key, see [`known_app_key`]),
+    /// seen or not, oldest first.
+    pub fn behaviour_alerts(&self, app_key: &str) -> Result<Vec<StoredAlert>, StoreError> {
         let mut query = self.conn.prepare(&format!(
-            "SELECT {ALERT_COLUMNS} FROM alerts WHERE kind = 'behaviour' AND dismissed = 0 \
+            "SELECT {ALERT_COLUMNS} FROM alerts WHERE kind = 'behaviour' \
              AND lower(app_path) = ?1 ORDER BY id"
         ))?;
         let rows = query.query_map([app_key], read_alert)?;
@@ -2366,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn open_behaviour_alerts_are_listed_per_app() {
+    fn behaviour_alerts_are_listed_per_app() {
         let path = temp_db("open-behaviour");
         let mut store = Store::open(&path, &key(7)).unwrap();
         let first = store
@@ -2380,17 +2380,17 @@ mod tests {
         other.key = String::from("behaviour|c:\\b.exe|1");
         other.app_path = Some(String::from(r"C:\b.exe"));
         store.add_alert(&other, at(30)).unwrap().unwrap();
-        let ids = |store: &Store| -> Vec<i64> {
+        let ids = |store: &Store| -> Vec<(i64, bool)> {
             store
-                .open_behaviour_alerts(r"c:\a.exe")
+                .behaviour_alerts(r"c:\a.exe")
                 .unwrap()
                 .iter()
-                .map(|a| a.id)
+                .map(|a| (a.id, a.dismissed))
                 .collect()
         };
-        assert_eq!(ids(&store), [first, second]);
+        assert_eq!(ids(&store), [(first, false), (second, false)]);
         assert!(store.dismiss_alert(first, false, at(40)).unwrap());
-        assert_eq!(ids(&store), [second]);
+        assert_eq!(ids(&store), [(first, true), (second, false)]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
