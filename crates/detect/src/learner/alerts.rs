@@ -247,17 +247,22 @@ impl Alerts {
         result
     }
 
-    /// The user closed alert `id`. Its window ends. Returns the pending
-    /// destinations linked to it; their links stay until the caller says
-    /// what happens to each ([`Alerts::remind`] or [`Alerts::unlink`]).
-    pub(super) fn close(&mut self, id: i64) -> Vec<(String, ItemKind, String)> {
-        self.windows.retain(|_, window| window.id != id);
-        self.seen_again.remove(&id);
+    /// The pending destinations linked to alert `id`. Their links stay until
+    /// the caller says what happens to each ([`Alerts::remind`] or
+    /// [`Alerts::unlink`]).
+    pub(super) fn linked(&self, id: i64) -> Vec<(String, ItemKind, String)> {
         self.links
             .iter()
             .filter(|(_, link)| **link == Link::Open(id))
             .map(|(named, _)| named.clone())
             .collect()
+    }
+
+    /// The user closed alert `id`: its window ends and its "seen again"
+    /// count is forgotten.
+    pub(super) fn close(&mut self, id: i64) {
+        self.windows.retain(|_, window| window.id != id);
+        self.seen_again.remove(&id);
     }
 
     /// "Remind me": the next sighting of this pending destination raises a
@@ -419,7 +424,8 @@ mod tests {
         alerts.set_link("k", ItemKind::Company, "Acme", 8);
         alerts.mark_today("k", &[reason(Signal::NewCountry, Some("RU"))]);
         alerts.mark_today("k", &[reason(Signal::NewCompany, Some("Acme"))]);
-        let named = alerts.close(7);
+        let named = alerts.linked(7);
+        alerts.close(7);
         assert_eq!(
             named,
             [("k".to_owned(), ItemKind::Country, "RU".to_owned())]

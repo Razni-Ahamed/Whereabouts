@@ -988,6 +988,11 @@ fn allowing_with_a_failing_store_keeps_the_link() {
     let mut learner = Learner::new(Toggles::default(), 0);
     let e = enricher();
     let id = learner.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+    // Seen twice again before the user answers.
+    for secs in [T0 + 20, T0 + 40] {
+        learner.finished(&random_flow(secs), &e, &mut db, at(secs));
+    }
+    assert_eq!(behaviour(&db)[0].seen_again, 2);
 
     drop(db.store.take());
     set_read_only(&path, true);
@@ -996,7 +1001,8 @@ fn allowing_with_a_failing_store_keeps_the_link() {
     set_read_only(&path, false);
     assert!(failed.unwrap().is_err());
 
-    // Still pending, and still linked to its alert: a sighting counts on it.
+    // Still pending, and still linked to its alert: a sighting counts on
+    // it, after the sightings before.
     db.store = Some(Store::open(&path, &store_key).unwrap());
     assert_eq!(
         state(&db, ItemKind::Domain, RANDOM_DOMAIN),
@@ -1010,7 +1016,7 @@ fn allowing_with_a_failing_store_keeps_the_link() {
     );
     let saved = behaviour(&db);
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].seen_again, 1);
+    assert_eq!(saved[0].seen_again, 3);
     // Trying again works.
     learner
         .alert_closed(&mut db, id, true, at(T0 + 2 * HOUR))

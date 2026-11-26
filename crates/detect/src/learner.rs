@@ -501,8 +501,8 @@ impl Learner {
         result
     }
 
-    /// The user closed behaviour alert `alert_id`. Its window ends either
-    /// way. With `allowed` ("this is fine"), the pending destinations it
+    /// The user closed behaviour alert `alert_id`. Its window ends, unless
+    /// this fails. With `allowed` ("this is fine"), the pending destinations it
     /// named become allowed, in the store and here, and every reason in it
     /// that can be allowed (beaconing, random-looking name, unusual time)
     /// gets its lasting allow key. Otherwise (dismiss: "remind me") they stay
@@ -529,11 +529,12 @@ impl Learner {
         if let Some(path) = path {
             self.cache_saved(&known_app_key(&path), store)?;
         }
-        let named = self.alerts.close(alert_id);
+        let named = self.alerts.linked(alert_id);
         if !allowed {
             for (key, kind, value) in &named {
                 self.alerts.remind(key, *kind, value);
             }
+            self.alerts.close(alert_id);
             return Ok(());
         }
         let mut result = store.add_allow_keys(&allow_keys_of_saved(store, alert_id)?, now);
@@ -552,6 +553,11 @@ impl Learner {
             {
                 item.state = ItemState::Allowed;
             }
+        }
+        // Only a close that worked ends the window and its count: the alert
+        // stays shown, and sightings keep counting on it.
+        if result.is_ok() {
+            self.alerts.close(alert_id);
         }
         result
     }
