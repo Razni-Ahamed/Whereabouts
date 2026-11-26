@@ -506,13 +506,11 @@ impl Learner {
     /// named become allowed, in the store and here, and every reason in it
     /// that can be allowed (beaconing, random-looking name, unusual time)
     /// gets its lasting allow key. Otherwise (dismiss: "remind me") they stay
-    /// pending, and the next sighting of each raises a new alert. For an
-    /// alert this Learner holds no links for (the service restarted), the
-    /// destinations come from the alert's saved reasons: those still pending,
-    /// unless the profile was reset after the alert, so the alert's
-    /// destinations are gone, and except those linked to another open alert
-    /// by now. A destination that could not be allowed keeps its link, so
-    /// trying again finds it. The caller then marks the alert seen
+    /// pending, and the next sighting of each raises a new alert. After a
+    /// restart, the app's profile is read first and its destinations linked
+    /// again ([`Learner::relink`]), so the alert's destinations are those
+    /// waiting on it. A destination that could not be allowed keeps its
+    /// link, so trying again finds it. The caller then marks the alert seen
     /// (`Store::dismiss_alert`), only if this succeeded.
     pub fn alert_closed(
         &mut self,
@@ -521,18 +519,17 @@ impl Learner {
         allowed: bool,
         now: SystemTime,
     ) -> Result<(), StoreError> {
-        let mut named = self.alerts.close(alert_id);
-        if named.is_empty() {
-            named = pending_named_by_saved(store, alert_id)?;
-            // A destination that now waits on a newer open alert is that
-            // alert's to answer.
-            named.retain(|(key, kind, value)| {
-                !matches!(
-                    self.alerts.link(key, *kind, value),
-                    Some(Link::Open(other)) if other != alert_id
-                )
-            });
+        // After a restart, the app's links are read back first, so closing
+        // finds exactly what waits on this alert (not what waits on a newer
+        // one, nor what an alert from before a reset named).
+        let path = store
+            .alert(alert_id)?
+            .filter(|alert| alert.kind == AlertKind::Behaviour)
+            .and_then(|alert| alert.app_path);
+        if let Some(path) = path {
+            self.cache_saved(&known_app_key(&path), store)?;
         }
+        let named = self.alerts.close(alert_id);
         if !allowed {
             for (key, kind, value) in &named {
                 self.alerts.remind(key, *kind, value);
@@ -707,88 +704,58 @@ impl Learner {
     /// its pending destinations linked again, see [`Learner::relink`]), or
     /// created (and saved) if it has none. `false` if the store failed.
     fn load(&mut self, key: &str, app: &AppFacts<'_>, store: &mut Store, now: SystemTime) -> bool {
-        if self.profiles.contains_key(key) {
-            return true;
-        }
-        let stored = match store.profile(key) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                let row = ProfileRow {
-                    key: key.to_owned(),
-                    path: app.path.to_owned(),
-                    app_name: app.app_name.to_owned(),
-                    first_data: now,
-                    learned_since: now,
-                    last_data: now,
-                    active_days: 0,
-                    last_active_day: None,
-                    last_sha256: None,
-                    last_publisher: None,
-                    goes_anywhere: GoesAnywhere::Auto,
-                    reset_at: None,
-                };
-                if let Err(error) = store.save_profile_row(&row) {
-                    self.errors
-                        .push(format!("could not save a behaviour profile: {error}"));
-                    return false;
-                }
-                StoredProfile {
-                    row,
-                    items: Vec::new(),
-                    hours: Vec::new(),
-                }
-            }
+        match self.cache_saved(key, store) {
+            Ok(true) => return true,
+            Ok(false) => {}
             Err(error) => {
                 self.errors
                     .push(format!("could not read a behaviour profile: {error}"));
                 return false;
             }
+        }
+        let row = ProfileRow {
+            key: key.to_owned(),
+            path: app.path.to_owned(),
+            app_name: app.app_name.to_owned(),
+            first_data: now,
+            learned_since: now,
+            last_data: now,
+            active_days: 0,
+            last_active_day: None,
+            last_sha256: None,
+            last_publisher: None,
+            goes_anywhere: GoesAnywhere::Auto,
+            reset_at: None,
+        };
+        if let Err(error) = store.save_profile_row(&row) {
+            self.errors
+                .push(format!("could not save a behaviour profile: {error}"));
+            return false;
+        }
+        let stored = StoredProfile {
+            row,
+            items: Vec::new(),
+            hours: Vec::new(),
+        };
+        self.profiles.insert(key.to_owned(), Profile::new(stored));
+        true
+    }
+
+    /// Caches the app's saved profile, unless it is cached already, with its
+    /// pending destinations linked again ([`Learner::relink`]). `false` if
+    /// it has none.
+    fn cache_saved(&mut self, key: &str, store: &Store) -> Result<bool, StoreError> {
+        if self.profiles.contains_key(key) {
+            return Ok(true);
+        }
+        let Some(stored) = store.profile(key)? else {
+            return Ok(false);
         };
         self.profiles.insert(key.to_owned(), Profile::new(stored));
         // After a restart: what waits on which alert.
         self.relink(key, store);
-        true
+        Ok(true)
     }
-}
-
-/// The destinations a saved behaviour alert named that are still pending in
-/// its app's profile, as `(app key, kind, value)`. None if there is no such
-/// alert or profile, or the profile was reset after the alert was raised.
-fn pending_named_by_saved(
-    store: &Store,
-    alert_id: i64,
-) -> Result<Vec<(String, ItemKind, String)>, StoreError> {
-    let Some(alert) = store.alert(alert_id)? else {
-        return Ok(Vec::new());
-    };
-    let Some(path) = alert
-        .app_path
-        .filter(|_| alert.kind == AlertKind::Behaviour)
-    else {
-        return Ok(Vec::new());
-    };
-    let key = known_app_key(&path);
-    let Some(stored) = store.profile(&key)? else {
-        return Ok(Vec::new());
-    };
-    if stored
-        .row
-        .reset_at
-        .is_some_and(|reset| reset > alert.created)
-    {
-        return Ok(Vec::new());
-    }
-    let profile = Profile::new(stored);
-    let mut named = Vec::new();
-    for reason in &alert.reasons {
-        if let (Some(kind), Some(value)) = (item_kind(reason.signal), reason.value.as_deref())
-            && profile.pending(kind, value)
-            && !named.iter().any(|(_, k, v)| *k == kind && v == value)
-        {
-            named.push((key.clone(), kind, value.to_owned()));
-        }
-    }
-    Ok(named)
 }
 
 /// The lasting allow keys of every reason in a saved behaviour alert that

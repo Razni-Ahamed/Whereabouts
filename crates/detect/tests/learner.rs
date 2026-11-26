@@ -875,12 +875,13 @@ fn this_is_fine_after_a_restart_uses_the_saved_reasons() {
         let mut before = Learner::new(Toggles::default(), 0);
         before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id
     };
-    // The service restarted: this Learner never saw the alert.
+    // The service restarted: this Learner never saw the alert. As the
+    // service does, the Learner first, then the alert is marked seen.
     let mut learner = Learner::new(Toggles::default(), 0);
-    assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
     learner
         .alert_closed(&mut db, id, true, at(T0 + 60))
         .unwrap();
+    assert!(db.dismiss_alert(id, true, at(T0 + 60)).unwrap());
     assert_eq!(
         state(&db, ItemKind::Domain, RANDOM_DOMAIN),
         Some(ItemState::Allowed)
@@ -910,10 +911,10 @@ fn dismissing_after_a_restart_still_reminds() {
         Learner::new(Toggles::default(), 0).finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
     // The service restarted: this Learner never saw the alert.
     let mut learner = Learner::new(Toggles::default(), 0);
-    assert!(db.dismiss_alert(id, false, at(T0 + 60)).unwrap());
     learner
         .alert_closed(&mut db, id, false, at(T0 + 60))
         .unwrap();
+    assert!(db.dismiss_alert(id, false, at(T0 + 60)).unwrap());
     let again = learner.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
     assert_eq!(
         again.len(),
@@ -1332,5 +1333,41 @@ fn a_reminder_is_not_folded_into_an_older_alert_with_dropped_reasons() {
     assert_eq!(again.len(), 1, "remind me: a new alert");
     assert_eq!(again[0].alert.severity, Severity::Medium);
     assert_eq!(behaviour(&db).len(), 3);
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn dismissing_a_superseded_alert_before_its_profile_is_loaded() {
+    let mut db = TestStore::open("dismiss-superseded-cold");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let (first, second) = {
+        let mut before = Learner::new(Toggles::default(), 0);
+        let first = before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+        // "Remind me" reached the Learner, but the alert is still open.
+        before
+            .alert_closed(&mut db, first, false, at(T0 + 60))
+            .unwrap();
+        let again = before.finished(&random_flow(T0 + 120), &e, &mut db, at(T0 + 120));
+        assert_eq!(again.len(), 1);
+        (first, again[0].id)
+    };
+    // Restarted, and the older alert is dismissed before any traffic of
+    // the app loads its profile.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    learner
+        .alert_closed(&mut db, first, false, at(T0 + HOUR))
+        .unwrap();
+    assert!(db.dismiss_alert(first, false, at(T0 + HOUR)).unwrap());
+    let secs = T0 + 2 * HOUR;
+    assert!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .is_empty(),
+        "seen again on the newer alert, not a third alert"
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved.iter().find(|a| a.id == second).unwrap().seen_again, 1);
     assert!(learner.take_errors().is_empty());
 }
