@@ -590,10 +590,10 @@ impl Learner {
     /// reasons and was raised by the time it was last seen, and whose
     /// window it was first seen in or, after a reminder, that was raised
     /// after the closed alert's last update. Links this run already holds
-    /// are kept.
-    fn relink(&mut self, key: &str, store: &Store) {
+    /// are kept. Fails if the alerts cannot be read.
+    fn relink(&mut self, key: &str, store: &Store) -> Result<(), StoreError> {
         let Some(profile) = self.profiles.get(key) else {
-            return;
+            return Ok(());
         };
         let pending: Vec<(ItemKind, String, SystemTime, SystemTime)> = profile
             .stored()
@@ -610,17 +610,10 @@ impl Learner {
             })
             .collect();
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         let reset = profile.stored().row.reset_at;
-        let alerts = match store.behaviour_alerts(key) {
-            Ok(alerts) => alerts,
-            Err(error) => {
-                self.errors
-                    .push(format!("could not read behaviour alerts: {error}"));
-                return;
-            }
-        };
+        let alerts = store.behaviour_alerts(key)?;
         let since_reset = || {
             alerts
                 .iter()
@@ -667,6 +660,7 @@ impl Learner {
                 None => self.alerts.restore(key, kind, &value, Link::Closed, 0),
             }
         }
+        Ok(())
     }
 
     /// Sets whether an app is expected to go anywhere, in the store and
@@ -759,7 +753,8 @@ impl Learner {
 
     /// Caches the app's saved profile, unless it is cached already, with its
     /// pending destinations linked again ([`Learner::relink`]). `false` if
-    /// it has none.
+    /// it has none. If they cannot be linked, it is not cached (the next
+    /// call tries again) and the error is returned.
     fn cache_saved(&mut self, key: &str, store: &Store) -> Result<bool, StoreError> {
         if self.profiles.contains_key(key) {
             return Ok(true);
@@ -769,7 +764,10 @@ impl Learner {
         };
         self.profiles.insert(key.to_owned(), Profile::new(stored));
         // After a restart: what waits on which alert.
-        self.relink(key, store);
+        if let Err(error) = self.relink(key, store) {
+            self.profiles.remove(key);
+            return Err(error);
+        }
         Ok(true)
     }
 }

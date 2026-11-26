@@ -724,12 +724,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn a_failed_profile_change_leaves_the_alert_to_answer_again() {
+    /// A finished profile of [`PATH`] with a pending random-looking domain,
+    /// and the behaviour alert naming it (its ID).
+    fn seed_pending_alert(store: &mut Store) -> i64 {
         use whereabouts_store::{
             GoesAnywhere, ItemState, NewAlert, ProfileItem, ProfileRow, Reason, Severity, Signal,
         };
-        let (mut store, dir) = temp_store("close-fails");
         let app_key = known_app_key(PATH);
         let domain = "q7x9k2m4zt8w.example";
         store
@@ -778,7 +778,13 @@ mod tests {
                 count: None,
             }],
         };
-        let id = store.add_alert(&alert, at(T0)).unwrap().unwrap();
+        store.add_alert(&alert, at(T0)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_failed_profile_change_leaves_the_alert_to_answer_again() {
+        let (mut store, dir) = temp_store("close-fails");
+        let id = seed_pending_alert(&mut store);
         // The store takes everything but the change to the profile's items.
         let raw = rusqlite::Connection::open(dir.join("t.db")).unwrap();
         raw.pragma_update(None, "key", format!("x'{}'", "06".repeat(32)))
@@ -796,6 +802,45 @@ mod tests {
             .answer(Some(&mut store), close, at(T0 + 60))
             .unwrap_err();
         assert!(error.contains("refused by the test"), "{error}");
+        let alert = store.alert(id).unwrap().unwrap();
+        assert!(!alert.dismissed, "still shown, so the user can try again");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn closing_fails_when_the_alerts_cannot_be_read_back() {
+        let (mut store, dir) = temp_store("relink-fails");
+        let id = seed_pending_alert(&mut store);
+        // Another alert of the app that cannot be read.
+        let broken = whereabouts_store::NewAlert {
+            key: String::from("behaviour|other"),
+            allow_key: None,
+            kind: AlertKind::Behaviour,
+            severity: whereabouts_store::Severity::Info,
+            app_name: Some(String::from("chat.exe")),
+            app_path: Some(PATH.to_owned()),
+            target: None,
+            detail: None,
+            reasons: Vec::new(),
+        };
+        let broken = store.add_alert(&broken, at(T0)).unwrap().unwrap();
+        let raw = rusqlite::Connection::open(dir.join("t.db")).unwrap();
+        raw.pragma_update(None, "key", format!("x'{}'", "06".repeat(32)))
+            .unwrap();
+        raw.execute("UPDATE alerts SET seen_again = -1 WHERE id = ?1", [broken])
+            .unwrap();
+        drop(raw);
+
+        // The profile is first read on this path: its links cannot be read
+        // back, so nothing would be allowed. The close fails instead.
+        let mut learning = ready(&mut store, at(T0));
+        let close = BehaviourCommand::CloseAlert { id, allow: true };
+        assert!(
+            learning
+                .answer(Some(&mut store), close, at(T0 + 60))
+                .is_err()
+        );
         let alert = store.alert(id).unwrap().unwrap();
         assert!(!alert.dismissed, "still shown, so the user can try again");
         drop(store);
