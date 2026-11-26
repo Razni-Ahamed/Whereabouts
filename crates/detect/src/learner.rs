@@ -588,8 +588,8 @@ impl Learner {
     /// destination may also be one whose reason an alert dropped (it keeps
     /// only so many): it waits on the newest open alert that dropped
     /// reasons and was raised by the time it was last seen, and whose
-    /// window it was first seen in or, after a reminder, that was raised
-    /// after the closed alert's last update. Links this run already holds
+    /// window it was first seen in or, after a reminder, if it was last
+    /// seen after the closed alert's last update. Links this run already holds
     /// are kept. Fails if the alerts cannot be read.
     fn relink(&mut self, key: &str, store: &Store) -> Result<(), StoreError> {
         let Some(profile) = self.profiles.get(key) else {
@@ -638,10 +638,11 @@ impl Learner {
                 .or_else(|| match since_reset().find(|a| a.dismissed && names(a)) {
                     // Reminded: only a sighting after the closed alert's
                     // last update can have joined (and been dropped by) a
-                    // newer alert; otherwise it raises a new one.
+                    // newer alert (one counted on the closed alert updated
+                    // it); otherwise it raises a new one.
                     Some(closed) => {
                         let after = closed.updated.unwrap_or(closed.created);
-                        since_reset().find(|alert| dropping(alert) && alert.created > after)
+                        since_reset().find(|alert| dropping(alert) && last_seen > after)
                     }
                     // First seen inside the window of the alert that dropped it.
                     None => since_reset().find(|alert| {

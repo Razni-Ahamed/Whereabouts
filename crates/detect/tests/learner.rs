@@ -1468,3 +1468,55 @@ fn a_value_counted_on_its_alert_before_a_reminder_is_not_moved_to_a_newer_one() 
     assert_eq!(behaviour(&db).len(), 3);
     assert!(learner.take_errors().is_empty());
 }
+
+#[test]
+fn another_value_counting_on_the_dismissed_alert_does_not_hide_a_dropped_reminder() {
+    let mut db = TestStore::open("other-value-updates");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let e = enricher();
+    let names = random_domains(MAX_REASONS + 2);
+    let other_flow = |secs: u64| flow(Some(names[1].as_str()), Some("Chat Inc"), Some("DE"), secs);
+    let newer = {
+        let mut before = Learner::new(Toggles::default(), 0);
+        // Alert Y names V (the random domain) and W.
+        let first = before.finished(&random_flow(T0), &e, &mut db, at(T0))[0].id;
+        before.finished(&other_flow(T0 + 60), &e, &mut db, at(T0 + 60));
+        // An hour later Z fills up with other random names.
+        for (n, domain) in names.iter().enumerate().skip(2) {
+            let secs = T0 + HOUR + n as u64;
+            let other = flow(Some(domain), Some("Chat Inc"), Some("DE"), secs);
+            before.finished(&other, &e, &mut db, at(secs));
+        }
+        let newer = newest(&db);
+        assert!(newer.dropped_reasons > 0);
+        // W counts on Y (which updates Y), then Y is dismissed.
+        let secs = T0 + HOUR + 50;
+        before.finished(&other_flow(secs), &e, &mut db, at(secs));
+        before
+            .alert_closed(&mut db, first, false, at(secs + 10))
+            .unwrap();
+        assert!(db.dismiss_alert(first, false, at(secs + 10)).unwrap());
+        // V's reminder joins Z, which drops it.
+        let secs = T0 + HOUR + 100;
+        assert!(
+            before
+                .finished(&random_flow(secs), &e, &mut db, at(secs))
+                .is_empty()
+        );
+        assert!(before.take_errors().is_empty());
+        newer.id
+    };
+    // After a restart, V still counts on Z: no extra alert.
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let secs = T0 + 2 * HOUR;
+    assert!(
+        learner
+            .finished(&random_flow(secs), &e, &mut db, at(secs))
+            .is_empty(),
+        "seen again on the newer alert"
+    );
+    let saved = behaviour(&db);
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved.iter().find(|a| a.id == newer).unwrap().seen_again, 1);
+    assert!(learner.take_errors().is_empty());
+}
