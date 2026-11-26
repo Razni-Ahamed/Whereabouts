@@ -5048,7 +5048,7 @@ name = "whereabouts-data-bundle"
 version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -5084,7 +5084,7 @@ dependencies = [
 name = "whereabouts-lab-replay"
 version = "0.3.0"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "whereabouts-core",

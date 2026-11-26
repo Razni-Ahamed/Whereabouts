@@ -47,7 +47,7 @@ whereabouts-win-startup = { path = "crates/win-startup" }
 # Ed25519 signatures on data updates (BSD-3-Clause).
 ed25519-dalek = "3.0.0"
 ferrisetw = "1.2"
-getrandom = "0.3"
+getrandom = "0.4"
 maxminddb = "0.33"
 psl = "2"
 # SQLCipher (encrypted SQLite) with OpenSSL built from source. Building it
