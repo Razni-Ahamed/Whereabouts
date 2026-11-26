@@ -6,7 +6,7 @@ Whereabouts is a free, open-source app for Windows that shows **which app on you
 
 It never reads the contents of your traffic, and it never sends anything about you to anyone. Everything happens on your own computer.
 
-> **Status: developer preview (0.2).** It watches, labels, blocks and warns today; learning what is normal for each app comes next. See the [roadmap](#roadmap) and [installing](#installing).
+> **Status: developer preview (0.3).** It watches, labels and blocks, and learns what is normal for each app to warn, with reasons, when that changes. See the [roadmap](#roadmap) and [installing](#installing).
 
 ---
 
@@ -46,7 +46,7 @@ These are rules, not goals. Code that breaks one of them is not merged. The full
 Detection has three layers, from simple to smart:
 
 1. **Known lists:** trackers, ad networks and known malicious servers
-2. **Per-app profiles:** learns what is normal for each app, then flags new destinations, new countries and upload spikes
+2. **Per-app profiles:** learns what is normal for each app; new sites, companies and countries are listed, and it warns about upload spikes, random-looking site names and swapped program files
 3. **Anomaly model:** a small on-device machine-learning model (Isolation Forest). It ships only if lab tests show it catches more problems *without* more false alarms.
 
 All learning happens on your computer. Details are in the [design spec](docs/design-spec.md#6-detection-and-learning).
@@ -57,14 +57,14 @@ All learning happens on your computer. Details are in the [design spec](docs/des
 |---|---|---|
 | v0.1 ✅ | *See* | Live view of every app's connections, companies and countries |
 | v0.2 ✅ | *Control* | Block apps, sites and addresses; alerts for trackers and known-bad networks; tray and notifications; signed list updates |
-| v0.3 | *Learn* | Per-app behaviour profiles and explained alerts |
+| v0.3 ✅ | *Learn* | Per-app behaviour profiles and explained alerts |
 | v0.4 | *Detect* | On-device anomaly model (if it passes testing) |
 | v1.0 | *Trust* | Signed installer, external security review |
 | Later | | Android app, PC + phone dashboard over your local network |
 
 ## Installing
 
-Whereabouts 0.2 is a **developer preview** for Windows 10 (22H2) and Windows 11, 64-bit.
+Whereabouts 0.3 is a **developer preview** for Windows 10 (22H2) and Windows 11, 64-bit.
 
 1. Download the latest `Whereabouts_<version>_x64-setup.exe` and its `SHA256SUMS.txt` from the [Releases](https://github.com/Razni-Ahamed/Whereabouts/releases) page.
 2. **Check the download.** The preview's installer is not code-signed yet, so Windows SmartScreen may warn about it. Compare its checksum with the published one before running it:

@@ -105,7 +105,20 @@ export interface Rules {
 }
 
 export type Severity = 'info' | 'medium' | 'high' | 'critical';
-export type AlertKind = 'tracker' | 'bad_network' | 'faked_dns' | 'unattributed';
+export type AlertKind = 'tracker' | 'bad_network' | 'faked_dns' | 'unattributed' | 'behaviour';
+
+/** One reason behind a behaviour alert. */
+export interface ReasonView {
+  /** new_site, new_company, new_country, upload_spike, ratio_flip, beaconing, unusual_time, random_name or binary_changed. */
+  signal: string;
+  /** The domain, company, country code or hour concerned. */
+  value: string | null;
+  /** What was seen (e.g. bytes sent in the hour). */
+  observed: number | null;
+  /** What is usual for this app. */
+  usual: number | null;
+  count: number | null;
+}
 
 export interface AlertView {
   id: number;
@@ -122,6 +135,12 @@ export interface AlertView {
   dismissed: boolean;
   /** Whether "this is fine" also stops alerts like it. */
   can_allow: boolean;
+  /** Why a behaviour alert was raised. Missing from older services. */
+  reasons?: ReasonView[];
+  /** How many more times it happened after the alert was raised. Missing from older services. */
+  seen_again?: number;
+  /** Reasons left out because the alert holds only the most severe few. Missing from older services. */
+  dropped_reasons?: number;
 }
 
 /** The app's own settings (per Windows user). */
@@ -142,4 +161,39 @@ export interface Live {
   flows: FlowView[];
   /** Process IDs that are Whereabouts: the app, its WebView2 helpers, the service. */
   own_pids: number[];
+}
+
+export type GoesAnywhereChoice = 'auto' | 'on' | 'off';
+
+/** One destination in a behaviour profile. */
+export interface ProfileItemView {
+  /** The domain, company or country code. */
+  value: string;
+  /** Seconds since 1970. */
+  last_seen_secs: number;
+  /** learned, allowed (the user said it is fine) or pending (raised an alert). */
+  state: string;
+}
+
+/** What Whereabouts learned is usual for one program. */
+export interface ProfileView {
+  path: string;
+  app: string;
+  /** Still in its first week: no behaviour alerts meanwhile. */
+  learning: boolean;
+  /** Seconds since 1970. */
+  learning_ends_secs: number;
+  /** Seconds since 1970. */
+  learned_since_secs: number;
+  /** Whether new sites, companies and countries are expected of it. */
+  goes_anywhere: boolean;
+  goes_anywhere_choice: GoesAnywhereChoice;
+  recognised_browser: boolean;
+  sites: ProfileItemView[];
+  companies: ProfileItemView[];
+  countries: ProfileItemView[];
+  usual_sent_per_hour: number | null;
+  busiest_sent_per_hour: number | null;
+  /** The share of its active hours in each local hour (24 numbers). */
+  active_hours: number[];
 }

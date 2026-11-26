@@ -6,10 +6,13 @@ app the user ran in its learning week, starts at a moment the user was
 active in the test week, and gets a label with its time window.
 
 - upload: 200 MB or more sent in one hour to a new destination
-- beacon: small connections every 60 s +/- 5 s for 3 hours to one new host
+- beacon: small connections every 60 s +/- 5 s for 3 hours to one new host:
+  `connection` lines (when each was opened) plus one flow row with their bytes
 - random_domain: 5 connections to random-looking names not on any list
-- swapped_binary: the app's program changes (new SHA-256) and it reaches
-  3 new destinations
+- swapped_binary: a signed app's program changes (new SHA-256, unsigned: a
+  swapped vendor program can't keep the vendor's valid signature) and it
+  reaches 3 new destinations. Only apps signed (with a publisher) in the
+  learning week are chosen.
 """
 
 from __future__ import annotations
@@ -61,6 +64,13 @@ def _row(template: dict, at: int, **changes) -> dict:
     return row
 
 
+def _connection(template: dict, at: int, destination: str) -> dict:
+    """A connection line (timeline schema 2): when one connection was opened."""
+    return {"type": "connection", "user": template["user"], "day": (at - T0) // DAY + 1,
+            "session": "synthetic", "app_path": template["app_path"], "app_name": template["app_name"],
+            "destination": destination, "time": at, "scenario": template["scenario"]}
+
+
 def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int]) -> tuple[list[dict], list[dict]]:
     """Returns new lists with the scenarios added (rows sorted by time)."""
     rng = random.Random(seed)
@@ -73,14 +83,27 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
     staged = {label.get("app_name") for label in labels if label.get("live")}
     for user in users:
         flows = [r for r in out if r["type"] == "flow" and r["user"] == user]
-        learned = sorted({r["app_name"] for r in flows if r["day"] <= 7} - staged)
+        learning = [r for r in flows if r["day"] <= 7 and r["app_name"] not in staged]
+        # Each kind's template rows: any for most; beacons need a program path (apps
+        # without one are never profiled); swaps need a signed program with a publisher,
+        # path and hash (a program that was never signed can't lose a signature, so its
+        # swap isn't detected, by design).
+        templates = {
+            "beacon": [r for r in learning if r.get("app_path")],
+            "swapped_binary": [r for r in learning if r.get("app_path") and r.get("app_sha256")
+                               and r.get("signature") == "signed" and r.get("publisher")],
+        }
         active = [r for r in flows if r["day"] >= 8 and not r.get("scenario")]
-        if not learned or not active:
+        if not learning or not active:
             continue
         for kind in TYPES:
+            rows_for = templates.get(kind, learning)
+            candidates = sorted({r["app_name"] for r in rows_for})
             for k in range(per_user.get(kind, 0)):
-                app = rng.choice(learned)
-                template = next(r for r in flows if r["app_name"] == app and r["day"] <= 7)
+                if not candidates:
+                    continue
+                app = rng.choice(candidates)
+                template = next(r for r in rows_for if r["app_name"] == app)
                 anchor = rng.choice(active)
                 start = min(anchor["first_seen"], end_of_test - BEACON_SPAN - 600)
                 scenario = f"{kind}-{user}-{k + 1}"
@@ -94,11 +117,17 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
                     end = start + HOUR
                 elif kind == "beacon":
                     ip, host = _new_ip(rng), f"cdn-{rng.randrange(16**6):06x}.example.org"
+                    times = []
                     t = start
                     while t + 65 <= start + BEACON_SPAN:
-                        out.append(_row(base, t, remote_ip=ip, domain=host, domain_source="verified",
-                                        bytes_sent=1000, bytes_received=1000))
+                        times.append(t)
                         t += 60 + rng.randint(-5, 5)
+                    # As the engine sees it: one flow (same program and server) whose
+                    # connection count rises, and when each connection was opened.
+                    out.append(_row(base, start, remote_ip=ip, domain=host, domain_source="verified",
+                                    last_seen=times[-1], connections=len(times),
+                                    bytes_sent=1000 * len(times), bytes_received=1000 * len(times)))
+                    out.extend(_connection(base, at, host) for at in times)
                     end = start + BEACON_SPAN
                 elif kind == "random_domain":
                     for i in range(5):
@@ -110,11 +139,12 @@ def add(rows: list[dict], labels: list[dict], seed: int, per_user: dict[str, int
                     for row in out:
                         if (row["type"] == "flow" and row["user"] == user and row["app_name"] == app
                                 and row["first_seen"] >= start):
-                            row["app_sha256"] = new_hash
+                            row.update(app_sha256=new_hash, signature="unsigned", publisher=None)
                     for i in range(3):
                         out.append(_row(base, start + 60 + i * 300, remote_ip=_new_ip(rng),
                                         domain=f"upd-{rng.randrange(16**6):06x}.example.com",
                                         domain_source="verified", app_sha256=new_hash,
+                                        signature="unsigned", publisher=None,
                                         bytes_sent=5000, bytes_received=20000))
                     end = start + HOUR
                 labels.append({"scenario": scenario, "type": kind, "user": user, "app_name": app,

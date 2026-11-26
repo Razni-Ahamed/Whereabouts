@@ -6,6 +6,9 @@ Each day places a few of the persona's sessions at hours the persona is
 usually active, shifting their times. **No leakage:** per persona the
 sessions are split (seeded) into a learning pool and a test pool, so a
 user's test week never reuses a session from its learning week.
+
+A session's recorded connection times (`connections.jsonl`) become
+`connection` lines, shifted with the session like its flows.
 """
 
 from __future__ import annotations
@@ -102,6 +105,11 @@ def _place(session: Session, user: str, day: int, hour: int, shift: int,
                "first_seen": clamp(flow["first_seen"]), "last_seen": clamp(flow["last_seen"]),
                "scenario": None}
         rows.append(row)
+    for connection in session.connections:
+        at = clamp(connection["time"])
+        rows.append({"type": "connection", "user": user, "day": (at - T0) // DAY + 1, "session": session.id,
+                     "app_path": connection["app_path"], "app_name": connection["app_name"],
+                     "destination": connection["destination"], "time": at})
     peak = [0, 0]
     for sample in session.counters:
         rejected = int(sample.get("rejected") or 0)

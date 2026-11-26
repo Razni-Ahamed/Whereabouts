@@ -36,6 +36,24 @@ else {
 if (-not (Test-Path $csvPath)) { $problems += 'session.csv is missing' }
 elseif ((Get-Content $csvPath -TotalCount 1) -ne $expectedHeader) { $problems += 'session.csv has an unexpected header' }
 
+# When each connection was opened (--record-connections): one JSON object per line.
+$connectionsPath = Join-Path $Out 'connections.jsonl'
+if (-not (Test-Path $connectionsPath)) { $problems += 'connections.jsonl is missing (--record-connections)' }
+else {
+    $first = Get-Content $connectionsPath -TotalCount 1
+    if (-not $first) { Write-Warning 'connections.jsonl is empty: no connection of a known program was recorded' }
+    else {
+        try {
+            $line = $first | ConvertFrom-Json
+            foreach ($name in 'app_path', 'app_name', 'destination', 'remote_ip', 'remote_port', 'time_ms') {
+                if (-not $line.PSObject.Properties[$name]) { $problems += "connections.jsonl lines lack $name" }
+            }
+        } catch {
+            $problems += "connections.jsonl is not JSON lines: $_"
+        }
+    }
+}
+
 if ($problems) {
     $problems | ForEach-Object { Write-Host "FAIL: $_" }
     exit 1

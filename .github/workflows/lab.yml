@@ -44,6 +44,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       minutes: ${{ steps.plan.outputs.minutes }}
+      timeout: ${{ steps.plan.outputs.timeout }}
       users: ${{ steps.plan.outputs.users }}
       seed: ${{ steps.plan.outputs.seed }}
       inject: ${{ steps.plan.outputs.inject }}
@@ -66,6 +67,10 @@ jobs:
           [[ "$INJECT" =~ ^[a-z_=0-9,]*$ ]] || { echo "bad inject list"; exit 1; }
           [[ "$REANALYSE" =~ ^[0-9]*$ ]] || { echo "bad run id"; exit 1; }
           (( SESSIONS >= 2 )) || { echo "need at least 2 sessions per persona"; exit 1; }
+          # Session length plus setup, build and upload time, capped below the
+          # 360-minute job limit. GitHub expressions have no arithmetic.
+          timeout=$(( 10#$MINUTES + 40 ))
+          (( timeout <= 340 )) || timeout=340
           matrix=$(python3 -c "
           import json, sys
           n = int(sys.argv[1])
@@ -74,6 +79,7 @@ jobs:
           {
             echo "matrix=$matrix"
             echo "minutes=$MINUTES"
+            echo "timeout=$timeout"
             echo "users=$USERS"
             echo "seed=$SEED"
             echo "inject=$INJECT"
@@ -85,7 +91,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.reanalyse == ''
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Planned in the plan job (session minutes + 40); a fixed 45 killed 30-minute sessions.
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -125,6 +132,7 @@ jobs:
           path: |
             ${{ runner.temp }}\session\session.csv
             ${{ runner.temp }}\session\session.json
+            ${{ runner.temp }}\session\connections.jsonl
             ${{ runner.temp }}\session\engine.log
           retention-days: 90
           if-no-files-found: warn
@@ -188,12 +196,19 @@ jobs:
           --timeline "${{ runner.temp }}\dataset\timeline.jsonl"
           --data data --lists "${{ runner.temp }}\lists" --layers 1
           --out "${{ runner.temp }}\dataset\alerts-layer1.jsonl"
+      - name: Replay (Layers 1 and 2)
+        run: >
+          cargo run --release --locked -p whereabouts-lab-replay --
+          --timeline "${{ runner.temp }}\dataset\timeline.jsonl"
+          --data data --lists "${{ runner.temp }}\lists" --layers "1,2"
+          --out "${{ runner.temp }}\dataset\alerts-layer2.jsonl"
       - name: Report
         shell: pwsh
         run: |
           uv run --project lab --frozen lab report `
             --timeline-dir "$env:RUNNER_TEMP\dataset" `
             --alerts "Layer 1=$env:RUNNER_TEMP\dataset\alerts-layer1.jsonl" `
+            --alerts "Layers 1+2=$env:RUNNER_TEMP\dataset\alerts-layer2.jsonl" `
             --out "$env:RUNNER_TEMP\report"
           Get-Content "$env:RUNNER_TEMP\report\summary.md" | Add-Content $env:GITHUB_STEP_SUMMARY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

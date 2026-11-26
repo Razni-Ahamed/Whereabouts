@@ -2,6 +2,7 @@
   import { Ban, Download, Globe, MapPin, Radar, Search, ShieldOff, Upload } from '@lucide/svelte';
   import AppAvatar from '../lib/components/AppAvatar.svelte';
   import FlowTable from '../lib/components/FlowTable.svelte';
+  import ProfilePanel from '../lib/components/ProfilePanel.svelte';
   import Trust from '../lib/components/Trust.svelte';
   import { appLabel, bytes, countryName } from '../lib/format';
   import { findApp, folderOf, savedTotals } from '../lib/apps';
@@ -118,6 +119,12 @@
         </p>
       {:else if store.live?.status.save_history === false}
         <p class="saved muted">History is off, so nothing is saved for this app. Turn it on under Privacy.</p>
+      {/if}
+
+      {#if current.path}
+        {#key current.path}
+          <ProfilePanel path={current.path} app={appLabel(current.app)} />
+        {/key}
       {/if}
 
       <div class="glass where">

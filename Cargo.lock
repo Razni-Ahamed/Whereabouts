@@ -5009,7 +5009,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5028,7 +5028,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-client"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5041,11 +5041,11 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-core"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "whereabouts-data-bundle"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
@@ -5056,7 +5056,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-detect"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "whereabouts-core",
  "whereabouts-enrich",
@@ -5065,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-enrich"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "maxminddb",
  "psl",
@@ -5074,7 +5074,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-ipc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5082,7 +5082,7 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-lab-replay"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -5096,8 +5096,9 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-service"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
+ "rusqlite",
  "serde_json",
  "ureq",
  "whereabouts-client",
@@ -5111,20 +5112,23 @@ dependencies = [
  "whereabouts-win-firewall",
  "whereabouts-win-pipe",
  "whereabouts-win-secrets",
+ "windows 0.62.2",
  "windows-service",
 ]
 
 [[package]]
 name = "whereabouts-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
+ "serde",
+ "serde_json",
  "whereabouts-core",
 ]
 
 [[package]]
 name = "whereabouts-win-capture"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ferrisetw",
  "sha2 0.11.1",
@@ -5134,14 +5138,14 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-win-dialog"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "whereabouts-win-firewall"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5151,21 +5155,21 @@ dependencies = [
 
 [[package]]
 name = "whereabouts-win-pipe"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "whereabouts-win-secrets"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "whereabouts-win-startup"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "windows 0.62.2",
 ]

@@ -4,6 +4,29 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
+*Learn.* Whereabouts now learns what each app normally does and warns, with reasons, when that changes. The lab's release bar was met (held-out run, **lab numbers on datacenter runners, not real-world rates**; see [design spec §6.2](docs/design-spec.md)): 0.562 false alarms per simulated user-week (limit 1.0), and fitting alerts for random-looking domains 100 %, swapped programs 100 % and hidden uploads 69 %. Details in the [release notes](docs/releases/v0.3.0.md).
+
+### Added
+
+- **Behaviour profiles and explained alerts.** For each program Whereabouts learns the sites, companies, countries, ports, upload sizes and active hours it normally uses, and raises an alert, with the reasons in plain words, for: an upload spike, a flip from mostly downloading to mostly uploading, activity at an unusual hour, a random-looking site name, and a program file that changed (to an unsigned one or another publisher's; a signature that could not be checked does not count) and then reaches somewhere new. Signals within 10 minutes become one alert, and a warning still waiting for you is updated ("seen again") instead of repeated.
+- **A 7-day learning period** per program, counted from its first data. Programs with 7 days or more of saved history start warning right after the upgrade; profiles are built from that history. Profile entries not used for 30 active days are forgotten. Programs whose file is not known are never profiled.
+- **Alerts screen:** behaviour alerts show their reasons, and offer to block the app or site, or to treat it as normal ("This is fine", which also lasts for every random-looking name and unusual hour in the alert). Dismissing a behaviour alert means "remind me": the next sighting raises a new alert. Both, and the "seen again" count, survive a restart of Whereabouts.
+- **Apps screen:** what Whereabouts learned is normal for each app, with "learned since", **Reset** (which also forgets the behaviour warnings marked "This is fine" for that app), and **Goes anywhere** for apps such as browsers (no new-site, company or country alerts; the other signals stay). Genuine browsers installed by administrators and signed by their publisher are recognised automatically, by their program file's name (never the name a program shows); a file merely named `chrome.exe` is not.
+- **Command line:** `--profile <path>` shows what was learned for a program; `--status` shows whether learning is starting, ready or paused. Resetting a profile, "goes anywhere" and "This is fine" need the Whereabouts app or administrator rights.
+- Lab (for developers, never shipped): the lab runs its simulated weeks through behaviour learning (`--layers 1,2`), scores each signal on its own, checks the release bar with the signals that ship, and lists its own synthetic-entry artifacts apart. The console engine has a lab-only `--record-connections <file>` (never on by default; the installed service refuses it).
+
+### Changed
+
+- A first connection to a new site, company or country is **listed on the Alerts screen as info and never notified**, because global content networks made it too common. These are learned at once.
+- **Beaconing detection (regular check-ins) is built but not switched on**: the lab measured too many false alarms.
+- Profiles are **kept when "Save connection history" is off**, and when saved history is deleted; they are cleared by Reset (one app) and "Delete everything". The Privacy screen, the first-run history question, the delete dialog and PRIVACY.md say so, and list what a profile holds: sites (registrable names only, including each browser's), companies, countries and ports with when each was first and last used, 30 days of hourly totals, and the program file's hash and signer.
+- A behaviour alert keeps its 24 most serious reasons and says "and N more" for the rest, so an app reaching thousands of new places at once cannot blank the Alerts screen; if the list of alerts is ever too long for one reply, info alerts are left out first.
+- "This is fine" reads the alert it answers by its ID (new pipe request `Alert`), so it works on every alert shown, however long the list; if what it allows cannot be saved, the alert stays on screen to answer again.
+- Storage: the database moves to layout version 5 (alert reasons and profiles). Existing alerts are kept.
+- The history-off texts now say learning works either way, and "Block site" is only offered for host names.
+
 ## [0.2.1] - 2026-11-24
 
 *Security update.* Fixes every attack found in the [security test of 2026-11-22](docs/reviews/security-ui-test-2026-11-22.md), which work against 0.2.0 and earlier (see **Security** below); please update. Also: a choice to save no history, much less writing to disk, and a lighter, living background.
@@ -131,7 +154,8 @@ First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
 - `core`: connection metadata model, robust statistics (median, MAD, robust z-score) and domain entropy.
 - CI on Windows: formatting, Clippy, tests, and licence/advisory checks with `cargo-deny`.
 
-[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.0...v0.1.1

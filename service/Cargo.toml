@@ -23,7 +23,14 @@ whereabouts-win-capture.workspace = true
 whereabouts-win-firewall.workspace = true
 whereabouts-win-pipe.workspace = true
 whereabouts-win-secrets.workspace = true
+# The local time zone's offset from UTC (for behaviour profiles' local days).
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time"] }
 windows-service.workspace = true
+
+[dev-dependencies]
+# Tests make the store refuse one kind of write (a trigger), to check what
+# happens when a change fails halfway.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

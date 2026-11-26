@@ -50,11 +50,33 @@ def test_upload_shape(tmp_path):
 def test_beacon_period_and_span(tmp_path):
     rows, labels = injected(tmp_path)
     for label in [label for label in labels if label["type"] == "beacon"]:
-        times = sorted(r["first_seen"] for r in rows if r.get("scenario") == label["scenario"])
+        mine = [r for r in rows if r.get("scenario") == label["scenario"]]
+        times = sorted(r["time"] for r in mine if r["type"] == "connection")
         gaps = [b - a for a, b in zip(times, times[1:])]
         assert all(55 <= g <= 65 for g in gaps)
         assert 3 * 3600 - 120 <= times[-1] - times[0] <= 3 * 3600
-        assert len({r["remote_ip"] for r in rows if r.get("scenario") == label["scenario"]}) == 1
+        assert len({r["remote_ip"] for r in mine if r["type"] == "flow"}) == 1
+        assert len({r["destination"] for r in mine if r["type"] == "connection"}) == 1
+
+
+def test_beacon_injected_as_connection_lines(tmp_path):
+    rows, labels = injected(tmp_path)
+    for label in [label for label in labels if label["type"] == "beacon"]:
+        mine = [r for r in rows if r.get("scenario") == label["scenario"]]
+        connections = [r for r in mine if r["type"] == "connection"]
+        [flow_row] = [r for r in mine if r["type"] == "flow"]  # one flow carries the bytes
+        assert len(connections) >= 150  # every ~60 s for 3 hours
+        for line in connections:
+            assert line["user"] == label["user"]
+            assert line["app_name"] == label["app_name"]
+            assert line["app_path"] == label["app_path"]
+            assert line["destination"] == flow_row["domain"]
+            assert label["start"] <= line["time"] <= label["end"]
+            assert set(line) >= {"type", "user", "app_path", "app_name", "destination", "time"}
+        times = [line["time"] for line in connections]
+        assert flow_row["first_seen"] == min(times) and flow_row["last_seen"] == max(times)
+        assert flow_row["connections"] == len(connections)
+        assert flow_row["bytes_sent"] == 1000 * len(connections)
 
 
 def test_random_domain_entropy(tmp_path):
@@ -82,6 +104,22 @@ def test_swapped_binary_changes_hash_after_start_only(tmp_path):
         assert len(after) == 1 and len(next(iter(after))) == 64
         new = [r for r in app_rows if r.get("scenario") == label["scenario"]]
         assert len(new) == 3
+        # A swapped vendor program can't keep the vendor's valid signature (R25).
+        swapped = [r for r in app_rows if r["first_seen"] >= label["start"]]
+        assert all(r["signature"] == "unsigned" and r["publisher"] is None for r in swapped)
+        assert all(r["signature"] == "signed" for r in app_rows if r["first_seen"] < label["start"])
+
+
+def test_beacons_only_target_apps_with_a_path(tmp_path):
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="chrome.exe", at=1010 + i), flow(app="nopath.exe", at=1020 + i, app_path="")])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"beacon": 4})
+    beacons = [label for label in labels if label["type"] == "beacon"]
+    assert len(beacons) == 12
+    assert {label["app_name"] for label in beacons} == {"chrome.exe"}
+    assert all(r["app_path"] for r in rows if r["type"] == "connection")
 
 
 def test_only_in_test_week(tmp_path):
@@ -123,3 +161,40 @@ def test_never_targets_apps_of_live_scenarios(tmp_path):
     rows, labels = inject.add(rows, labels, seed=4, per_user={"upload": 3, "beacon": 3})
     targets = {label["app_name"] for label in labels if not label["live"]}
     assert targets == {"chrome.exe"}
+
+
+def test_swaps_only_target_signed_apps(tmp_path):
+    # A program that was never signed can't lose a signature: a swap of it isn't
+    # detected by design, so it would be no test of the detector.
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="chrome.exe", at=1010 + i),
+                             flow(app="unsigned.exe", at=1020 + i, signature="unsigned", publisher=""),
+                             flow(app="nopub.exe", at=1030 + i, publisher="")])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"swapped_binary": 4})
+    swaps = [label for label in labels if label["type"] == "swapped_binary"]
+    assert len(swaps) == 12
+    assert {label["app_name"] for label in swaps} == {"chrome.exe"}
+
+
+def test_no_signed_app_means_no_swap(tmp_path):
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="unsigned.exe", at=1010 + i, signature="unsigned", publisher="")])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 2, seed=2)
+    _, labels = inject.add(rows, labels, seed=4, per_user={"swapped_binary": 1, "upload": 1})
+    assert {label["type"] for label in labels} == {"upload"}
+
+
+def test_beacon_template_has_a_path(tmp_path):
+    # One app name seen with and without a path (a process whose file wasn't read).
+    for i in range(4):
+        write_session(tmp_path, f"office-{i}", "office", start=1000 + i,
+                      flows=[flow(app="chrome.exe", at=1010 + i, app_path=""),
+                             flow(app="chrome.exe", at=1020 + i)])
+    rows, labels, _ = timeline.build(sessions.load(tmp_path), 3, seed=2)
+    rows, labels = inject.add(rows, labels, seed=4, per_user={"beacon": 2})
+    beacons = [label for label in labels if label["type"] == "beacon"]
+    assert beacons and all(label["app_path"] for label in beacons)
+    assert all(r["app_path"] for r in rows if r["type"] == "connection")

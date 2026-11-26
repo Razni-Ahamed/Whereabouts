@@ -13,18 +13,29 @@
 - **False alarm** = a test-week alert that matches nothing; reported per
   simulated user-week, at medium and above, and as "notified" (what the app
   would have pushed).
+- With `fits` (the release bar's rule, R26), a matching alert **detects** a
+  scenario instance only if it fits the instance's type; one that matches
+  but does not fit detects nothing and is still no false alarm (the staged
+  problem caused it).
+- A **lab artifact** (R30) is an unmatched `bad_network` alert whose detail
+  names the lab's synthetic `SBL-LAB` DROP entry: that entry is example.com's
+  address, shared with other apps' traffic (e.g. Cloudflare), so such a hit on
+  an app the scenario never ran on is no real false alarm. It is counted separately, never as a
+  false alarm. Matching `known_bad` detections are unchanged.
 """
 
 from __future__ import annotations
 
 import statistics
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .timeline import DAY
 
 GRACE = 3_600
 SERIOUS = {"medium", "high", "critical"}
+LAB_ENTRY = "(SBL-LAB)"
 
 
 @dataclass
@@ -36,6 +47,7 @@ class Scored:
     fa_notified: float = 0.0
     kinds: Counter = field(default_factory=Counter)
     alerts_in_test_week: int = 0
+    artifacts: list[dict] = field(default_factory=list)
 
 
 def _matches(alert: dict, label: dict, grace: int) -> bool:
@@ -50,7 +62,19 @@ def _matches(alert: dict, label: dict, grace: int) -> bool:
     return label["start"] <= alert["time"] <= label["end"] + grace
 
 
-def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE) -> Scored:
+def is_lab_artifact(alert: dict, labels: list[dict]) -> bool:
+    """A bad-network hit on the lab's synthetic SBL-LAB entry (R30), on an app the
+    known_bad scenario never ran (same app name, and path where both are known)."""
+    if alert.get("kind") != "bad_network" or LAB_ENTRY not in (alert.get("detail") or ""):
+        return False
+    return not any(
+        label.get("type") == "known_bad" and label.get("app_name") == alert.get("app_name")
+        and not (alert.get("app_path") and label.get("app_path") and alert["app_path"] != label["app_path"])
+        for label in labels)
+
+
+def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE,
+          fits: Callable[[dict, str], bool] | None = None) -> Scored:
     test_start = info["t0"] + info["learning_days"] * DAY
     users = info["users_per_persona"] * len(info["pools"])
     scored = Scored(user_weeks=users * info["test_days"] / 7)
@@ -63,7 +87,10 @@ def match(alerts: list[dict], labels: list[dict], info: dict, grace: int = GRACE
         hits = [label for label in test_labels if _matches(alert, label, grace)]
         if hits:
             for label in hits:
-                first_hit.setdefault(label["scenario"], alert["time"] - label["start"])
+                if fits is None or fits(alert, label["type"]):
+                    first_hit.setdefault(label["scenario"], alert["time"] - label["start"])
+        elif is_lab_artifact(alert, test_labels):
+            scored.artifacts.append(alert)
         else:
             scored.false_alarms.append(alert)
     scored.alerts_in_test_week = len(in_test)

@@ -1,4 +1,5 @@
-"""Reads captured lab sessions: the engine's CSV export plus session.json."""
+"""Reads captured lab sessions: the engine's CSV export, session.json and, when
+recorded, connections.jsonl (when each connection was opened)."""
 
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ def is_runner_app(name: str | None) -> bool:
 
 INT_FIELDS = ("remote_port", "bytes_sent", "bytes_received", "connections")
 TEXT_FIELDS = (
-    "app_name", "app_path", "app_sha256", "protocol", "remote_ip",
+    "app_name", "app_path", "app_sha256", "signature", "publisher", "protocol", "remote_ip",
     "domain", "domain_source", "owner", "country",
 )
 
@@ -41,6 +42,8 @@ class Session:
     counters: list[dict] = field(default_factory=list)
     live: list[dict] = field(default_factory=list)
     meta: dict = field(default_factory=dict)
+    # When each connection was opened (from the engine's --record-connections).
+    connections: list[dict] = field(default_factory=list)
 
 
 def unguard(text: str) -> str:
@@ -69,6 +72,23 @@ def read_flows(path: Path) -> list[dict]:
     return flows
 
 
+def read_connections(path: Path) -> list[dict]:
+    """The engine's --record-connections lines as timeline connection fields (time in
+    Unix seconds). Only connections of programs with a known path, as the engine keeps
+    them; a line cut short (the engine was stopped mid-write) is skipped."""
+    connections = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+            connection = {"app_path": record["app_path"], "app_name": record["app_name"],
+                          "destination": record["destination"], "time": int(record["time_ms"]) // 1000}
+        except (ValueError, KeyError, TypeError):
+            continue
+        if connection["app_path"] and not is_runner_app(connection["app_name"]):
+            connections.append(connection)
+    return connections
+
+
 def load(root: Path) -> list[Session]:
     """Every session folder (one holding session.json) under `root`, by id."""
     found = []
@@ -78,6 +98,8 @@ def load(root: Path) -> list[Session]:
         all_flows = read_flows(csv_path) if csv_path.exists() else []
         flows = [f for f in all_flows if not is_runner_app(f["app_name"])]
         meta["dropped_runner_flows"] = len(all_flows) - len(flows)
+        connections_path = meta_path.with_name("connections.jsonl")
+        connections = read_connections(connections_path) if connections_path.exists() else []
         found.append(Session(
             id=str(meta["id"]),
             persona=meta["persona"],
@@ -88,5 +110,6 @@ def load(root: Path) -> list[Session]:
             counters=list(meta.get("counters") or []),
             live=list(meta.get("live") or []),
             meta=meta,
+            connections=connections,
         ))
     return sorted(found, key=lambda s: s.id)

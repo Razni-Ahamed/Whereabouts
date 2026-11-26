@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { Ban, Check, EyeOff, Ghost, Radar, ShieldCheck, Siren } from '@lucide/svelte';
+  import { Ban, Check, EyeOff, Ghost, Radar, ShieldCheck, Siren, Sparkles } from '@lucide/svelte';
   import AppAvatar from '../lib/components/AppAvatar.svelte';
   import BlockMenu from '../lib/components/BlockMenu.svelte';
   import { appKey } from '../lib/apps';
   import { appLabel } from '../lib/format';
+  import { isIpLiteral } from '../lib/host';
+  import { alertTitle, moreReasonsText, reasonText } from '../lib/reasons';
   import { store } from '../lib/state.svelte';
   import type { AlertView, FlowView } from '../lib/types';
 
@@ -50,10 +52,15 @@
           title: "Traffic that couldn't be tied to an app",
           why: `${alert.detail ?? 'Some events'} went into a shared count because many connections flooded Whereabouts' table at once, which can be used to hide.`,
         };
+      case 'behaviour':
+        return {
+          title: alertTitle(alert),
+          why: 'This is not what Whereabouts has learned is usual for it.',
+        };
     }
   }
 
-  const ICONS = { bad_network: Siren, tracker: Radar, faked_dns: Ghost, unattributed: EyeOff };
+  const ICONS = { bad_network: Siren, tracker: Radar, faked_dns: Ghost, unattributed: EyeOff, behaviour: Sparkles };
 
   function ago(secs: number): string {
     const minutes = Math.max(0, Math.round((Date.now() / 1000 - secs) / 60));
@@ -64,8 +71,20 @@
     return new Date(secs * 1000).toLocaleDateString('en', { day: 'numeric', month: 'short' });
   }
 
-  /** A stand-in connection, so the Block… picker can offer its choices. */
-  function asFlow(alert: AlertView): FlowView {
+  /** The first site (not a company or country) a behaviour alert's reasons name. */
+  function siteOf(alert: AlertView): string | null {
+    const site = alert.reasons?.find(
+      (r) =>
+        ['new_site', 'random_name', 'beaconing'].includes(r.signal) &&
+        r.value?.includes('.') &&
+        !isIpLiteral(r.value),
+    );
+    return site?.value ?? null;
+  }
+
+
+  /** A stand-in connection, so the Block… picker can offer its choices. `site` makes it about one domain. */
+  function asFlow(alert: AlertView, site: string | null = null): FlowView {
     const isDomain = alert.kind === 'tracker';
     return {
       pid: 0,
@@ -74,11 +93,11 @@
       publisher: '',
       publisher_confirmed: false,
       protocol: 'TCP',
-      domain: isDomain ? alert.target : null,
-      domain_trust: isDomain ? 'verified' : null,
+      domain: isDomain ? alert.target : site,
+      domain_trust: isDomain || site ? 'verified' : null,
       owner: null,
       country: null,
-      remote: alert.target && !isDomain ? `${alert.target.includes(':') ? `[${alert.target}]` : alert.target}:0` : '',
+      remote: alert.kind !== 'behaviour' && alert.target && !isDomain ? `${alert.target.includes(':') ? `[${alert.target}]` : alert.target}:0` : '',
       bytes_sent: 0,
       bytes_received: 0,
       active: false,
@@ -142,7 +161,22 @@
               <span class="chip sev">{alert.severity}</span>
               <span class="muted when">{ago(alert.created_secs)}</span>
             </div>
-            <p class="why">{text.why}</p>
+            {#if alert.kind === 'behaviour'}
+              <ul class="reasons">
+                {#each alert.reasons ?? [] as reason, i (i)}
+                  <li>{reasonText(reason)}</li>
+                {/each}
+                {#if moreReasonsText(alert.dropped_reasons)}
+                  <li class="muted">{moreReasonsText(alert.dropped_reasons)}</li>
+                {/if}
+              </ul>
+              <p class="why">
+                {text.why}
+                {#if alert.seen_again}Seen again {alert.seen_again} {alert.seen_again === 1 ? 'time' : 'times'}.{/if}
+              </p>
+            {:else}
+              <p class="why">{text.why}</p>
+            {/if}
             {#if alert.app}
               <button class="who" type="button" title={alert.path ?? undefined} onclick={() => onpickapp(alert.app ? appKey(alert.app, alert.path) : '')}>
                 <AppAvatar app={alert.app} size={20} />
@@ -158,6 +192,15 @@
                 <button class="btn btn-ghost small" type="button" onclick={() => (blocking = asFlow(alert))}>
                   <Ban size={14} /> Block…
                 </button>
+              {:else if alert.app && alert.path && alert.kind === 'behaviour'}
+                <button class="btn btn-ghost small" type="button" onclick={() => (blocking = asFlow(alert))}>
+                  <Ban size={14} /> Block app
+                </button>
+                {#if siteOf(alert)}
+                  <button class="btn btn-ghost small" type="button" onclick={() => (blocking = asFlow(alert, siteOf(alert)))}>
+                    <Ban size={14} /> Block site
+                  </button>
+                {/if}
               {/if}
               <button
                 class="btn btn-ghost small"
@@ -173,7 +216,9 @@
                   class="btn btn-ghost small"
                   type="button"
                   disabled={busy === alert.id}
-                  title="Trust this: no more alerts about this app and {alert.kind === 'tracker' ? 'tracker' : 'network'}."
+                  title={alert.kind === 'behaviour'
+                    ? 'Treat this as normal: no more alerts about these destinations for this app.'
+                    : `Trust this: no more alerts about this app and ${alert.kind === 'tracker' ? 'tracker' : 'network'}.`}
                   onclick={() => dismiss(alert, true)}
                 >
                   This is fine
@@ -305,6 +350,17 @@
   .when {
     font-size: 12px;
   }
+  .reasons {
+    margin: 6px 0 0;
+    padding-left: 18px;
+    list-style: disc;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .reasons li {
+    margin: 2px 0;
+    overflow-wrap: anywhere;
+  }
   .why {
     margin: 4px 0 6px;
     font-size: 13px;
@@ -332,6 +388,17 @@
     display: flex;
     gap: 8px;
     align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  @media (max-width: 560px) {
+    .alert {
+      grid-template-columns: auto minmax(0, 1fr);
+    }
+    .actions {
+      grid-column: 1 / -1;
+      justify-content: flex-start;
+    }
   }
   .small {
     height: 32px;

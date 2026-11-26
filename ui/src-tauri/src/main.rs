@@ -8,7 +8,10 @@
 //! user through native Windows dialogs (where to save; whether to delete);
 //! `add_rule` shows what will be blocked in a native Windows dialog and
 //! blocks only if the user agrees; `remove_rule` and `set_blocking_paused`
-//! lift blocks (the safe direction).
+//! lift blocks (the safe direction). `profile` reads what was learned about
+//! a program; `reset_profile` asks in a native Windows dialog before the
+//! service forgets it; `set_goes_anywhere` only changes what counts as
+//! unusual for one program.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -33,8 +36,8 @@ use tauri_plugin_dialog::{
 use whereabouts_client::{Client, Problem, ProblemKind, unexpected};
 use whereabouts_core::text::display_safe;
 use whereabouts_ipc::{
-    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, MAX_HOURS, MAX_ROWS, PIPE_NAME,
-    Request, Response, RuleSpec, RuleView, Status,
+    AppTotals, DELETE_ALL_CONFIRMATION, EXPORT_PAGE_ROWS, FlowView, GoesAnywhereChoice, MAX_HOURS,
+    MAX_ROWS, PIPE_NAME, ProfileView, Request, Response, RuleSpec, RuleView, Status,
 };
 
 /// The service's status and current flows.
@@ -223,8 +226,9 @@ async fn delete_history(
         let confirmed = whereabouts_win_dialog::confirm(
             main_window(&app),
             "Delete everything Whereabouts saved?",
-            "All saved connection history and hourly totals will be deleted and overwritten. \
-             This cannot be undone.\n\nWhereabouts keeps recording new connections afterwards.",
+            "All saved connection history, hourly totals and behaviour profiles (what each app \
+             normally uses) will be deleted and overwritten. This cannot be undone.\n\nWhereabouts \
+             keeps recording new connections afterwards.",
             "Delete everything",
         );
         if !confirmed {
@@ -411,6 +415,119 @@ async fn set_blocking_paused(
     .await
 }
 
+/// One program's behaviour profile (`None` if it has none yet).
+#[tauri::command]
+async fn profile(
+    path: String,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Option<ProfileView>, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        connection.with(
+            |client| match client.ask(&Request::Profile { path: path.clone() })? {
+                Response::Profile { profile } => Ok(profile),
+                other => Err(unexpected(&other)),
+            },
+        )
+    })
+    .await
+}
+
+/// Asks the user, in a native Windows dialog, whether to forget what was
+/// learned about a program, and if they agree asks the service to. `false`
+/// if the user said no.
+#[tauri::command]
+async fn reset_profile(
+    path: String,
+    app: tauri::AppHandle,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<bool, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        // The name comes from the path, not from the web view's own words.
+        let name = program_name(&path);
+        // Cancel is the default: Enter must not throw away what was learned.
+        let confirmed = whereabouts_win_dialog::confirm(
+            main_window(&app),
+            "Reset what Whereabouts learned?",
+            &format!(
+                "{name} will start a new 7-day learning period. Until then you'll get no behaviour \
+                 warnings for it, and behaviour warnings you marked as fine for it can come \
+                 back.\n\nProgram file: {}",
+                display_safe(&path)
+            ),
+            "Reset",
+        );
+        if !confirmed {
+            return Ok(false);
+        }
+        connection.with(|client| {
+            match client.ask(&Request::ResetProfile { path: path.clone() })? {
+                Response::ProfileReset {} => Ok(true),
+                other => Err(unexpected(&other)),
+            }
+        })
+    })
+    .await
+}
+
+/// Says whether a program is expected to connect anywhere (a web browser).
+/// Only widens or narrows what counts as unusual for that one program, so
+/// it needs no dialog; the service insists on a trusted client.
+#[tauri::command]
+async fn set_goes_anywhere(
+    path: String,
+    value: GoesAnywhereChoice,
+    app: tauri::AppHandle,
+    connection: tauri::State<'_, Arc<Connection>>,
+) -> Result<Option<ProfileView>, Problem> {
+    let connection = Arc::clone(&connection);
+    blocking(move || {
+        // Widening what counts as normal silences warnings, so it is
+        // confirmed natively. Whether Auto widens is asked of the service,
+        // not taken from the web view.
+        let widens = match value {
+            GoesAnywhereChoice::On => true,
+            GoesAnywhereChoice::Off => false,
+            GoesAnywhereChoice::Auto => connection.with(|client| {
+                match client.ask(&Request::Profile { path: path.clone() })? {
+                    Response::Profile { profile } => {
+                        Ok(profile.is_some_and(|p| p.recognised_browser))
+                    }
+                    other => Err(unexpected(&other)),
+                }
+            })?,
+        };
+        if widens {
+            // Cancel is the default: Enter must not silence warnings.
+            let confirmed = whereabouts_win_dialog::confirm(
+                main_window(&app),
+                &format!("Treat every site as normal for {}?", program_name(&path)),
+                &format!(
+                    "Whereabouts will stop warning about new sites, companies and countries for \
+                     this program:\n\n{}",
+                    display_safe(&path)
+                ),
+                "Treat as normal",
+            );
+            if !confirmed {
+                return Ok(None);
+            }
+        }
+        connection.with(|client| {
+            let request = Request::SetGoesAnywhere {
+                path: path.clone(),
+                value,
+            };
+            match client.ask(&request)? {
+                Response::Profile { profile } => Ok(profile),
+                other => Err(unexpected(&other)),
+            }
+        })
+    })
+    .await
+}
+
 /// Saved alerts of the last `hours`, newest first.
 #[tauri::command]
 async fn alerts(
@@ -432,8 +549,8 @@ async fn alerts(
 }
 
 /// Marks an alert as seen and fine; with `allow`, alerts like it stop.
-/// Stopping alerts about a risky network is confirmed in a native Windows
-/// dialog first, so the web view cannot silence them on its own. `false` if
+/// Stopping alerts about a risky network, or after a high behaviour alert, is
+/// confirmed in a native Windows dialog first, so the web view cannot silence them on its own. `false` if
 /// the user said no.
 #[tauri::command]
 async fn dismiss_alert(
@@ -445,14 +562,11 @@ async fn dismiss_alert(
     let connection = Arc::clone(&connection);
     blocking(move || {
         if allow {
-            let alert = connection.with(|client| {
-                match client.ask(&Request::Alerts {
-                    hours: MAX_HOURS,
-                    limit: MAX_ROWS,
-                })? {
-                    Response::Alerts { alerts } => Ok(alerts.into_iter().find(|a| a.id == id)),
-                    other => Err(unexpected(&other)),
-                }
+            // Asked by ID: the alert list is trimmed to fit a message, so an
+            // alert on screen may be missing from it.
+            let alert = connection.with(|client| match client.ask(&Request::Alert { id })? {
+                Response::Alert { alert } => Ok(alert),
+                other => Err(unexpected(&other)),
             })?;
             let Some(alert) = alert else {
                 return Err(Problem::other("That alert no longer exists."));
@@ -463,21 +577,33 @@ async fn dismiss_alert(
                     .as_deref()
                     .or(alert.app.as_deref())
                     .map_or_else(|| String::from("this app"), display_safe);
-                let target = alert
-                    .detail
-                    .as_deref()
-                    .or(alert.target.as_deref())
-                    .map_or_else(|| String::from("this network"), display_safe);
                 // Cancel is the default: Enter must not silence a warning.
-                let confirmed = whereabouts_win_dialog::confirm(
-                    main_window(&app),
-                    "Stop these warnings?",
-                    &format!(
-                        "Whereabouts will no longer warn you when this program connects to this \
-                         network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
-                    ),
-                    "Stop these warnings",
-                );
+                let confirmed = if alert.kind == whereabouts_ipc::AlertKind::Behaviour {
+                    whereabouts_win_dialog::confirm(
+                        main_window(&app),
+                        "Treat this as normal?",
+                        &format!(
+                            "Whereabouts will stop warning you about these destinations for \
+                             this program:\n\n{program}\n\nOnly do this if you trust it."
+                        ),
+                        "Treat as normal",
+                    )
+                } else {
+                    let target = alert
+                        .detail
+                        .as_deref()
+                        .or(alert.target.as_deref())
+                        .map_or_else(|| String::from("this network"), display_safe);
+                    whereabouts_win_dialog::confirm(
+                        main_window(&app),
+                        "Stop these warnings?",
+                        &format!(
+                            "Whereabouts will no longer warn you when this program connects to \
+                             this network:\n\n{program}\n{target}\n\nOnly do this if you trust both."
+                        ),
+                        "Stop these warnings",
+                    )
+                };
                 if !confirmed {
                     return Ok(false);
                 }
@@ -548,8 +674,9 @@ async fn set_save_history(
                 .message(
                     "Whereabouts will still show live connections, raise alerts and block what \
                      you choose. But finished connections will no longer be saved, so the \
-                     History view and Export get nothing new, and per-app learning (coming in \
-                     version 0.3) has nothing to learn from.\n\nWhat should happen to the \
+                     History view and Export get nothing new. Learning what is normal for each \
+                     app works either way, and behaviour profiles are kept. Reset them on the \
+                     Apps screen, or use Delete everything.\n\nWhat should happen to the \
                      history saved so far? If you keep it, it is deleted as it ages: each \
                      connection after 30 days, hourly totals after 180 days.",
                 )
@@ -749,7 +876,10 @@ fn main() {
             dismiss_alert,
             set_list_updates,
             check_lists_now,
-            set_save_history
+            set_save_history,
+            profile,
+            reset_profile,
+            set_goes_anywhere
         ])
         .build(tauri::generate_context!())
         .expect("failed to start the Whereabouts app")

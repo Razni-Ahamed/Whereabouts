@@ -18,6 +18,9 @@ fn main() {
             "set_list_updates",
             "check_lists_now",
             "set_save_history",
+            "profile",
+            "reset_profile",
+            "set_goes_anywhere",
         ]),
     ))
     .expect("failed to run the Tauri build script");
