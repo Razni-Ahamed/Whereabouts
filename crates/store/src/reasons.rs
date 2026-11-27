@@ -38,6 +38,9 @@ pub enum Signal {
     RandomName,
     /// The program file changed and it now behaves differently.
     BinaryChanged,
+    /// A new program named like a known, signed one, but not signed by the
+    /// same publisher.
+    Impostor,
 }
 
 impl Signal {
@@ -53,6 +56,7 @@ impl Signal {
             Self::UnusualTime => "unusual_time",
             Self::RandomName => "random_name",
             Self::BinaryChanged => "binary_changed",
+            Self::Impostor => "impostor",
         }
     }
 
@@ -65,7 +69,7 @@ impl Signal {
                 Severity::Info
             }
             Self::RatioFlip | Self::Beaconing | Self::RandomName => Severity::Medium,
-            Self::UploadSpike | Self::BinaryChanged => Severity::High,
+            Self::UploadSpike | Self::BinaryChanged | Self::Impostor => Severity::High,
         }
     }
 }

@@ -43,7 +43,7 @@ pub const RANDOM_NAME_ENTROPY: f64 = 3.5;
 const RANDOM_NAME_MIN_LEN: usize = 8;
 
 /// Every signal.
-const ALL: [Signal; 9] = [
+const ALL: [Signal; 10] = [
     Signal::NewSite,
     Signal::NewCompany,
     Signal::NewCountry,
@@ -53,6 +53,7 @@ const ALL: [Signal; 9] = [
     Signal::UnusualTime,
     Signal::RandomName,
     Signal::BinaryChanged,
+    Signal::Impostor,
 ];
 
 /// Which signals are switched on.
@@ -320,6 +321,14 @@ mod tests {
         assert_eq!(severity_of(Signal::UnusualTime), Severity::Info);
         assert_eq!(severity_of(Signal::RandomName), Severity::Medium);
         assert_eq!(severity_of(Signal::BinaryChanged), Severity::High);
+    }
+
+    #[test]
+    fn impostor_is_high_and_on_by_default() {
+        assert_eq!(Signal::Impostor.as_str(), "impostor");
+        assert_eq!(severity_of(Signal::Impostor), Severity::High);
+        assert!(Toggles::default().is_on(Signal::Impostor));
+        assert!(Toggles::all_on().is_on(Signal::Impostor));
     }
 
     #[test]

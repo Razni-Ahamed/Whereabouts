@@ -22,7 +22,7 @@ from .score import SERIOUS, Scored, match  # noqa: E402
 SIGNAL_SEVERITY = {
     "new_site": "info", "new_company": "info", "new_country": "info", "upload_spike": "high",
     "ratio_flip": "medium", "beaconing": "medium", "unusual_time": "info", "random_name": "medium",
-    "binary_changed": "high",
+    "binary_changed": "high", "impostor": "high",
 }
 SIGNALS = tuple(SIGNAL_SEVERITY)
 # What ships on: every signal except beaconing (spec §8; `Toggles::default`).
