@@ -4,6 +4,10 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- **Dismiss all** on the Alerts screen marks every alert that needs a look as seen. They stay under *All*, and an alert comes back if the same thing happens again.
+
 ## [0.3.0] - 2026-11-25
 
 *Learn.* Whereabouts now learns what each app normally does and warns, with reasons, when that changes. The lab's release bar was met (held-out run, **lab numbers on datacenter runners, not real-world rates**; see [design spec §6.2](docs/design-spec.md)): 0.562 false alarms per simulated user-week (limit 1.0), and fitting alerts for random-looking domains 100 %, swapped programs 100 % and hidden uploads 69 %. Details in the [release notes](docs/releases/v0.3.0.md).

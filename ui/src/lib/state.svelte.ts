@@ -1,5 +1,6 @@
 // App-wide state, refreshed from the service.
 
+import { dismissEach } from './alerts';
 import { groupByApp } from './apps';
 import {
   addRule,
@@ -101,6 +102,20 @@ class Store {
       this.showNote({ text: allow ? "Marked as fine. You won't be told about this again." : 'Marked as seen.', tone: 'good' });
       await this.refreshAlerts();
     }
+  }
+
+  /** Marks each of these alerts as seen (like Dismiss: nothing is allowed). */
+  async dismissAll(ids: number[]): Promise<void> {
+    const { done, failed, firstError } = await dismissEach(ids, async (id) => {
+      const result = await dismissAlert(id, false);
+      return result.ok ? { ok: true } : { ok: false, message: result.problem.message };
+    });
+    if (failed > 0) {
+      this.showNote({ text: `${done} marked as seen; ${failed} could not be: ${firstError}`, tone: 'bad' });
+    } else if (done > 0) {
+      this.showNote({ text: done === 1 ? 'Marked as seen.' : `${done} alerts marked as seen.`, tone: 'good' });
+    }
+    await this.refreshAlerts();
   }
 
   /** Turns list updates on or off; `false` (with a note) if that failed. */
