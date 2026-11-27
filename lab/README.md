@@ -21,7 +21,7 @@ capture (one runner per session)         analyse (one runner)
 2. **Simulated user-weeks** (`lab timeline`): each simulated user has one persona and 14 days: 7 learning days (design spec D15) and a 7-day test week. Sessions are placed at the persona's usual hours. Per persona the sessions are split into a learning pool and a test pool, so **a user's test week never reuses a session it learned from** (no leakage).
 3. **Synthetic scenarios** (`--inject`), added to the test week with labels, because they must not be staged for real: a 200 MB hidden upload, 3 hours of beaconing, random-looking domains, a swapped program reaching new destinations. Their addresses are documentation ranges and `example.*` names.
 4. **Replay** (`crates/lab-replay`): runs every simulated user through **the same detection code the app ships** (`whereabouts-detect`), with a fresh temporary encrypted store each, and the same rule the app uses to decide what becomes a notification (`whereabouts_ipc::notify`). `--layers 1` runs the list and health checks; `--layers 1,2` also runs the behaviour Learner with **every** signal on (beaconing too), fed as the app feeds it: each flow's bytes spread over the hours it spans, its destinations learned by the app's own rule, and each recorded connection time for beaconing.
-5. **Score and report** (`lab report`): an alert of medium or higher matches a scenario when it is for the same user and app within the scenario's window plus an hour. Everything else in the test week is a false alarm. Reported: false alarms per simulated user-week (medium and up; and notified), detection rate and time to detect per scenario type, each behaviour signal on its own, and the **release bar** (U8): at most 1.0 medium+ false alarm per user-week and at least 50 % detection in 3 of the 5 Layer 2 scenario types (`upload`, `beacon`, `random_domain`, `swapped_binary`, `renamed_binary`). The bar is checked with **the signals that ship** (all but beaconing, as `Toggles::default`), with a second line for every signal on, for comparison; on the run named by `--bar`, else the last one with Layer 2 alerts. For the bar, a staged problem counts as caught only by a Layer 1 alert or a behaviour alert whose reasons fit it (upload: upload spike or ratio flip; beacon: beaconing; random_domain: random name; swapped_binary: binary changed; renamed_binary: any). `--signals a,b,c` scores another set of signals (an estimate: Layer 1 alerts always count, a behaviour alert counts if one of its reasons is on).
+5. **Score and report** (`lab report`): an alert of medium or higher matches a scenario when it is for the same user and app within the scenario's window plus an hour. Everything else in the test week is a false alarm. Reported: false alarms per simulated user-week (medium and up; and notified), detection rate and time to detect per scenario type, each behaviour signal on its own, and the **release bar** (U8): at most 1.0 medium+ false alarm per user-week and at least 50 % detection in 3 of the 5 Layer 2 scenario types (`upload`, `beacon`, `random_domain`, `swapped_binary`, `renamed_binary`). The bar is checked with **the signals that ship** (all but beaconing, as `Toggles::default`), with a second line for every signal on, for comparison; on the run named by `--bar`, else the last one with Layer 2 alerts. For the bar, a staged problem counts as caught only by a Layer 1 alert or a behaviour alert whose reasons fit it (upload: upload spike or ratio flip; beacon: beaconing; random_domain: random name; swapped_binary: binary changed; renamed_binary: the impostor warning). `--signals a,b,c` scores another set of signals (an estimate: Layer 1 alerts always count, a behaviour alert counts if one of its reasons is on).
 
 ## Running it
 
@@ -29,6 +29,12 @@ On GitHub (Actions → **Lab** → Run workflow), or:
 
 ```powershell
 gh workflow run lab.yml -f minutes=8 -f sessions_per_persona=4 -f users_per_persona=3 -f seed=1
+```
+
+To measure beaconing's false alarms, run **long sessions** by hand: `-f minutes=180`. Ordinary apps check in every 5 to 15 minutes, and beaconing needs 6 regular connections, so short sessions can't show those check-ins (see Known gaps). Each job's time limit is the session length plus 40 minutes, up to 340.
+
+```powershell
+gh workflow run lab.yml -f minutes=180 -f sessions_per_persona=4 -f users_per_persona=4 -f seed=3
 ```
 
 It also runs weekly. Results: the job summary, and the `lab-report-<run>` and `lab-dataset-<run>` artifacts (kept 90 days; datasets are never committed). To re-analyse an earlier run's sessions, pass `-f reanalyse_run_id=<run id>`.
@@ -61,7 +67,7 @@ Python runs only through uv (the version is pinned in `.python-version`, depende
 
 - The capture is the engine's CSV export: no process IDs and no DNS alias chains, so trackers hidden behind a site's own name are not detected in the lab (they are in the app).
 - New-app notices are not measured.
-- Beaconing false alarms are under-measured: sessions last about 8 minutes and beaconing needs 6 connections, so only check-ins every 90 seconds or less can show up; real telemetry every 5 to 15 minutes cannot.
+- Beaconing false alarms are under-measured in short runs: sessions last about 8 minutes by default and beaconing needs 6 connections, so only check-ins every 90 seconds or less can show up; real telemetry every 5 to 15 minutes cannot.
 - Connection lines carry no bytes, so the 64 KB per connection limit never rules a beacon out in the lab (pessimistic: more beaconing alerts than in the app).
 - Each flow's bytes are spread evenly over the hours it spans, which smooths bursts that cross an hour boundary (upload spike and ratio flip see less than the app would).
 - `swapped_binary` only targets apps that were signed (with a publisher) in the learning week: a swap of a program that was never signed isn't detected, by design. A swapped app's later rows from other scenarios are also unsigned.

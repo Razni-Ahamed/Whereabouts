@@ -28,12 +28,13 @@ SIGNALS = tuple(SIGNAL_SEVERITY)
 # What ships on: every signal except beaconing (spec §8; `Toggles::default`).
 SHIPPED = tuple(signal for signal in SIGNALS if signal != "beaconing")
 # For the release bar, the signals that count as catching each scenario type (R26).
-# Other types (renamed_binary, the live ones) are caught by any medium+ alert.
+# Other types (the live known_bad) are caught by any medium+ alert.
 FITTING = {
     "upload": {"upload_spike", "ratio_flip"},
     "beacon": {"beaconing"},
     "random_domain": {"random_name"},
     "swapped_binary": {"binary_changed"},
+    "renamed_binary": {"impostor"},
 }
 # Release bar U8 (design spec v0.3): with the shipped signals on together, at most
 # 1.0 medium+ false alarms per user-week, and at least 50 % detection in at least 3

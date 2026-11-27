@@ -124,7 +124,7 @@ def test_bar_counts_only_fitting_reasons():
     assert bar.false_alarms == []  # caused by a staged problem: never a false alarm
     for kind, reasons in [("upload", ["ratio_flip"]), ("upload", ["upload_spike"]),
                           ("random_domain", ["new_site", "random_name"]), ("swapped_binary", ["binary_changed"]),
-                          ("renamed_binary", ["new_country"])]:
+                          ("renamed_binary", ["impostor"])]:
         assert report.fits_type(behaviour(reasons), kind), (kind, reasons)
     assert not report.fits_type(behaviour(["new_site", "new_company"]), "random_domain")
     assert report.fits_type(alert(), "upload")  # a Layer 1 alert always fits
@@ -309,3 +309,13 @@ def test_sbl_lab_hit_on_the_scenarios_own_app_is_a_real_false_alarm():
     scored = score.match([late, other_user, chrome], [known_bad], INFO)
     assert scored.false_alarms == [other_user, late] or scored.false_alarms == [late, other_user]
     assert scored.artifacts == [chrome]
+
+
+def test_renamed_binary_needs_an_impostor_reason():
+    renamed = label(kind="renamed_binary")
+    assert not report.fits_type(behaviour(["random_name"]), "renamed_binary")
+    assert report.fits_type(behaviour(["impostor"], severity="high"), "renamed_binary")
+    bar = score.match([behaviour(["random_name"])], [renamed], INFO, fits=report.fits_type)
+    assert bar.per_type["renamed_binary"]["detected"] == 0
+    bar = score.match([behaviour(["impostor"], severity="high")], [renamed], INFO, fits=report.fits_type)
+    assert bar.per_type["renamed_binary"]["detected"] == 1
