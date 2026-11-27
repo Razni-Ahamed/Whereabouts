@@ -92,6 +92,16 @@ From a terminal, the installed service can also tell you how it is doing, and ad
 
 Run `whereabouts-service.exe --help` for every command (blocking an app or an address, pausing and resuming).
 
+### Code signing policy
+
+Windows releases are to be code-signed through the SignPath Foundation: free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). The application is in progress, so current releases are still unsigned (check them with `SHA256SUMS.txt` as above).
+
+- Only installers built by this repository's GitHub Actions release workflow, from a tagged commit on `main`, are signed.
+- Committers and reviewers: [Razni-Ahamed](https://github.com/Razni-Ahamed)
+- Approvers: [Razni-Ahamed](https://github.com/Razni-Ahamed)
+
+Privacy: this program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Its only own requests are the optional list updates, which it asks about before downloading anything; see [PRIVACY.md](PRIVACY.md#requests-whereabouts-makes-itself).
+
 ### Without installing
 
 Developers can watch live connections in a terminal without installing anything. Open **PowerShell as administrator** in the project folder, download the offline data once (see [data/README.md](data/README.md)), then run the console view (stop it with **Ctrl+C**, or add `--seconds 30`):
