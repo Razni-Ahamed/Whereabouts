@@ -4,9 +4,19 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-28
+
+*Detect.* Whereabouts now warns at once about a program posing as one you already use, and the lab's release bar was met again (held-out run, **lab numbers on datacenter runners, not real-world rates**; see [design spec §6.2](docs/design-spec.md)): 0.188 false alarms per simulated user-week (limit 1.0), and fitting alerts for random-looking domains 69 %, swapped programs 100 % and hidden uploads 75 %. Details in the [release notes](docs/releases/v0.4.0.md).
+
 ### Added
 
+- **Impostor warning.** A program named like one you already use (and have used for at least a week) but not signed by the same publisher (unsigned, or signed by someone else) is warned about straight away, without waiting for it to be learned. In the lab it caught 26 of the 27 renamed copies of an app the simulated user had used for a week, with no false alarm.
 - **Dismiss all** on the Alerts screen marks every alert that needs a look as seen. They stay under *All*, and an alert comes back if the same thing happens again.
+
+### Changed
+
+- **Browsers no longer get "random-looking name" warnings.** Browsers reach ad and CDN names that only look random all day; in the lab they caused most false alarms. Other apps still get them.
+- **Beaconing stays off** in 0.4, now measured with 3-hour lab sessions. When switched on, it ignores Windows' own services checking in with Microsoft.
 
 ## [0.3.0] - 2026-11-25
 
@@ -158,7 +168,8 @@ First release: a developer preview for Windows 10 (22H2) and 11, 64-bit.
 - `core`: connection metadata model, robust statistics (median, MAD, robust z-score) and domain entropy.
 - CI on Windows: formatting, Clippy, tests, and licence/advisory checks with `cargo-deny`.
 
-[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Razni-Ahamed/Whereabouts/compare/v0.1.1...v0.2.0
