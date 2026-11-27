@@ -460,7 +460,10 @@ impl Learner {
             reasons.extend(new.into_iter().filter(|r| {
                 !matches!((item_kind(r.signal), r.value.as_deref()), (Some(kind), Some(value)) if quiet(kind, value))
             }));
+            // Not for apps that go anywhere: browsers reach ad and CDN names
+            // that only look random all day (lab-tuned).
             if self.toggles.is_on(Signal::RandomName)
+                && !goes_anywhere
                 && let Some(domain) = flow.domain.filter(|d| !d.is_empty())
                 && !profile.knows(ItemKind::Domain, domain)
                 && !quiet(ItemKind::Domain, domain)

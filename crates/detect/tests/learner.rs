@@ -627,6 +627,24 @@ fn goes_anywhere_app_gets_no_destination_alerts() {
 }
 
 #[test]
+fn goes_anywhere_app_gets_no_random_name_warnings() {
+    // Browsers reach ad and CDN names that only look random all day.
+    let mut db = TestStore::open("anywhere-random");
+    seed(&mut db, GoesAnywhere::UserOn, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    assert!(
+        learner
+            .finished(&random_flow(T0), &enricher(), &mut db, at(T0))
+            .is_empty()
+    );
+    assert!(behaviour(&db).is_empty());
+    assert_eq!(
+        state(&db, ItemKind::Domain, RANDOM_DOMAIN),
+        Some(ItemState::Learned)
+    );
+}
+
+#[test]
 fn allowed_beacon_not_raised_again() {
     let mut db = TestStore::open("beacon");
     seed(&mut db, GoesAnywhere::Auto, &[]);
