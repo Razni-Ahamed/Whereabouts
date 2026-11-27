@@ -63,6 +63,10 @@ pub struct AppFacts<'a> {
     pub signature_valid: bool,
     /// Whether the file is in a folder only administrators can change.
     pub installed_by_admins: bool,
+    /// Whether the signature could be checked at all (false when it could
+    /// not be read): only then do `publisher` and `signature_valid` say
+    /// "unsigned".
+    pub signature_checked: bool,
 }
 
 /// A flow the engine finished, with what is known about where it went.
@@ -113,6 +117,9 @@ pub struct Learner {
     time_checked: HashMap<String, i64>,
     /// Problems with the store, for the caller to report ([`Learner::take_errors`]).
     errors: Vec<String>,
+    /// Impostor reasons found when [`Self::load`] created a profile, saved
+    /// by the caller as an alert.
+    first_sight: Vec<Reason>,
 }
 
 impl Learner {
@@ -129,7 +136,110 @@ impl Learner {
             suspects: HashMap::new(),
             time_checked: HashMap::new(),
             errors: Vec::new(),
+            first_sight: Vec::new(),
         }
+    }
+
+    /// Adds traffic of `app` (see [`Self::traffic_inner`]), and warns at once
+    /// if `app` is a new program posing as a known one.
+    pub fn traffic(
+        &mut self,
+        app: &AppFacts<'_>,
+        deltas: &[Delta],
+        enricher: &Enricher,
+        store: &mut Store,
+        now: SystemTime,
+    ) -> Vec<Raised> {
+        let mut raised = self.traffic_inner(app, deltas, enricher, store, now);
+        raised.extend(self.save_first_sight(app, store, now));
+        raised
+    }
+
+    /// Learns a finished flow (see [`Self::finished_inner`]), and warns at
+    /// once if its program is a new one posing as a known one.
+    pub fn finished(
+        &mut self,
+        flow: &Finished<'_>,
+        enricher: &Enricher,
+        store: &mut Store,
+        now: SystemTime,
+    ) -> Vec<Raised> {
+        let mut raised = self.finished_inner(flow, enricher, store, now);
+        raised.extend(self.save_first_sight(&flow.app, store, now));
+        raised
+    }
+
+    /// Saves the impostor reasons [`Self::load`] found for a new program.
+    fn save_first_sight(
+        &mut self,
+        app: &AppFacts<'_>,
+        store: &mut Store,
+        now: SystemTime,
+    ) -> Vec<Raised> {
+        let reasons = std::mem::take(&mut self.first_sight);
+        if reasons.is_empty() {
+            return Vec::new();
+        }
+        let key = known_app_key(app.path);
+        let saved = self
+            .alerts
+            .fresh(&key, reasons, store)
+            .and_then(|fresh| self.alerts.save(&key, app, fresh, store, now));
+        match saved {
+            Ok(saved) => saved.raised.into_iter().collect(),
+            Err(error) => {
+                self.errors
+                    .push(format!("could not save an alert: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether `app`, seen for the first time, is named like an established
+    /// program with a known signer elsewhere on this PC but isn't signed by
+    /// that publisher. Nothing when its signature couldn't be checked.
+    fn impostor(
+        &mut self,
+        key: &str,
+        app: &AppFacts<'_>,
+        store: &Store,
+        now: SystemTime,
+    ) -> Vec<Reason> {
+        if !self.toggles.is_on(Signal::Impostor) || !app.signature_checked {
+            return Vec::new();
+        }
+        let rows = match store.profile_rows() {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.errors
+                    .push(format!("could not read behaviour profiles: {error}"));
+                return Vec::new();
+            }
+        };
+        let name = crate::browsers::program_file_name(app.path);
+        let signer = app.publisher.filter(|_| app.signature_valid);
+        rows.into_iter()
+            .filter(|row| row.key != key)
+            .filter(|row| crate::browsers::program_file_name(&row.path).eq_ignore_ascii_case(name))
+            .filter(|row| {
+                row.first_data
+                    .checked_add(crate::profile::LEARNING)
+                    .is_some_and(|end| now >= end)
+            })
+            .find(|row| {
+                row.last_publisher.as_deref().is_some_and(|known| {
+                    signer.is_none_or(|signer| !signer.eq_ignore_ascii_case(known))
+                })
+            })
+            .map(|row| Reason {
+                signal: Signal::Impostor,
+                value: Some(row.path),
+                observed: None,
+                usual: None,
+                count: None,
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Changes the local time zone's offset from UTC.
@@ -141,7 +251,7 @@ impl Learner {
     /// to its hours in memory, and checks upload spike, ratio flip, unusual
     /// time and beaconing on the hours it touches. Returns an alert to
     /// notify about, if any.
-    pub fn traffic(
+    fn traffic_inner(
         &mut self,
         app: &AppFacts<'_>,
         deltas: &[Delta],
@@ -250,7 +360,7 @@ impl Learner {
     /// and changed-program signals (none while learning). Returns an alert to
     /// notify about, if any. If the alert cannot be saved, the destinations
     /// behind it are not learned, so the next flow checks them again.
-    pub fn finished(
+    fn finished_inner(
         &mut self,
         flow: &Finished<'_>,
         enricher: &Enricher,
@@ -749,6 +859,7 @@ impl Learner {
             hours: Vec::new(),
         };
         self.profiles.insert(key.to_owned(), Profile::new(stored));
+        self.first_sight = self.impostor(key, app, store, now);
         true
     }
 

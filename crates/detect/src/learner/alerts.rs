@@ -484,6 +484,7 @@ mod tests {
             publisher: None,
             signature_valid: false,
             installed_by_admins: false,
+            signature_checked: true,
         }
     }
 

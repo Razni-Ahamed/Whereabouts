@@ -84,6 +84,7 @@ fn app() -> AppFacts<'static> {
         publisher: Some("Chat Inc"),
         signature_valid: true,
         installed_by_admins: true,
+        signature_checked: true,
     }
 }
 
@@ -1519,4 +1520,203 @@ fn another_value_counting_on_the_dismissed_alert_does_not_hide_a_dropped_reminde
     assert_eq!(saved.len(), 2);
     assert_eq!(saved.iter().find(|a| a.id == newer).unwrap().seen_again, 1);
     assert!(learner.take_errors().is_empty());
+}
+
+// --- Impostor programs (v0.4) ---
+
+/// Where a second copy named like the seeded app turns up.
+const DOWNLOADS: &str = r"C:\Users\u\Downloads\Chat.exe";
+
+/// A program at `path` (named like the seeded `Chat.exe`) with this signature.
+fn newcomer(
+    path: &'static str,
+    publisher: Option<&'static str>,
+    checked: bool,
+) -> AppFacts<'static> {
+    AppFacts {
+        app_name: "Chat.exe",
+        path,
+        sha256: Some("cccc"),
+        publisher,
+        signature_valid: publisher.is_some(),
+        signature_checked: checked,
+        installed_by_admins: false,
+    }
+}
+
+/// The first finished flow of `app`, to the seeded app's usual places.
+fn first_flow(app: AppFacts<'static>, secs: u64) -> Finished<'static> {
+    Finished {
+        app,
+        domain: Some("chat.example"),
+        company: Some("Chat Inc"),
+        country: Some("DE"),
+        port: 443,
+        first_seen: at(secs.saturating_sub(30)),
+        last_seen: at(secs),
+    }
+}
+
+/// The impostor alerts saved so far.
+fn impostors(store: &Store) -> Vec<StoredAlert> {
+    behaviour(store)
+        .into_iter()
+        .filter(|a| signals_of_stored(a).contains(&Signal::Impostor))
+        .collect()
+}
+
+#[test]
+fn unsigned_namesake_of_a_signed_app_is_an_impostor() {
+    let mut db = TestStore::open("impostor-unsigned");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+
+    assert_eq!(raised.len(), 1, "warned at once, while still learning");
+    assert_eq!(raised[0].alert.severity, Severity::High);
+    assert_eq!(raised[0].alert.app_path.as_deref(), Some(DOWNLOADS));
+    let reason = &raised[0].alert.reasons[0];
+    assert_eq!(reason.signal, Signal::Impostor);
+    assert_eq!(reason.value.as_deref(), Some(PATH));
+    assert!(learner.take_errors().is_empty());
+}
+
+#[test]
+fn differently_signed_namesake_is_an_impostor() {
+    let mut db = TestStore::open("impostor-other-signer");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let app = newcomer(DOWNLOADS, Some("Evil Ltd"), true);
+    learner.finished(&first_flow(app, T0), &enricher(), &mut db, at(T0));
+    assert_eq!(impostors(&db).len(), 1);
+}
+
+#[test]
+fn same_publisher_elsewhere_is_not_an_impostor() {
+    let mut db = TestStore::open("impostor-same-signer");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let app = newcomer(r"C:\Apps\Chat PTB\Chat.exe", Some("chat inc"), true);
+    learner.finished(&first_flow(app, T0), &enricher(), &mut db, at(T0));
+    assert!(impostors(&db).is_empty());
+}
+
+#[test]
+fn learning_namesake_is_not_compared() {
+    let mut db = TestStore::open("impostor-learning");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    // The known program only started 3 days ago: like an installer that ran
+    // once, it isn't one the user really uses yet.
+    let mut row = db.profile(&key()).unwrap().unwrap().row;
+    row.first_data = at(T0 - 3 * DAY);
+    db.save_profile_row(&row).unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert!(impostors(&db).is_empty());
+}
+
+#[test]
+fn unsigned_namesake_has_nothing_to_compare() {
+    let mut db = TestStore::open("impostor-no-signer");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut row = db.profile(&key()).unwrap().unwrap().row;
+    row.last_publisher = None;
+    db.save_profile_row(&row).unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert!(impostors(&db).is_empty());
+}
+
+#[test]
+fn unchecked_signature_is_never_an_impostor() {
+    let mut db = TestStore::open("impostor-unchecked");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, false), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert!(impostors(&db).is_empty());
+}
+
+#[test]
+fn names_and_paths_compare_without_case() {
+    let mut db = TestStore::open("impostor-case");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    // The seeded path in other letters is the same program, not a second one.
+    let same = AppFacts {
+        app_name: "CHAT.EXE",
+        ..newcomer(r"c:\apps\CHAT.EXE", Some("Chat Inc"), true)
+    };
+    learner.finished(&first_flow(same, T0), &enricher(), &mut db, at(T0));
+    assert!(impostors(&db).is_empty());
+
+    let upper = newcomer(r"C:\Users\u\Downloads\CHAT.EXE", None, true);
+    learner.finished(
+        &first_flow(upper, T0 + 60),
+        &enricher(),
+        &mut db,
+        at(T0 + 60),
+    );
+    assert_eq!(impostors(&db).len(), 1);
+}
+
+#[test]
+fn impostor_toggled_off_raises_nothing() {
+    let mut db = TestStore::open("impostor-off");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut toggles = Toggles::default();
+    toggles.on.insert(Signal::Impostor, false);
+    let mut learner = Learner::new(toggles, 0);
+    learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert!(impostors(&db).is_empty());
+}
+
+#[test]
+fn allowed_impostor_does_not_warn_again() {
+    let mut db = TestStore::open("impostor-allowed");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    learner
+        .alert_closed(&mut db, raised[0].id, true, at(T0 + 60))
+        .unwrap();
+    db.dismiss_alert(raised[0].id, true, at(T0 + 60)).unwrap();
+    let new_key = whereabouts_store::known_app_key(DOWNLOADS);
+    let allow = format!("behaviour|{new_key}|impostor|{PATH}");
+    assert!(db.is_allowed(&allow).unwrap());
+
+    // Reset learns the new program from scratch: the next first sight warns
+    // again, because Reset removes its lasting allows.
+    assert!(learner.reset(&mut db, &new_key, at(T0 + DAY)).unwrap());
+    assert!(!db.is_allowed(&allow).unwrap());
 }

@@ -195,6 +195,8 @@ fn app_facts(row: &FlowRow) -> Option<AppFacts<'_>> {
         publisher: row.publisher.as_deref().filter(|_| signed),
         signature_valid: signed,
         installed_by_admins: installed_by_admins(path),
+        // No signature data says nothing either.
+        signature_checked: checked && row.signature.is_some(),
     })
 }
 
@@ -416,6 +418,7 @@ fn apply(user: &mut User, step: &Step<'_>, time: u64, enricher: &Enricher) -> Re
                     publisher: None,
                     signature_valid: false,
                     installed_by_admins: installed_by_admins(&row.app_path),
+                    signature_checked: false,
                 };
                 let delta = Delta {
                     app_key: known_app_key(&row.app_path),
