@@ -17,7 +17,7 @@
 //!
 //! Everything happens in time order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,7 +33,7 @@ use whereabouts_detect::signals::Toggles;
 use whereabouts_detect::{Detector, FlowFacts};
 use whereabouts_enrich::{DropList, Enricher, registrable_domain};
 use whereabouts_ipc::notify::AlertLimiter;
-use whereabouts_store::{AlertKind, Key, Severity, Store, known_app_key};
+use whereabouts_store::{AlertKind, GoesAnywhere, Key, Severity, Store, known_app_key};
 
 use crate::timeline::{ConnectionRow, CounterRow, FlowRow, Line};
 
@@ -93,6 +93,59 @@ struct User {
     hour: Option<u64>,
     /// The time of the user's last event.
     last: u64,
+    /// What each program's flows said about its signature, for its
+    /// connection lines (which carry none).
+    signers: Signers,
+    /// The lab's own browsers already marked as going anywhere.
+    lab_browsers: HashSet<String>,
+}
+
+/// Per program (app key): whether it is signed, and by whom.
+type Signers = HashMap<String, (bool, Option<String>)>;
+
+/// The lab drives an unsigned test build of a browser from a user folder
+/// (Playwright's). It stands in for the user's real, installed browser, which
+/// the app recognises by itself, so the replay marks it as going anywhere.
+fn is_lab_browser(path: &str) -> bool {
+    path.to_ascii_lowercase().contains(r"\ms-playwright\")
+}
+
+/// The program behind a connection line, with the signature its flows showed
+/// (nothing known before its first flow).
+fn connection_facts<'a>(path: &'a str, name: &'a str, signers: &'a Signers) -> AppFacts<'a> {
+    let known = signers.get(&known_app_key(path));
+    AppFacts {
+        app_name: name,
+        path,
+        sha256: None,
+        publisher: known.and_then(|(_, publisher)| publisher.as_deref()),
+        signature_valid: known.is_some_and(|(signed, _)| *signed),
+        installed_by_admins: installed_by_admins(path),
+        signature_checked: known.is_some(),
+    }
+}
+
+/// Remembers a flow's signature for its program's connection lines, and marks
+/// the lab's own browser as going anywhere once its profile exists.
+fn note_program(user: &mut User, row: &FlowRow) {
+    let Some(path) = row.app_path.as_deref().filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let key = known_app_key(path);
+    if let Some(signature) = row.signature.as_deref() {
+        let signed = signature == "signed";
+        let publisher = row.publisher.clone().filter(|_| signed);
+        user.signers.insert(key.clone(), (signed, publisher));
+    }
+    if is_lab_browser(path)
+        && !user.lab_browsers.contains(&key)
+        && let Some(learner) = user.learner.as_mut()
+        && learner
+            .set_goes_anywhere(&mut user.store, &key, GoesAnywhere::UserOn)
+            .unwrap_or(false)
+    {
+        user.lab_browsers.insert(key);
+    }
 }
 
 /// One thing that happens to a user, at a moment.
@@ -293,6 +346,8 @@ fn open_user(drop: Option<&DropList>, layers: Layers, path: &Path) -> Result<Use
         learner,
         hour: None,
         last: 0,
+        signers: Signers::default(),
+        lab_browsers: HashSet::new(),
     })
 }
 
@@ -388,6 +443,7 @@ fn apply(user: &mut User, step: &Step<'_>, time: u64, enricher: &Enricher) -> Re
                 };
                 learner.traffic(&app, &[delta], enricher, &mut user.store, now);
             }
+            note_program(user, row);
         }
         Step::Finished(row, key) => {
             if let (Some(learner), Some(app)) = (user.learner.as_mut(), app_facts(row)) {
@@ -408,20 +464,13 @@ fn apply(user: &mut User, step: &Step<'_>, time: u64, enricher: &Enricher) -> Re
                 };
                 learner.finished(&finished, enricher, &mut user.store, now);
             }
+            note_program(user, row);
         }
         Step::Connection(row) => {
             if let Some(learner) = user.learner.as_mut()
                 && !row.app_path.is_empty()
             {
-                let app = AppFacts {
-                    app_name: &row.app_name,
-                    path: &row.app_path,
-                    sha256: None,
-                    publisher: None,
-                    signature_valid: false,
-                    installed_by_admins: installed_by_admins(&row.app_path),
-                    signature_checked: false,
-                };
+                let app = connection_facts(&row.app_path, &row.app_name, &user.signers);
                 let delta = Delta {
                     app_key: known_app_key(&row.app_path),
                     destination: connection_destination(&row.destination),
@@ -509,6 +558,32 @@ fn user_alerts(name: &str, store: &Store) -> Result<Vec<AlertOut>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_lines_carry_the_programs_signature() {
+        let mut signers = Signers::default();
+        let svchost = r"C:\Windows\System32\svchost.exe";
+        // Before any flow of the program: nothing is known about it.
+        let unknown = connection_facts(svchost, "svchost.exe", &signers);
+        assert!(!unknown.signature_checked && unknown.publisher.is_none());
+        signers.insert(
+            known_app_key(svchost),
+            (true, Some("Microsoft Windows Publisher".to_owned())),
+        );
+        let facts = connection_facts(svchost, "svchost.exe", &signers);
+        assert!(facts.signature_checked && facts.signature_valid && facts.installed_by_admins);
+        assert_eq!(facts.publisher, Some("Microsoft Windows Publisher"));
+    }
+
+    #[test]
+    fn the_labs_own_browser_counts_as_a_browser() {
+        assert!(is_lab_browser(
+            r"C:\Users\runneradmin\AppData\Local\ms-playwright\firefox-1572\firefox\firefox.exe"
+        ));
+        assert!(!is_lab_browser(
+            r"C:\Users\runneradmin\AppData\Local\Lab\Discord.exe"
+        ));
+    }
 
     fn row(first_seen: u64, last_seen: u64, sent: u64, received: u64) -> FlowRow {
         FlowRow {
