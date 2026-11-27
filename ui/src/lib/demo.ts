@@ -199,6 +199,7 @@ export function demoSetPaused(paused: boolean): Rules {
 // Demo alerts, kept in memory while the page is open.
 const minute = 60;
 let demoAlertList: AlertView[] = [
+  { id: 9, created_secs: now() - 2 * minute, kind: 'behaviour', severity: 'high', app: 'chrome.exe', path: 'C:\\Users\\you\\Downloads\\chrome.exe', target: PATHS['chrome.exe'] ?? null, detail: null, dismissed: false, can_allow: true, seen_again: 0, reasons: [{ signal: 'impostor', value: PATHS['chrome.exe'] ?? null, observed: null, usual: null, count: null }] },
   { id: 8, created_secs: now() - 9 * minute, kind: 'behaviour', severity: 'high', app: 'Discord.exe', path: PATHS['Discord.exe'] ?? null, target: null, detail: null, dismissed: false, can_allow: false, seen_again: 2, reasons: [{ signal: 'upload_spike', value: null, observed: 356_515_840, usual: 5_242_880, count: null }] },
   { id: 7, created_secs: now() - 21 * minute, kind: 'behaviour', severity: 'medium', app: 'Code.exe', path: PATHS['Code.exe'] ?? null, target: 'q7x9k2m4zt8w.example', detail: null, dismissed: false, can_allow: true, seen_again: 0, reasons: [{ signal: 'new_site', value: 'q7x9k2m4zt8w.example', observed: null, usual: null, count: null }, { signal: 'random_name', value: 'q7x9k2m4zt8w.example', observed: 3.6, usual: null, count: null }] },
   { id: 6, created_secs: now() - 4 * minute, kind: 'bad_network', severity: 'high', app: 'updater.exe', path: PATHS['updater.exe'] ?? null, target: '185.215.113.66', detail: '185.215.113.0/24 (SBL549867)', dismissed: false, can_allow: true },

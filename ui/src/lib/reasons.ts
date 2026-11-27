@@ -35,6 +35,10 @@ export function reasonText(r: ReasonView): string {
       return present(r.value) ? `Used a random-looking name: ${r.value}` : 'Used a random-looking name.';
     case 'binary_changed':
       return 'Its program file changed and is no longer signed by the same publisher, and it reached somewhere new.';
+    case 'impostor':
+      return present(r.value)
+        ? `Same name as ${r.value}, but not signed by the same publisher. It may be pretending to be that program.`
+        : 'Same name as a program you already use, but not signed by the same publisher.';
     default:
       return 'Unusual behaviour';
   }
