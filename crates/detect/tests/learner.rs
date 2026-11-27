@@ -1756,16 +1756,134 @@ fn windows_own_services_are_not_beacons() {
         installed_by_admins: false,
         ..windows
     };
-    let mut beacon = |app: &AppFacts<'_>, start: u64| {
+    let mut beacon = |app: &AppFacts<'_>, to: &str, start: u64| {
         let mut raised = Vec::new();
         for i in 0..8 {
             let secs = start + i * 60;
-            let deltas = [delta(secs, "microsoft.com", 500, 1)];
+            let deltas = [delta(secs, to, 500, 1)];
             raised.extend(learner.traffic(app, &deltas, &e, &mut db, at(secs)));
         }
         raised
     };
-    assert!(beacon(&windows, T0).is_empty());
+    assert!(beacon(&windows, "microsoft.com", T0).is_empty());
+    // A Windows tool (powershell, rundll32, curl...) beaconing anywhere else
+    // is exactly what malware does: still caught.
+    assert_eq!(beacon(&windows, "c2.example", T0 + 2 * HOUR).len(), 1);
     // A Microsoft-signed file in a folder anyone can change still counts.
-    assert_eq!(beacon(&user_copy, T0 + DAY).len(), 1);
+    assert_eq!(beacon(&user_copy, "microsoft.com", T0 + DAY).len(), 1);
+}
+
+/// Sets the seeded app's first data to `secs`.
+fn seeded_since(db: &mut Store, secs: u64) {
+    let mut row = db.profile(&key()).unwrap().unwrap().row;
+    row.first_data = at(secs);
+    row.learned_since = at(secs);
+    db.save_profile_row(&row).unwrap();
+}
+
+#[test]
+fn copy_seen_before_its_namesake_was_established_is_caught_later() {
+    let mut db = TestStore::open("impostor-later");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    seeded_since(&mut db, T0 - 3 * DAY); // the real app is still learning
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let fake = || first_flow(newcomer(DOWNLOADS, None, true), T0);
+    learner.finished(&fake(), &enricher(), &mut db, at(T0));
+    assert!(impostors(&db).is_empty());
+
+    // Five days on, the real app is established and the copy is still newer.
+    let later = T0 + 5 * DAY;
+    let mut flow = fake();
+    flow.first_seen = at(later - 30);
+    flow.last_seen = at(later);
+    let raised = learner.finished(&flow, &enricher(), &mut db, at(later));
+    assert_eq!(raised.len(), 1);
+    assert_eq!(impostors(&db).len(), 1);
+}
+
+#[test]
+fn dismissed_impostor_comes_back_the_next_day() {
+    let mut db = TestStore::open("impostor-remind");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    learner
+        .alert_closed(&mut db, raised[0].id, false, at(T0 + 60))
+        .unwrap();
+    db.dismiss_alert(raised[0].id, false, at(T0 + 60)).unwrap();
+    // Later the same day: no repeat.
+    let same_day = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0 + 3_600),
+        &enricher(),
+        &mut db,
+        at(T0 + 3_600),
+    );
+    assert!(same_day.is_empty());
+    // The next day it reminds.
+    let next = T0 + DAY;
+    let again = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), next),
+        &enricher(),
+        &mut db,
+        at(next),
+    );
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].alert.reasons[0].signal, Signal::Impostor);
+}
+
+#[test]
+fn older_program_is_not_called_an_impostor() {
+    // An unsigned portable copy that was there long before a signed install
+    // is not pretending to be it.
+    let mut db = TestStore::open("impostor-older");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let old = whereabouts_store::known_app_key(DOWNLOADS);
+    let mut row = db.profile(&key()).unwrap().unwrap().row;
+    row.key = old.clone();
+    row.path = DOWNLOADS.to_owned();
+    row.first_data = at(T0 - 30 * DAY);
+    row.learned_since = at(T0 - 30 * DAY);
+    row.last_publisher = None;
+    db.save_profile_row(&row).unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert!(impostors(&db).is_empty());
+}
+
+#[test]
+fn allowed_impostor_stays_quiet_the_next_day() {
+    let mut db = TestStore::open("impostor-allowed-later");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    learner
+        .alert_closed(&mut db, raised[0].id, true, at(T0 + 60))
+        .unwrap();
+    db.dismiss_alert(raised[0].id, true, at(T0 + 60)).unwrap();
+    let next = T0 + DAY;
+    assert!(
+        learner
+            .finished(
+                &first_flow(newcomer(DOWNLOADS, None, true), next),
+                &enricher(),
+                &mut db,
+                at(next)
+            )
+            .is_empty()
+    );
 }

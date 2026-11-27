@@ -45,6 +45,9 @@ use alerts::{Alerts, Link, Saved, allow_key, item_kind};
 /// time, the first flow to somewhere new raises "binary changed".
 pub const BINARY_CHANGE_WINDOW: u64 = 24 * 3_600;
 
+/// Microsoft's own registrable domains that Windows' services check in with.
+const MICROSOFT_DOMAINS: [&str; 3] = ["microsoft.com", "windowsupdate.com", "windows.com"];
+
 const SECS_PER_HOUR: i64 = 3_600;
 const SECS_PER_DAY: i64 = 86_400;
 
@@ -117,9 +120,8 @@ pub struct Learner {
     time_checked: HashMap<String, i64>,
     /// Problems with the store, for the caller to report ([`Learner::take_errors`]).
     errors: Vec<String>,
-    /// Impostor reasons found when [`Self::load`] created a profile, saved
-    /// by the caller as an alert.
-    first_sight: Vec<Reason>,
+    /// The local day each app was last checked for posing as another.
+    impostor_checked: HashMap<String, i64>,
 }
 
 impl Learner {
@@ -136,7 +138,7 @@ impl Learner {
             suspects: HashMap::new(),
             time_checked: HashMap::new(),
             errors: Vec::new(),
-            first_sight: Vec::new(),
+            impostor_checked: HashMap::new(),
         }
     }
 
@@ -151,7 +153,7 @@ impl Learner {
         now: SystemTime,
     ) -> Vec<Raised> {
         let mut raised = self.traffic_inner(app, deltas, enricher, store, now);
-        raised.extend(self.save_first_sight(app, store, now));
+        raised.extend(self.check_impostor(app, store, now));
         raised
     }
 
@@ -165,22 +167,31 @@ impl Learner {
         now: SystemTime,
     ) -> Vec<Raised> {
         let mut raised = self.finished_inner(flow, enricher, store, now);
-        raised.extend(self.save_first_sight(&flow.app, store, now));
+        raised.extend(self.check_impostor(&flow.app, store, now));
         raised
     }
 
-    /// Saves the impostor reasons [`Self::load`] found for a new program.
-    fn save_first_sight(
+    /// Once a local day per app: warns if it poses as another program (see
+    /// [`Self::impostor`]), so a copy first seen before its namesake was
+    /// established is still caught, and a dismissed warning reminds.
+    fn check_impostor(
         &mut self,
         app: &AppFacts<'_>,
         store: &mut Store,
         now: SystemTime,
     ) -> Vec<Raised> {
-        let reasons = std::mem::take(&mut self.first_sight);
+        let key = known_app_key(app.path);
+        let day = self.local_day(now);
+        let Some(first_data) = self.profiles.get(&key).map(|p| p.stored().row.first_data) else {
+            return Vec::new();
+        };
+        if self.impostor_checked.insert(key.clone(), day) == Some(day) {
+            return Vec::new();
+        }
+        let reasons = self.impostor(&key, app, store, now, first_data);
         if reasons.is_empty() {
             return Vec::new();
         }
-        let key = known_app_key(app.path);
         let saved = self
             .alerts
             .fresh(&key, reasons, store)
@@ -195,15 +206,16 @@ impl Learner {
         }
     }
 
-    /// Whether `app`, seen for the first time, is named like an established
-    /// program with a known signer elsewhere on this PC but isn't signed by
-    /// that publisher. Nothing when its signature couldn't be checked.
+    /// Whether `app` (first seen at `first_data`) is named like an older,
+    /// established program with a known signer elsewhere on this PC but isn't
+    /// signed by that publisher. Nothing when its signature couldn't be checked.
     fn impostor(
         &mut self,
         key: &str,
         app: &AppFacts<'_>,
         store: &Store,
         now: SystemTime,
+        first_data: SystemTime,
     ) -> Vec<Reason> {
         if !self.toggles.is_on(Signal::Impostor) || !app.signature_checked {
             return Vec::new();
@@ -219,7 +231,7 @@ impl Learner {
         let name = crate::browsers::program_file_name(app.path);
         let signer = app.publisher.filter(|_| app.signature_valid);
         rows.into_iter()
-            .filter(|row| row.key != key)
+            .filter(|row| row.key != key && row.first_data < first_data)
             .filter(|row| crate::browsers::program_file_name(&row.path).eq_ignore_ascii_case(name))
             .filter(|row| {
                 row.first_data
@@ -288,15 +300,19 @@ impl Learner {
 
         let mut contacted = BTreeSet::new();
         // Windows' own services (Microsoft-signed, in folders only
-        // administrators can change) check in on a timer by design (lab-tuned).
+        // administrators can change) check in with Microsoft on a timer by
+        // design (lab-tuned). Only those check-ins are skipped: Windows tools
+        // such as powershell or rundll32 beaconing anywhere else still count.
         let windows_service = app.installed_by_admins
             && app.signature_valid
             && app
                 .publisher
                 .is_some_and(|p| p.to_ascii_lowercase().starts_with("microsoft"));
-        if self.toggles.is_on(Signal::Beaconing) && !windows_service {
+        if self.toggles.is_on(Signal::Beaconing) {
             for delta in deltas.iter().filter(|d| d.new_connections > 0) {
-                if let Some(destination) = &delta.destination {
+                if let Some(destination) = &delta.destination
+                    && !(windows_service && MICROSOFT_DOMAINS.contains(&destination.as_str()))
+                {
                     self.beacons.record(
                         &key,
                         destination,
@@ -869,7 +885,6 @@ impl Learner {
             hours: Vec::new(),
         };
         self.profiles.insert(key.to_owned(), Profile::new(stored));
-        self.first_sight = self.impostor(key, app, store, now);
         true
     }
 
