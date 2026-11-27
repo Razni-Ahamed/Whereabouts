@@ -287,7 +287,14 @@ impl Learner {
         }
 
         let mut contacted = BTreeSet::new();
-        if self.toggles.is_on(Signal::Beaconing) {
+        // Windows' own services (Microsoft-signed, in folders only
+        // administrators can change) check in on a timer by design (lab-tuned).
+        let windows_service = app.installed_by_admins
+            && app.signature_valid
+            && app
+                .publisher
+                .is_some_and(|p| p.to_ascii_lowercase().starts_with("microsoft"));
+        if self.toggles.is_on(Signal::Beaconing) && !windows_service {
             for delta in deltas.iter().filter(|d| d.new_connections > 0) {
                 if let Some(destination) = &delta.destination {
                     self.beacons.record(

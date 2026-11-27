@@ -1738,3 +1738,34 @@ fn allowed_impostor_does_not_warn_again() {
     assert!(learner.reset(&mut db, &new_key, at(T0 + DAY)).unwrap());
     assert!(!db.is_allowed(&allow).unwrap());
 }
+
+#[test]
+fn windows_own_services_are_not_beacons() {
+    // In the lab, every beaconing false alarm was svchost or Defender
+    // checking in with microsoft.com on a timer.
+    let mut db = TestStore::open("beacon-windows");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::all_on(), 0);
+    let e = enricher();
+    let windows = AppFacts {
+        publisher: Some("Microsoft Windows Publisher"),
+        installed_by_admins: true,
+        ..app()
+    };
+    let user_copy = AppFacts {
+        installed_by_admins: false,
+        ..windows
+    };
+    let mut beacon = |app: &AppFacts<'_>, start: u64| {
+        let mut raised = Vec::new();
+        for i in 0..8 {
+            let secs = start + i * 60;
+            let deltas = [delta(secs, "microsoft.com", 500, 1)];
+            raised.extend(learner.traffic(app, &deltas, &e, &mut db, at(secs)));
+        }
+        raised
+    };
+    assert!(beacon(&windows, T0).is_empty());
+    // A Microsoft-signed file in a folder anyone can change still counts.
+    assert_eq!(beacon(&user_copy, T0 + DAY).len(), 1);
+}
