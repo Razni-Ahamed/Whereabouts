@@ -175,6 +175,8 @@ fn installed_by_admins(path: &str) -> bool {
         r"c:\program files\",
         r"c:\program files (x86)\",
         r"c:\windows\",
+        // Defender's engine, updated outside Program Files.
+        r"c:\programdata\microsoft\windows defender\",
     ]
     .iter()
     .any(|folder| lower.starts_with(folder))
@@ -572,6 +574,9 @@ mod tests {
         assert!(installed_by_admins(r"C:\Program Files\App\app.exe"));
         assert!(installed_by_admins(r"c:\PROGRAM FILES (X86)\App\app.exe"));
         assert!(installed_by_admins(r"C:\Windows\System32\curl.exe"));
+        assert!(installed_by_admins(
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18\MpDefenderCoreService.exe"
+        ));
         assert!(!installed_by_admins(
             r"C:\Users\u\AppData\Local\Lab\Discord.exe"
         ));
