@@ -340,11 +340,15 @@ fn today(key: &str, reason: &Reason) -> (String, Signal, String) {
 }
 
 /// The lasting "this is fine" key for a reason, for the signals that have
-/// one (beaconing, random-looking name, unusual time).
+/// one (beaconing, random-looking name, unusual time, impostor).
 pub(super) fn allow_key(key: &str, reason: &Reason) -> Option<String> {
     let allowable = matches!(
         reason.signal,
-        Signal::Beaconing | Signal::RandomName | Signal::UnusualTime
+        Signal::Beaconing
+            | Signal::RandomName
+            | Signal::UnusualTime
+            | Signal::Impostor
+            | Signal::ImpostorUnchecked
     );
     let value = reason.value.as_deref().filter(|_| allowable)?;
     Some(format!(
@@ -401,6 +405,15 @@ mod tests {
         );
         assert_eq!(combined(&[beacon, name]), Severity::High);
         assert_eq!(combined(&[]), Severity::Info);
+    }
+
+    #[test]
+    fn an_impostor_warning_can_be_allowed_lastingly() {
+        let impostor = reason(Signal::Impostor, Some(r"C:\Apps\chrome.exe"));
+        assert_eq!(
+            allow_key("k", &impostor).as_deref(),
+            Some(r"behaviour|k|impostor|C:\Apps\chrome.exe")
+        );
     }
 
     #[test]
@@ -475,6 +488,7 @@ mod tests {
             publisher: None,
             signature_valid: false,
             installed_by_admins: false,
+            signature_checked: true,
         }
     }
 

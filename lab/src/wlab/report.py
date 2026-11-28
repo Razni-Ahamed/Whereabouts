@@ -22,18 +22,19 @@ from .score import SERIOUS, Scored, match  # noqa: E402
 SIGNAL_SEVERITY = {
     "new_site": "info", "new_company": "info", "new_country": "info", "upload_spike": "high",
     "ratio_flip": "medium", "beaconing": "medium", "unusual_time": "info", "random_name": "medium",
-    "binary_changed": "high",
+    "binary_changed": "high", "impostor": "high", "impostor_unchecked": "medium",
 }
 SIGNALS = tuple(SIGNAL_SEVERITY)
 # What ships on: every signal except beaconing (spec §8; `Toggles::default`).
 SHIPPED = tuple(signal for signal in SIGNALS if signal != "beaconing")
 # For the release bar, the signals that count as catching each scenario type (R26).
-# Other types (renamed_binary, the live ones) are caught by any medium+ alert.
+# Other types (the live known_bad) are caught by any medium+ alert.
 FITTING = {
     "upload": {"upload_spike", "ratio_flip"},
     "beacon": {"beaconing"},
     "random_domain": {"random_name"},
     "swapped_binary": {"binary_changed"},
+    "renamed_binary": {"impostor", "impostor_unchecked"},
 }
 # Release bar U8 (design spec v0.3): with the shipped signals on together, at most
 # 1.0 medium+ false alarms per user-week, and at least 50 % detection in at least 3
@@ -273,7 +274,7 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path,
                   f"{BAR_RATE * 100:.0f} % detection in {BAR_TYPES_NEEDED} of: {', '.join(BAR_TYPES)}. Here a "
                   "staged problem counts as detected only by a Layer 1 alert or a behaviour alert whose "
                   "reasons fit its type (upload: upload spike or ratio flip; beacon: beaconing; random_domain: "
-                  "random name; swapped_binary: binary changed; renamed_binary: any), so the rates can be "
+                  "random name; swapped_binary: binary changed; renamed_binary: impostor), so the rates can be "
                   "lower than in the table above. The first line decides; others are for comparison.", ""]
         for bar in bars:
             lines.append(f"- **{bar['label']}** ({', '.join(bar['signals'])}): {bar['line']}")

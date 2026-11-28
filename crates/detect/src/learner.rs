@@ -45,6 +45,17 @@ use alerts::{Alerts, Link, Saved, allow_key, item_kind};
 /// time, the first flow to somewhere new raises "binary changed".
 pub const BINARY_CHANGE_WINDOW: u64 = 24 * 3_600;
 
+/// Microsoft's own registrable domains that Windows' services check in with.
+const MICROSOFT_DOMAINS: [&str; 3] = ["microsoft.com", "windowsupdate.com", "windows.com"];
+
+/// The publishers that sign Windows' own programs. Not every "Microsoft..."
+/// signer: "Microsoft 3rd Party Application Component" signs others' code.
+const MICROSOFT_PUBLISHERS: [&str; 3] = [
+    "Microsoft Corporation",
+    "Microsoft Windows",
+    "Microsoft Windows Publisher",
+];
+
 const SECS_PER_HOUR: i64 = 3_600;
 const SECS_PER_DAY: i64 = 86_400;
 
@@ -63,6 +74,10 @@ pub struct AppFacts<'a> {
     pub signature_valid: bool,
     /// Whether the file is in a folder only administrators can change.
     pub installed_by_admins: bool,
+    /// Whether the signature could be checked at all (false when it could
+    /// not be read): only then do `publisher` and `signature_valid` say
+    /// "unsigned".
+    pub signature_checked: bool,
 }
 
 /// A flow the engine finished, with what is known about where it went.
@@ -113,6 +128,10 @@ pub struct Learner {
     time_checked: HashMap<String, i64>,
     /// Problems with the store, for the caller to report ([`Learner::take_errors`]).
     errors: Vec<String>,
+    /// The local day each app was last checked for posing as another, by app
+    /// key and whether its signature could be checked (an unreadable copy is
+    /// looked at again once it can be read).
+    impostor_checked: HashMap<(String, bool), i64>,
 }
 
 impl Learner {
@@ -129,6 +148,117 @@ impl Learner {
             suspects: HashMap::new(),
             time_checked: HashMap::new(),
             errors: Vec::new(),
+            impostor_checked: HashMap::new(),
+        }
+    }
+
+    /// Adds traffic of `app` (see [`Self::traffic_inner`]), and warns at once
+    /// if `app` is a new program posing as a known one.
+    pub fn traffic(
+        &mut self,
+        app: &AppFacts<'_>,
+        deltas: &[Delta],
+        enricher: &Enricher,
+        store: &mut Store,
+        now: SystemTime,
+    ) -> Vec<Raised> {
+        let mut raised = self.traffic_inner(app, deltas, enricher, store, now);
+        raised.extend(self.check_impostor(app, store, now));
+        raised
+    }
+
+    /// Learns a finished flow (see [`Self::finished_inner`]), and warns at
+    /// once if its program is a new one posing as a known one.
+    pub fn finished(
+        &mut self,
+        flow: &Finished<'_>,
+        enricher: &Enricher,
+        store: &mut Store,
+        now: SystemTime,
+    ) -> Vec<Raised> {
+        let mut raised = self.finished_inner(flow, enricher, store, now);
+        raised.extend(self.check_impostor(&flow.app, store, now));
+        raised
+    }
+
+    /// Once a local day per app: warns if it poses as another program (see
+    /// [`Self::impostor`]), so a copy first seen before its namesake was
+    /// established is still caught, and a dismissed warning reminds.
+    fn check_impostor(
+        &mut self,
+        app: &AppFacts<'_>,
+        store: &mut Store,
+        now: SystemTime,
+    ) -> Vec<Raised> {
+        let key = known_app_key(app.path);
+        let day = self.local_day(now);
+        let Some(first_data) = self.profiles.get(&key).map(|p| p.stored().row.first_data) else {
+            return Vec::new();
+        };
+        let checked = (key.clone(), app.signature_checked);
+        if self.impostor_checked.get(&checked) == Some(&day) {
+            return Vec::new();
+        }
+        // The day counts as checked only once the check ran and its alert was
+        // saved, so a store error is retried.
+        let Some(reasons) = self.impostor(&key, app, store, now, first_data) else {
+            return Vec::new();
+        };
+        if reasons.is_empty() {
+            self.impostor_checked.insert(checked, day);
+            return Vec::new();
+        }
+        let saved = self
+            .alerts
+            .fresh(&key, reasons, store)
+            .and_then(|fresh| self.alerts.save(&key, app, fresh, store, now));
+        match saved {
+            Ok(saved) => {
+                self.impostor_checked.insert(checked, day);
+                saved.raised.into_iter().collect()
+            }
+            Err(error) => {
+                self.errors
+                    .push(format!("could not save an alert: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether `app` (first seen at `first_data`), in a folder its user can
+    /// change, is named like an older, established program with a known
+    /// signer elsewhere on this PC, and:
+    /// - its signature couldn't be checked ([`Signal::ImpostorUnchecked`]), or
+    /// - it isn't signed by that publisher ([`Signal::Impostor`]), nor by
+    ///   any namesake's that is trusted (never warned about as an impostor,
+    ///   or marked "This is fine").
+    ///
+    /// `None` when the store couldn't be read.
+    fn impostor(
+        &mut self,
+        key: &str,
+        app: &AppFacts<'_>,
+        store: &Store,
+        now: SystemTime,
+        first_data: SystemTime,
+    ) -> Option<Vec<Reason>> {
+        let signal = if app.signature_checked {
+            Signal::Impostor
+        } else {
+            Signal::ImpostorUnchecked
+        };
+        // Posing needs a folder the user (or malware running as them) can
+        // write: programs installed by administrators are trusted already.
+        if !self.toggles.is_on(signal) || app.installed_by_admins {
+            return Some(Vec::new());
+        }
+        match namesakes(key, app, store, now, first_data, signal) {
+            Ok(reasons) => Some(reasons),
+            Err(error) => {
+                self.errors
+                    .push(format!("could not read behaviour profiles: {error}"));
+                None
+            }
         }
     }
 
@@ -141,7 +271,7 @@ impl Learner {
     /// to its hours in memory, and checks upload spike, ratio flip, unusual
     /// time and beaconing on the hours it touches. Returns an alert to
     /// notify about, if any.
-    pub fn traffic(
+    fn traffic_inner(
         &mut self,
         app: &AppFacts<'_>,
         deltas: &[Delta],
@@ -177,9 +307,22 @@ impl Learner {
         }
 
         let mut contacted = BTreeSet::new();
+        // Windows' own services (Microsoft-signed, in folders only
+        // administrators can change) check in with Microsoft on a timer by
+        // design (lab-tuned). Only those check-ins are skipped: Windows tools
+        // such as powershell or rundll32 beaconing anywhere else still count.
+        let windows_service = app.installed_by_admins
+            && app.signature_valid
+            && app.publisher.is_some_and(|p| {
+                MICROSOFT_PUBLISHERS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(p))
+            });
         if self.toggles.is_on(Signal::Beaconing) {
             for delta in deltas.iter().filter(|d| d.new_connections > 0) {
-                if let Some(destination) = &delta.destination {
+                if let Some(destination) = &delta.destination
+                    && !(windows_service && MICROSOFT_DOMAINS.contains(&destination.as_str()))
+                {
                     self.beacons.record(
                         &key,
                         destination,
@@ -250,7 +393,7 @@ impl Learner {
     /// and changed-program signals (none while learning). Returns an alert to
     /// notify about, if any. If the alert cannot be saved, the destinations
     /// behind it are not learned, so the next flow checks them again.
-    pub fn finished(
+    fn finished_inner(
         &mut self,
         flow: &Finished<'_>,
         enricher: &Enricher,
@@ -350,7 +493,10 @@ impl Learner {
             reasons.extend(new.into_iter().filter(|r| {
                 !matches!((item_kind(r.signal), r.value.as_deref()), (Some(kind), Some(value)) if quiet(kind, value))
             }));
+            // Not for apps that go anywhere: browsers reach ad and CDN names
+            // that only look random all day (lab-tuned).
             if self.toggles.is_on(Signal::RandomName)
+                && !goes_anywhere
                 && let Some(domain) = flow.domain.filter(|d| !d.is_empty())
                 && !profile.knows(ItemKind::Domain, domain)
                 && !quiet(ItemKind::Domain, domain)
@@ -897,6 +1043,88 @@ fn unix_secs_i64(time: SystemTime) -> i64 {
 /// Hours since the Unix epoch (0 before it), as the meter counts them.
 fn unix_hour(time: SystemTime) -> i64 {
     unix_secs_i64(time) / SECS_PER_HOUR
+}
+
+/// The older, established programs named like `app` with a known signer, as
+/// one `signal` reason for the first that `app` may be posing as (see
+/// [`Learner::impostor`]).
+fn namesakes(
+    key: &str,
+    app: &AppFacts<'_>,
+    store: &Store,
+    now: SystemTime,
+    first_data: SystemTime,
+    signal: Signal,
+) -> Result<Vec<Reason>, StoreError> {
+    let first_seen = store.known_apps_first_seen()?;
+    // Which program is older goes by when each was first seen, which a
+    // profile reset doesn't change (its `first_data` does).
+    let since =
+        |key: &str, first_data: SystemTime| first_seen.get(key).copied().unwrap_or(first_data);
+    let app_since = since(key, first_data);
+    let name = crate::browsers::program_file_name(app.path);
+    let namesakes: Vec<ProfileRow> = store
+        .profile_rows()?
+        .into_iter()
+        .filter(|row| row.key != key && since(&row.key, row.first_data) < app_since)
+        .filter(|row| crate::browsers::program_file_name(&row.path).eq_ignore_ascii_case(name))
+        .filter(|row| {
+            row.last_publisher.is_some()
+                && row
+                    .first_data
+                    .checked_add(crate::profile::LEARNING)
+                    .is_some_and(|end| now >= end)
+        })
+        .collect();
+    let signer = app
+        .publisher
+        .filter(|_| app.signature_checked && app.signature_valid);
+    let same_signer = |row: &ProfileRow| {
+        signer.is_some_and(|signer| {
+            row.last_publisher
+                .as_deref()
+                .is_some_and(|known| signer.eq_ignore_ascii_case(known))
+        })
+    };
+    // Several apps ship their own `Update.exe`, each signed by its maker: a
+    // new one signed like a trusted one of them is genuine.
+    for row in namesakes.iter().filter(|row| same_signer(row)) {
+        if !warned_as_impostor(store, &row.key)? {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(namesakes
+        .into_iter()
+        .find(|row| !same_signer(row))
+        .map(|row| Reason {
+            signal,
+            value: Some(row.path),
+            observed: None,
+            usual: None,
+            count: None,
+        })
+        .into_iter()
+        .collect())
+}
+
+/// Whether the app with this key was warned about as an impostor and the
+/// user didn't mark that "This is fine".
+fn warned_as_impostor(store: &Store, key: &str) -> Result<bool, StoreError> {
+    for alert in store.behaviour_alerts(key)? {
+        for reason in &alert.reasons {
+            if !matches!(reason.signal, Signal::Impostor | Signal::ImpostorUnchecked) {
+                continue;
+            }
+            let allowed = match allow_key(key, reason) {
+                Some(allow) => store.is_allowed(&allow)?,
+                None => false,
+            };
+            if !allowed {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

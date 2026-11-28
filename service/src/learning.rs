@@ -472,6 +472,7 @@ fn app_facts<'a>(app: &'a str, identity: &'a AppIdentity, installed: bool) -> Ap
         publisher,
         signature_valid: publisher.is_some(),
         installed_by_admins: installed,
+        signature_checked: checked,
     }
 }
 

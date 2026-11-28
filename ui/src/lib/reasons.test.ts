@@ -77,3 +77,23 @@ test('a behaviour alert is titled with the app', () => {
   assert.equal(alertTitle(base), 'chat is behaving differently');
   assert.equal(alertTitle({ ...base, app: null }), 'An app is behaving differently');
 });
+
+test('says when a program may be posing as another', () => {
+  const known = String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`;
+  assert.equal(
+    reasonText(reason({ signal: 'impostor', value: known })),
+    `Same name as ${known}, but not signed by the same publisher. It may be pretending to be that program.`,
+  );
+  assert.equal(
+    reasonText(reason({ signal: 'impostor', value: null })),
+    'Same name as a program you already use, but not signed by the same publisher.',
+  );
+  assert.equal(
+    reasonText(reason({ signal: 'impostor_unchecked', value: known })),
+    `Same name as ${known}, but its signature couldn't be checked. It may be pretending to be that program.`,
+  );
+  assert.equal(
+    reasonText(reason({ signal: 'impostor_unchecked', value: null })),
+    "Same name as a program you already use, but its signature couldn't be checked.",
+  );
+});

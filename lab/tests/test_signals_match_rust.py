@@ -40,7 +40,7 @@ def test_severities_match_severity_of():
                       body(REASONS_RS.read_text(encoding="utf-8"), "pub fn severity(self)"))
     rust = {snake(signal): severity.lower()
             for signals, severity in arms for signal in re.findall(r"Self::(\w+)", signals)}
-    assert len(rust) == 9
+    assert len(rust) == 11
     assert report.SIGNAL_SEVERITY == rust
     assert set(report.SIGNALS) == set(rust)
 

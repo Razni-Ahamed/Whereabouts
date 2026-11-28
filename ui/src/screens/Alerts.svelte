@@ -104,6 +104,18 @@
     };
   }
 
+  let clearing = $state(false);
+
+  /** Marks every alert that needs a look as seen (they stay under All). */
+  async function dismissAll() {
+    clearing = true;
+    try {
+      await store.dismissAll(all.filter((a) => a.severity !== 'info' && !a.dismissed).map((a) => a.id));
+    } finally {
+      clearing = false;
+    }
+  }
+
   /** Clears an alert; with `trust`, alerts like it stop too ("This is fine"). */
   async function dismiss(alert: AlertView, trust: boolean) {
     busy = alert.id;
@@ -128,6 +140,16 @@
           {f.label} <span class="num">{counts[f.id]}</span>
         </button>
       {/each}
+      {#if filter === 'look' && (counts.look ?? 0) > 0}
+        <button
+          type="button"
+          disabled={clearing}
+          title="Mark every alert here as seen. They stay under All, and come back if it happens again."
+          onclick={dismissAll}
+        >
+          {clearing ? 'Dismissing…' : 'Dismiss all'}
+        </button>
+      {/if}
     </div>
   </header>
 
