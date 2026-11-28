@@ -125,6 +125,14 @@ fn connection_facts<'a>(path: &'a str, name: &'a str, signers: &'a Signers) -> A
     }
 }
 
+/// Whether a flow's program is signed, and by whom; `None` when its signature
+/// wasn't checked (no data, or "unknown"), which says nothing either way.
+fn signer_of(row: &FlowRow) -> Option<(bool, Option<String>)> {
+    let signature = row.signature.as_deref().filter(|s| *s != "unknown")?;
+    let signed = signature == "signed";
+    Some((signed, row.publisher.clone().filter(|_| signed)))
+}
+
 /// Remembers a flow's signature for its program's connection lines, and marks
 /// the lab's own browser as going anywhere once its profile exists.
 fn note_program(user: &mut User, row: &FlowRow) {
@@ -132,10 +140,8 @@ fn note_program(user: &mut User, row: &FlowRow) {
         return;
     };
     let key = known_app_key(path);
-    if let Some(signature) = row.signature.as_deref() {
-        let signed = signature == "signed";
-        let publisher = row.publisher.clone().filter(|_| signed);
-        user.signers.insert(key.clone(), (signed, publisher));
+    if let Some(signer) = signer_of(row) {
+        user.signers.insert(key.clone(), signer);
     }
     if is_lab_browser(path)
         && !user.lab_browsers.contains(&key)
@@ -608,6 +614,22 @@ mod tests {
             connections: 1,
             scenario: None,
         }
+    }
+
+    #[test]
+    fn an_unknown_signature_says_nothing_about_the_signer() {
+        let mut flow = row(0, 1, 1, 1);
+        assert_eq!(signer_of(&flow), None);
+        flow.signature = Some(String::from("unknown"));
+        flow.publisher = Some(String::from("Microsoft Corporation"));
+        assert_eq!(signer_of(&flow), None);
+        flow.signature = Some(String::from("unsigned"));
+        assert_eq!(signer_of(&flow), Some((false, None)));
+        flow.signature = Some(String::from("signed"));
+        assert_eq!(
+            signer_of(&flow),
+            Some((true, Some(String::from("Microsoft Corporation"))))
+        );
     }
 
     #[test]

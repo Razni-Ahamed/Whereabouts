@@ -109,8 +109,11 @@
   /** Marks every alert that needs a look as seen (they stay under All). */
   async function dismissAll() {
     clearing = true;
-    await store.dismissAll(all.filter((a) => a.severity !== 'info' && !a.dismissed).map((a) => a.id));
-    clearing = false;
+    try {
+      await store.dismissAll(all.filter((a) => a.severity !== 'info' && !a.dismissed).map((a) => a.id));
+    } finally {
+      clearing = false;
+    }
   }
 
   /** Clears an alert; with `trust`, alerts like it stop too ("This is fine"). */

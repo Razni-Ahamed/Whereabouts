@@ -1887,3 +1887,128 @@ fn allowed_impostor_stays_quiet_the_next_day() {
             .is_empty()
     );
 }
+
+#[test]
+fn unreadable_signature_is_checked_again_once_it_can_be_read() {
+    // Defender may hold a fresh download while it scans it: the first
+    // identity can come back unchecked. That must not use up the day.
+    let mut db = TestStore::open("impostor-unchecked-retry");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let unchecked = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, false), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert!(unchecked.is_empty());
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0 + 60),
+        &enricher(),
+        &mut db,
+        at(T0 + 60),
+    );
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0].alert.reasons[0].signal, Signal::Impostor);
+}
+
+#[test]
+fn failed_impostor_save_is_tried_again_the_same_day() {
+    let mut db = TestStore::open("impostor-save-retry");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let path = db.dir.join("t.db");
+    let store_key = Key::from_bytes([9; 32]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let e = enricher();
+    // The copy's profile is cached while its signature can't be read yet.
+    let unchecked = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, false), T0),
+        &e,
+        &mut db,
+        at(T0),
+    );
+    assert!(unchecked.is_empty());
+
+    drop(db.store.take());
+    set_read_only(&path, true);
+    let failed = Store::open(&path, &store_key).map(|mut read_only| {
+        learner.finished(
+            &first_flow(newcomer(DOWNLOADS, None, true), T0 + 60),
+            &e,
+            &mut read_only,
+            at(T0 + 60),
+        )
+    });
+    set_read_only(&path, false);
+    assert!(failed.unwrap().is_empty());
+    let errors = learner.take_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("could not save an alert")),
+        "{errors:?}"
+    );
+
+    db.store = Some(Store::open(&path, &store_key).unwrap());
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0 + 120),
+        &e,
+        &mut db,
+        at(T0 + 120),
+    );
+    assert_eq!(raised.len(), 1);
+}
+
+#[test]
+fn a_signer_shared_with_any_namesake_is_not_an_impostor() {
+    // Several apps ship their own `Update.exe`, each signed by its maker: a
+    // new one signed like one of them is genuine, whatever the others say.
+    let mut db = TestStore::open("impostor-many-namesakes");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut other = db.profile(&key()).unwrap().unwrap().row;
+    other.key = whereabouts_store::known_app_key(r"C:\Other\Chat.exe");
+    other.path = r"C:\Other\Chat.exe".to_owned();
+    other.first_data = at(T0 - 20 * DAY);
+    other.learned_since = at(T0 - 20 * DAY);
+    other.last_publisher = Some("Other Co".to_owned());
+    db.save_profile_row(&other).unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+
+    let genuine = newcomer(r"C:\Apps\Chat PTB\Chat.exe", Some("Chat Inc"), true);
+    learner.finished(&first_flow(genuine, T0), &enricher(), &mut db, at(T0));
+    assert!(impostors(&db).is_empty());
+
+    let fake = newcomer(DOWNLOADS, Some("Evil Ltd"), true);
+    learner.finished(&first_flow(fake, T0), &enricher(), &mut db, at(T0));
+    assert_eq!(impostors(&db).len(), 1);
+}
+
+#[test]
+fn resetting_the_real_program_keeps_it_the_older_one() {
+    let mut db = TestStore::open("impostor-after-reset");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    db.add_known_app(PATH, at(T0 - 30 * DAY)).unwrap();
+    db.add_known_app(DOWNLOADS, at(T0)).unwrap();
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let raised = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), T0),
+        &enricher(),
+        &mut db,
+        at(T0),
+    );
+    assert_eq!(raised.len(), 1);
+    learner
+        .alert_closed(&mut db, raised[0].id, false, at(T0 + 60))
+        .unwrap();
+    db.dismiss_alert(raised[0].id, false, at(T0 + 60)).unwrap();
+
+    // The user resets the real program, which learns again for a week.
+    assert!(db.reset_profile(&key(), at(T0 + DAY)).unwrap());
+    let later = T0 + 9 * DAY;
+    let again = learner.finished(
+        &first_flow(newcomer(DOWNLOADS, None, true), later),
+        &enricher(),
+        &mut db,
+        at(later),
+    );
+    assert_eq!(again.len(), 1, "the copy is still the newer program");
+    assert_eq!(again[0].alert.reasons[0].signal, Signal::Impostor);
+}

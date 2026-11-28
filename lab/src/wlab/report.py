@@ -274,7 +274,7 @@ def write(results: list[tuple[str, Scored]], info: dict, out: Path,
                   f"{BAR_RATE * 100:.0f} % detection in {BAR_TYPES_NEEDED} of: {', '.join(BAR_TYPES)}. Here a "
                   "staged problem counts as detected only by a Layer 1 alert or a behaviour alert whose "
                   "reasons fit its type (upload: upload spike or ratio flip; beacon: beaconing; random_domain: "
-                  "random name; swapped_binary: binary changed; renamed_binary: any), so the rates can be "
+                  "random name; swapped_binary: binary changed; renamed_binary: impostor), so the rates can be "
                   "lower than in the table above. The first line decides; others are for comparison.", ""]
         for bar in bars:
             lines.append(f"- **{bar['label']}** ({', '.join(bar['signals'])}): {bar['line']}")

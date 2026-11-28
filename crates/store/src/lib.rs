@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::net::IpAddr;
@@ -591,6 +592,19 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(keys)
+    }
+
+    /// When each known program (by key) was first seen using the network.
+    pub fn known_apps_first_seen(&self) -> Result<HashMap<String, SystemTime>, StoreError> {
+        let mut query = self
+            .conn
+            .prepare("SELECT key, first_seen FROM known_apps")?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, from_unix_ms(row.get(1)?)))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
     }
 
     /// Remembers that the program at `path` used the network. Returns

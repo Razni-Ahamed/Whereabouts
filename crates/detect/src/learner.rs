@@ -48,6 +48,14 @@ pub const BINARY_CHANGE_WINDOW: u64 = 24 * 3_600;
 /// Microsoft's own registrable domains that Windows' services check in with.
 const MICROSOFT_DOMAINS: [&str; 3] = ["microsoft.com", "windowsupdate.com", "windows.com"];
 
+/// The publishers that sign Windows' own programs. Not every "Microsoft..."
+/// signer: "Microsoft 3rd Party Application Component" signs others' code.
+const MICROSOFT_PUBLISHERS: [&str; 3] = [
+    "Microsoft Corporation",
+    "Microsoft Windows",
+    "Microsoft Windows Publisher",
+];
+
 const SECS_PER_HOUR: i64 = 3_600;
 const SECS_PER_DAY: i64 = 86_400;
 
@@ -185,11 +193,16 @@ impl Learner {
         let Some(first_data) = self.profiles.get(&key).map(|p| p.stored().row.first_data) else {
             return Vec::new();
         };
-        if self.impostor_checked.insert(key.clone(), day) == Some(day) {
+        if self.impostor_checked.get(&key) == Some(&day) {
             return Vec::new();
         }
-        let reasons = self.impostor(&key, app, store, now, first_data);
+        // The day counts as checked only once the check ran and its alert was
+        // saved, so an unreadable signature or a store error is retried.
+        let Some(reasons) = self.impostor(&key, app, store, now, first_data) else {
+            return Vec::new();
+        };
         if reasons.is_empty() {
+            self.impostor_checked.insert(key, day);
             return Vec::new();
         }
         let saved = self
@@ -197,7 +210,10 @@ impl Learner {
             .fresh(&key, reasons, store)
             .and_then(|fresh| self.alerts.save(&key, app, fresh, store, now));
         match saved {
-            Ok(saved) => saved.raised.into_iter().collect(),
+            Ok(saved) => {
+                self.impostor_checked.insert(key, day);
+                saved.raised.into_iter().collect()
+            }
             Err(error) => {
                 self.errors
                     .push(format!("could not save an alert: {error}"));
@@ -208,7 +224,9 @@ impl Learner {
 
     /// Whether `app` (first seen at `first_data`) is named like an older,
     /// established program with a known signer elsewhere on this PC but isn't
-    /// signed by that publisher. Nothing when its signature couldn't be checked.
+    /// signed by that publisher (nor by any other such namesake's). `None`
+    /// when the check could not run: the signature couldn't be checked, or
+    /// the store couldn't be read.
     fn impostor(
         &mut self,
         key: &str,
@@ -216,42 +234,67 @@ impl Learner {
         store: &Store,
         now: SystemTime,
         first_data: SystemTime,
-    ) -> Vec<Reason> {
-        if !self.toggles.is_on(Signal::Impostor) || !app.signature_checked {
-            return Vec::new();
+    ) -> Option<Vec<Reason>> {
+        if !self.toggles.is_on(Signal::Impostor) {
+            return Some(Vec::new());
         }
-        let rows = match store.profile_rows() {
-            Ok(rows) => rows,
+        if !app.signature_checked {
+            return None;
+        }
+        let read = store
+            .profile_rows()
+            .and_then(|rows| Ok((rows, store.known_apps_first_seen()?)));
+        let (rows, first_seen) = match read {
+            Ok(read) => read,
             Err(error) => {
                 self.errors
                     .push(format!("could not read behaviour profiles: {error}"));
-                return Vec::new();
+                return None;
             }
         };
+        // Which program is older goes by when each was first seen, which a
+        // profile reset doesn't change (its `first_data` does).
+        let since =
+            |key: &str, first_data: SystemTime| first_seen.get(key).copied().unwrap_or(first_data);
+        let app_since = since(key, first_data);
         let name = crate::browsers::program_file_name(app.path);
-        let signer = app.publisher.filter(|_| app.signature_valid);
-        rows.into_iter()
-            .filter(|row| row.key != key && row.first_data < first_data)
+        let namesakes: Vec<ProfileRow> = rows
+            .into_iter()
+            .filter(|row| row.key != key && since(&row.key, row.first_data) < app_since)
             .filter(|row| crate::browsers::program_file_name(&row.path).eq_ignore_ascii_case(name))
             .filter(|row| {
-                row.first_data
-                    .checked_add(crate::profile::LEARNING)
-                    .is_some_and(|end| now >= end)
+                row.last_publisher.is_some()
+                    && row
+                        .first_data
+                        .checked_add(crate::profile::LEARNING)
+                        .is_some_and(|end| now >= end)
             })
-            .find(|row| {
-                row.last_publisher.as_deref().is_some_and(|known| {
-                    signer.is_none_or(|signer| !signer.eq_ignore_ascii_case(known))
+            .collect();
+        let signer = app.publisher.filter(|_| app.signature_valid);
+        let same_signer = |row: &ProfileRow| {
+            signer.is_some_and(|signer| {
+                row.last_publisher
+                    .as_deref()
+                    .is_some_and(|known| signer.eq_ignore_ascii_case(known))
+            })
+        };
+        if namesakes.iter().any(same_signer) {
+            return Some(Vec::new());
+        }
+        Some(
+            namesakes
+                .into_iter()
+                .next()
+                .map(|row| Reason {
+                    signal: Signal::Impostor,
+                    value: Some(row.path),
+                    observed: None,
+                    usual: None,
+                    count: None,
                 })
-            })
-            .map(|row| Reason {
-                signal: Signal::Impostor,
-                value: Some(row.path),
-                observed: None,
-                usual: None,
-                count: None,
-            })
-            .into_iter()
-            .collect()
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// Changes the local time zone's offset from UTC.
@@ -305,9 +348,11 @@ impl Learner {
         // such as powershell or rundll32 beaconing anywhere else still count.
         let windows_service = app.installed_by_admins
             && app.signature_valid
-            && app
-                .publisher
-                .is_some_and(|p| p.to_ascii_lowercase().starts_with("microsoft"));
+            && app.publisher.is_some_and(|p| {
+                MICROSOFT_PUBLISHERS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(p))
+            });
         if self.toggles.is_on(Signal::Beaconing) {
             for delta in deltas.iter().filter(|d| d.new_connections > 0) {
                 if let Some(destination) = &delta.destination

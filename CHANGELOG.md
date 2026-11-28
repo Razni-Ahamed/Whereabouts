@@ -10,13 +10,13 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ### Added
 
-- **Impostor warning.** A program named like one you already use (and have used for at least a week) but not signed by the same publisher (unsigned, or signed by someone else) is warned about straight away, without waiting for it to be learned. In the lab it caught 26 of the 27 renamed copies of an app the simulated user had used for a week, with no false alarm.
+- **Impostor warning.** A program with the same file name as one Whereabouts first saw at least a week ago, but not signed by the same publisher (unsigned, or signed by someone else), is warned about straight away, without waiting for it to be learned. In the lab's development run (the one the rules were tuned on) it caught 26 of the 27 renamed copies of an app the simulated user already had, with no false alarm.
 - **Dismiss all** on the Alerts screen marks every alert that needs a look as seen. They stay under *All*, and an alert comes back if the same thing happens again.
 
 ### Changed
 
 - **Browsers no longer get "random-looking name" warnings.** Browsers reach ad and CDN names that only look random all day; in the lab they caused most false alarms. Other apps still get them.
-- **Beaconing stays off** in 0.4, now measured with 3-hour lab sessions. When switched on, it ignores Windows' own services checking in with Microsoft.
+- **Beaconing stays off** in 0.4, now measured with 3-hour lab sessions. When switched on, it ignores Windows' own services (signed by Microsoft's Windows publishers) checking in with Microsoft.
 
 ## [0.3.0] - 2026-11-25
 
