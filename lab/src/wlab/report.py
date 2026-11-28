@@ -22,7 +22,7 @@ from .score import SERIOUS, Scored, match  # noqa: E402
 SIGNAL_SEVERITY = {
     "new_site": "info", "new_company": "info", "new_country": "info", "upload_spike": "high",
     "ratio_flip": "medium", "beaconing": "medium", "unusual_time": "info", "random_name": "medium",
-    "binary_changed": "high", "impostor": "high",
+    "binary_changed": "high", "impostor": "high", "impostor_unchecked": "medium",
 }
 SIGNALS = tuple(SIGNAL_SEVERITY)
 # What ships on: every signal except beaconing (spec §8; `Toggles::default`).
@@ -34,7 +34,7 @@ FITTING = {
     "beacon": {"beaconing"},
     "random_domain": {"random_name"},
     "swapped_binary": {"binary_changed"},
-    "renamed_binary": {"impostor"},
+    "renamed_binary": {"impostor", "impostor_unchecked"},
 }
 # Release bar U8 (design spec v0.3): with the shipped signals on together, at most
 # 1.0 medium+ false alarms per user-week, and at least 50 % detection in at least 3

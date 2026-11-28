@@ -344,7 +344,11 @@ fn today(key: &str, reason: &Reason) -> (String, Signal, String) {
 pub(super) fn allow_key(key: &str, reason: &Reason) -> Option<String> {
     let allowable = matches!(
         reason.signal,
-        Signal::Beaconing | Signal::RandomName | Signal::UnusualTime | Signal::Impostor
+        Signal::Beaconing
+            | Signal::RandomName
+            | Signal::UnusualTime
+            | Signal::Impostor
+            | Signal::ImpostorUnchecked
     );
     let value = reason.value.as_deref().filter(|_| allowable)?;
     Some(format!(

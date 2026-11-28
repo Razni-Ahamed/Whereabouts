@@ -10,7 +10,7 @@ All notable changes to Whereabouts are recorded here. The format follows [Keep a
 
 ### Added
 
-- **Impostor warning.** A program with the same file name as one Whereabouts first saw at least a week ago, but not signed by the same publisher (unsigned, or signed by someone else), is warned about straight away, without waiting for it to be learned. In the lab's development run (the one the rules were tuned on) it caught 26 of the 27 renamed copies of an app the simulated user already had, with no false alarm.
+- **Impostor warning.** A program with the same file name as one Whereabouts first saw at least a week ago, but not signed by the same publisher (unsigned, or signed by someone else), is warned about straight away, without waiting for it to be learned. Only programs in folders you can change are checked, not those installed by administrators, and a copy whose signature can't be read gets a medium warning instead. In the lab's development run (the one the rules were tuned on) it caught 26 of the 27 renamed copies of an app the simulated user already had, with no false alarm.
 - **Dismiss all** on the Alerts screen marks every alert that needs a look as seen. They stay under *All*, and an alert comes back if the same thing happens again.
 
 ### Changed

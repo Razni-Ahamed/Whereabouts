@@ -88,4 +88,12 @@ test('says when a program may be posing as another', () => {
     reasonText(reason({ signal: 'impostor', value: null })),
     'Same name as a program you already use, but not signed by the same publisher.',
   );
+  assert.equal(
+    reasonText(reason({ signal: 'impostor_unchecked', value: known })),
+    `Same name as ${known}, but its signature couldn't be checked. It may be pretending to be that program.`,
+  );
+  assert.equal(
+    reasonText(reason({ signal: 'impostor_unchecked', value: null })),
+    "Same name as a program you already use, but its signature couldn't be checked.",
+  );
 });

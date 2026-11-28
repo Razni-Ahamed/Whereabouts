@@ -1662,17 +1662,40 @@ fn unsigned_namesake_has_nothing_to_compare() {
 }
 
 #[test]
-fn unchecked_signature_is_never_an_impostor() {
+fn unreadable_copy_gets_a_medium_warning() {
+    // Malware can stop the service reading its file; a copy named like a
+    // signed program is still worth a look.
     let mut db = TestStore::open("impostor-unchecked");
     seed(&mut db, GoesAnywhere::Auto, &[]);
     let mut learner = Learner::new(Toggles::default(), 0);
-    learner.finished(
+    let raised = learner.finished(
         &first_flow(newcomer(DOWNLOADS, None, false), T0),
         &enricher(),
         &mut db,
         at(T0),
     );
-    assert!(impostors(&db).is_empty());
+    assert!(impostors(&db).is_empty(), "not called unsigned");
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0].alert.severity, Severity::Medium);
+    let reason = &raised[0].alert.reasons[0];
+    assert_eq!(reason.signal, Signal::ImpostorUnchecked);
+    assert_eq!(reason.value.as_deref(), Some(PATH));
+}
+
+#[test]
+fn admin_installed_copy_is_not_checked() {
+    // Posing needs a folder the user can write: a program in Program Files
+    // with a common name (java.exe, python.exe) from another vendor is not.
+    let mut db = TestStore::open("impostor-admin");
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    for (checked, publisher) in [(true, Some("Other Vendor")), (true, None), (false, None)] {
+        let mut app = newcomer(r"C:\Program Files\Other\Chat.exe", publisher, checked);
+        app.installed_by_admins = true;
+        let raised = learner.finished(&first_flow(app, T0), &enricher(), &mut db, at(T0));
+        assert!(raised.is_empty());
+    }
+    assert!(behaviour(&db).is_empty());
 }
 
 #[test]
@@ -1901,7 +1924,7 @@ fn unreadable_signature_is_checked_again_once_it_can_be_read() {
         &mut db,
         at(T0),
     );
-    assert!(unchecked.is_empty());
+    assert_eq!(unchecked.len(), 1, "the medium warning");
     let raised = learner.finished(
         &first_flow(newcomer(DOWNLOADS, None, true), T0 + 60),
         &enricher(),
@@ -1909,7 +1932,8 @@ fn unreadable_signature_is_checked_again_once_it_can_be_read() {
         at(T0 + 60),
     );
     assert_eq!(raised.len(), 1);
-    assert_eq!(raised[0].alert.reasons[0].signal, Signal::Impostor);
+    assert_eq!(raised[0].alert.severity, Severity::High);
+    assert!(signals_of(&raised[0].alert).contains(&Signal::Impostor));
 }
 
 #[test]
@@ -1927,7 +1951,7 @@ fn failed_impostor_save_is_tried_again_the_same_day() {
         &mut db,
         at(T0),
     );
-    assert!(unchecked.is_empty());
+    assert_eq!(unchecked.len(), 1, "the medium warning");
 
     drop(db.store.take());
     set_read_only(&path, true);
@@ -1955,6 +1979,7 @@ fn failed_impostor_save_is_tried_again_the_same_day() {
         at(T0 + 120),
     );
     assert_eq!(raised.len(), 1);
+    assert!(signals_of(&raised[0].alert).contains(&Signal::Impostor));
 }
 
 #[test]
@@ -2011,4 +2036,45 @@ fn resetting_the_real_program_keeps_it_the_older_one() {
     );
     assert_eq!(again.len(), 1, "the copy is still the newer program");
     assert_eq!(again[0].alert.reasons[0].signal, Signal::Impostor);
+}
+
+/// A first copy signed by `Evil Ltd` is warned about at `T0`, and the user
+/// answers (`allow`: "This is fine"); a week on, a second copy with the same
+/// signer turns up elsewhere. Returns the impostor alerts about the second.
+fn second_copy_after(allow: bool, name: &str) -> usize {
+    const SECOND: &str = r"C:\Users\u\AppData\Local\Temp\Chat.exe";
+    let mut db = TestStore::open(name);
+    seed(&mut db, GoesAnywhere::Auto, &[]);
+    let mut learner = Learner::new(Toggles::default(), 0);
+    let first = newcomer(DOWNLOADS, Some("Evil Ltd"), true);
+    let raised = learner.finished(&first_flow(first, T0), &enricher(), &mut db, at(T0));
+    assert_eq!(raised.len(), 1);
+    learner
+        .alert_closed(&mut db, raised[0].id, allow, at(T0 + 60))
+        .unwrap();
+    db.dismiss_alert(raised[0].id, allow, at(T0 + 60)).unwrap();
+
+    let later = T0 + 8 * DAY;
+    learner.finished(
+        &first_flow(first, later - 600),
+        &enricher(),
+        &mut db,
+        at(later - 600),
+    );
+    let second = newcomer(SECOND, Some("Evil Ltd"), true);
+    learner.finished(&first_flow(second, later), &enricher(), &mut db, at(later));
+    impostors(&db)
+        .iter()
+        .filter(|a| a.app_path.as_deref() == Some(SECOND))
+        .count()
+}
+
+#[test]
+fn a_namesake_warned_about_does_not_vouch_for_its_signer() {
+    assert_eq!(second_copy_after(false, "impostor-vouch-flagged"), 1);
+}
+
+#[test]
+fn a_namesake_marked_fine_vouches_for_its_signer() {
+    assert_eq!(second_copy_after(true, "impostor-vouch-allowed"), 0);
 }

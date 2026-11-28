@@ -128,8 +128,10 @@ pub struct Learner {
     time_checked: HashMap<String, i64>,
     /// Problems with the store, for the caller to report ([`Learner::take_errors`]).
     errors: Vec<String>,
-    /// The local day each app was last checked for posing as another.
-    impostor_checked: HashMap<String, i64>,
+    /// The local day each app was last checked for posing as another, by app
+    /// key and whether its signature could be checked (an unreadable copy is
+    /// looked at again once it can be read).
+    impostor_checked: HashMap<(String, bool), i64>,
 }
 
 impl Learner {
@@ -193,16 +195,17 @@ impl Learner {
         let Some(first_data) = self.profiles.get(&key).map(|p| p.stored().row.first_data) else {
             return Vec::new();
         };
-        if self.impostor_checked.get(&key) == Some(&day) {
+        let checked = (key.clone(), app.signature_checked);
+        if self.impostor_checked.get(&checked) == Some(&day) {
             return Vec::new();
         }
         // The day counts as checked only once the check ran and its alert was
-        // saved, so an unreadable signature or a store error is retried.
+        // saved, so a store error is retried.
         let Some(reasons) = self.impostor(&key, app, store, now, first_data) else {
             return Vec::new();
         };
         if reasons.is_empty() {
-            self.impostor_checked.insert(key, day);
+            self.impostor_checked.insert(checked, day);
             return Vec::new();
         }
         let saved = self
@@ -211,7 +214,7 @@ impl Learner {
             .and_then(|fresh| self.alerts.save(&key, app, fresh, store, now));
         match saved {
             Ok(saved) => {
-                self.impostor_checked.insert(key, day);
+                self.impostor_checked.insert(checked, day);
                 saved.raised.into_iter().collect()
             }
             Err(error) => {
@@ -222,11 +225,15 @@ impl Learner {
         }
     }
 
-    /// Whether `app` (first seen at `first_data`) is named like an older,
-    /// established program with a known signer elsewhere on this PC but isn't
-    /// signed by that publisher (nor by any other such namesake's). `None`
-    /// when the check could not run: the signature couldn't be checked, or
-    /// the store couldn't be read.
+    /// Whether `app` (first seen at `first_data`), in a folder its user can
+    /// change, is named like an older, established program with a known
+    /// signer elsewhere on this PC, and:
+    /// - its signature couldn't be checked ([`Signal::ImpostorUnchecked`]), or
+    /// - it isn't signed by that publisher ([`Signal::Impostor`]), nor by
+    ///   any namesake's that is trusted (never warned about as an impostor,
+    ///   or marked "This is fine").
+    ///
+    /// `None` when the store couldn't be read.
     fn impostor(
         &mut self,
         key: &str,
@@ -235,66 +242,24 @@ impl Learner {
         now: SystemTime,
         first_data: SystemTime,
     ) -> Option<Vec<Reason>> {
-        if !self.toggles.is_on(Signal::Impostor) {
+        let signal = if app.signature_checked {
+            Signal::Impostor
+        } else {
+            Signal::ImpostorUnchecked
+        };
+        // Posing needs a folder the user (or malware running as them) can
+        // write: programs installed by administrators are trusted already.
+        if !self.toggles.is_on(signal) || app.installed_by_admins {
             return Some(Vec::new());
         }
-        if !app.signature_checked {
-            return None;
-        }
-        let read = store
-            .profile_rows()
-            .and_then(|rows| Ok((rows, store.known_apps_first_seen()?)));
-        let (rows, first_seen) = match read {
-            Ok(read) => read,
+        match namesakes(key, app, store, now, first_data, signal) {
+            Ok(reasons) => Some(reasons),
             Err(error) => {
                 self.errors
                     .push(format!("could not read behaviour profiles: {error}"));
-                return None;
+                None
             }
-        };
-        // Which program is older goes by when each was first seen, which a
-        // profile reset doesn't change (its `first_data` does).
-        let since =
-            |key: &str, first_data: SystemTime| first_seen.get(key).copied().unwrap_or(first_data);
-        let app_since = since(key, first_data);
-        let name = crate::browsers::program_file_name(app.path);
-        let namesakes: Vec<ProfileRow> = rows
-            .into_iter()
-            .filter(|row| row.key != key && since(&row.key, row.first_data) < app_since)
-            .filter(|row| crate::browsers::program_file_name(&row.path).eq_ignore_ascii_case(name))
-            .filter(|row| {
-                row.last_publisher.is_some()
-                    && row
-                        .first_data
-                        .checked_add(crate::profile::LEARNING)
-                        .is_some_and(|end| now >= end)
-            })
-            .collect();
-        let signer = app.publisher.filter(|_| app.signature_valid);
-        let same_signer = |row: &ProfileRow| {
-            signer.is_some_and(|signer| {
-                row.last_publisher
-                    .as_deref()
-                    .is_some_and(|known| signer.eq_ignore_ascii_case(known))
-            })
-        };
-        if namesakes.iter().any(same_signer) {
-            return Some(Vec::new());
         }
-        Some(
-            namesakes
-                .into_iter()
-                .next()
-                .map(|row| Reason {
-                    signal: Signal::Impostor,
-                    value: Some(row.path),
-                    observed: None,
-                    usual: None,
-                    count: None,
-                })
-                .into_iter()
-                .collect(),
-        )
     }
 
     /// Changes the local time zone's offset from UTC.
@@ -1078,6 +1043,88 @@ fn unix_secs_i64(time: SystemTime) -> i64 {
 /// Hours since the Unix epoch (0 before it), as the meter counts them.
 fn unix_hour(time: SystemTime) -> i64 {
     unix_secs_i64(time) / SECS_PER_HOUR
+}
+
+/// The older, established programs named like `app` with a known signer, as
+/// one `signal` reason for the first that `app` may be posing as (see
+/// [`Learner::impostor`]).
+fn namesakes(
+    key: &str,
+    app: &AppFacts<'_>,
+    store: &Store,
+    now: SystemTime,
+    first_data: SystemTime,
+    signal: Signal,
+) -> Result<Vec<Reason>, StoreError> {
+    let first_seen = store.known_apps_first_seen()?;
+    // Which program is older goes by when each was first seen, which a
+    // profile reset doesn't change (its `first_data` does).
+    let since =
+        |key: &str, first_data: SystemTime| first_seen.get(key).copied().unwrap_or(first_data);
+    let app_since = since(key, first_data);
+    let name = crate::browsers::program_file_name(app.path);
+    let namesakes: Vec<ProfileRow> = store
+        .profile_rows()?
+        .into_iter()
+        .filter(|row| row.key != key && since(&row.key, row.first_data) < app_since)
+        .filter(|row| crate::browsers::program_file_name(&row.path).eq_ignore_ascii_case(name))
+        .filter(|row| {
+            row.last_publisher.is_some()
+                && row
+                    .first_data
+                    .checked_add(crate::profile::LEARNING)
+                    .is_some_and(|end| now >= end)
+        })
+        .collect();
+    let signer = app
+        .publisher
+        .filter(|_| app.signature_checked && app.signature_valid);
+    let same_signer = |row: &ProfileRow| {
+        signer.is_some_and(|signer| {
+            row.last_publisher
+                .as_deref()
+                .is_some_and(|known| signer.eq_ignore_ascii_case(known))
+        })
+    };
+    // Several apps ship their own `Update.exe`, each signed by its maker: a
+    // new one signed like a trusted one of them is genuine.
+    for row in namesakes.iter().filter(|row| same_signer(row)) {
+        if !warned_as_impostor(store, &row.key)? {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(namesakes
+        .into_iter()
+        .find(|row| !same_signer(row))
+        .map(|row| Reason {
+            signal,
+            value: Some(row.path),
+            observed: None,
+            usual: None,
+            count: None,
+        })
+        .into_iter()
+        .collect())
+}
+
+/// Whether the app with this key was warned about as an impostor and the
+/// user didn't mark that "This is fine".
+fn warned_as_impostor(store: &Store, key: &str) -> Result<bool, StoreError> {
+    for alert in store.behaviour_alerts(key)? {
+        for reason in &alert.reasons {
+            if !matches!(reason.signal, Signal::Impostor | Signal::ImpostorUnchecked) {
+                continue;
+            }
+            let allowed = match allow_key(key, reason) {
+                Some(allow) => store.is_allowed(&allow)?,
+                None => false,
+            };
+            if !allowed {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

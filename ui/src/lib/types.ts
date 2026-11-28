@@ -109,7 +109,7 @@ export type AlertKind = 'tracker' | 'bad_network' | 'faked_dns' | 'unattributed'
 
 /** One reason behind a behaviour alert. */
 export interface ReasonView {
-  /** new_site, new_company, new_country, upload_spike, ratio_flip, beaconing, unusual_time, random_name or binary_changed. */
+  /** new_site, new_company, new_country, upload_spike, ratio_flip, beaconing, unusual_time, random_name, binary_changed, impostor or impostor_unchecked. */
   signal: string;
   /** The domain, company, country code or hour concerned. */
   value: string | null;

@@ -39,6 +39,10 @@ export function reasonText(r: ReasonView): string {
       return present(r.value)
         ? `Same name as ${r.value}, but not signed by the same publisher. It may be pretending to be that program.`
         : 'Same name as a program you already use, but not signed by the same publisher.';
+    case 'impostor_unchecked':
+      return present(r.value)
+        ? `Same name as ${r.value}, but its signature couldn't be checked. It may be pretending to be that program.`
+        : "Same name as a program you already use, but its signature couldn't be checked.";
     default:
       return 'Unusual behaviour';
   }
